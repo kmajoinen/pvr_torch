@@ -12,4 +12,5 @@ recording/*
 *.pickle
 configs
 data
-Replica-Dataset 
+Replica-Dataset
+env/

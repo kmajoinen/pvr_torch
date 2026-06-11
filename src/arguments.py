@@ -6,7 +6,7 @@ parser = argparse.ArgumentParser(description='PyTorch Scalable Agent')
 parser.add_argument('--max_frames', type=int, default=200000000)
 parser.add_argument('--n_episodes_test', type=int, default=50)
 parser.add_argument('--eval_frequency', type=int, default=200)
-parser.add_argument('--to_env', type=str, default='HabitatImageNav-apartment_0')
+parser.add_argument('--to_env', type=str, default='FrankaKitchen-v1')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--disable_save', action='store_true')
 parser.add_argument('--essential_save_only', action='store_true')
@@ -24,7 +24,7 @@ parser.add_argument('--batch_norm', action='store_true',
                     help='Place a BatchNorm1d layer at the beginning of the policy.')
 
 # Environment Settings.
-parser.add_argument('--env', type=str, default='HabitatImageNav-apartment_0',
+parser.add_argument('--env', type=str, default='FrankaKitchen-v1',
                     help='Training environments. To enter multiple environments \
                     trained in parallel, add them as a comma-separated list.')
 parser.add_argument('--num_input_frames', type=int, default=1,

@@ -91,107 +91,46 @@ class PolicyNet(nn.Module):
 
 
 
+# ==============================================================================
+# Continuous policy for BC / SAC / IQL
+# ==============================================================================
 
+class ContinuousPolicyNet(nn.Module):
+    """
+    MLP policy with continuous (tanh-bounded) output.
+    Used for BC on manipulation tasks and as the actor in SAC/IQL.
 
-class PolicyNetWithConv(nn.Module):
-    def __init__(self, observation_shape, num_actions, batch_norm=False):
-        super(PolicyNetWithConv, self).__init__()
+    Args:
+        obs_size:    dimensionality of the (flat) input observation or embedding.
+        action_dim:  dimensionality of the continuous action.
+        hidden_size: width of each hidden layer.
+        batch_norm:  prepend a BatchNorm1d layer (helps when inputs are not normalised).
+    """
 
-        in_channels = 3
-        n_frames = observation_shape[2] // in_channels
+    def __init__(self, obs_size: int, action_dim: int,
+                 hidden_size: int = 1024, batch_norm: bool = False):
+        super().__init__()
 
-        init_ = lambda m: init(m, nn.init.orthogonal_,
+        init_ = lambda m: init(
+            m, nn.init.orthogonal_,
             lambda x: nn.init.constant_(x, 0),
-            nn.init.calculate_gain('relu'))
-
-        self.feat_extract = nn.Sequential(
-            init_(nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=(3, 3), stride=2, padding=1)),
-            nn.ELU(),
-            init_(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), stride=2, padding=1)),
-            nn.ELU(),
-            init_(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), stride=2, padding=1)),
-            nn.ELU(),
-            init_(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), stride=2, padding=1)),
-            nn.ELU(),
-            init_(nn.Conv2d(in_channels=32, out_channels=32, kernel_size=(3, 3), stride=2, padding=1)),
-            nn.ELU(),
+            nn.init.calculate_gain('relu'),
         )
 
-        dummy_x = torch.zeros((1, in_channels, observation_shape[0], observation_shape[1]))
-        conv_out_size = np.prod(self.feat_extract(dummy_x).shape)
-
-        # Linear layers
-        self.fc = nn.Sequential(
-            init_(nn.Linear(conv_out_size * n_frames, 1024)),
-            nn.ReLU(),
-            init_(nn.Linear(1024, 1024)),
-            nn.ReLU(),
-        )
-
-        # Add batch norm
+        layers = []
         if batch_norm:
-            self.fc = nn.Sequential(
-                nn.BatchNorm1d(conv_out_size * n_frames),
-                *list(self.fc)
-            )
-
-        # LSTM
-        self.core = nn.LSTM(1024, 1024, 2)
-
-        # Outputs
-        init_ = lambda m: init(m, nn.init.orthogonal_,
-            lambda x: nn.init.constant_(x, 0))
-
-        self.policy = init_(nn.Linear(1024, num_actions))
-        self.baseline = init_(nn.Linear(1024, 1))
-
+            layers.append(nn.BatchNorm1d(obs_size))
+        layers += [
+            init_(nn.Linear(obs_size, hidden_size)), nn.ReLU(),
+            init_(nn.Linear(hidden_size, hidden_size)), nn.ReLU(),
+            nn.Linear(hidden_size, action_dim),
+            nn.Tanh(),
+        ]
+        self.net = nn.Sequential(*layers)
 
     @property
     def device(self):
         return next(self.parameters()).device
 
-
-    def initial_state(self, batch_size):
-        return tuple(torch.zeros(self.core.num_layers, batch_size,
-                                self.core.hidden_size) for _ in range(2))
-
-
-    def forward(self, inputs, core_state=()):
-        x = inputs['obs'] # Original shape -> (unroll_length, batch_size, height, width, n_channels * n_frames)
-        T, B, *_, CN = x.shape
-        N = CN // 3 # n_frames
-        x = torch.flatten(x, 0, 1).float() # Merge time and batch -> (unroll_length * batch_size, obs_size)
-        x = x.to(device=self.device)
-        x /= 255.
-
-        xx = torch.split(x, 3, -1) # split frames
-
-        x = torch.cat([self.feat_extract(i.transpose(1, 3)) for i in xx], -1)
-        x = x.view(T * B, -1)
-        core_input = self.fc(x)
-
-        core_input = core_input.view(T, B, -1)
-        core_output_list = []
-        notdone = (1 - inputs['done'].float()).abs().to(device=self.device)
-        for input, nd in zip(core_input.unbind(), notdone.unbind()):
-            nd = nd.view(1, -1, 1)
-            core_state = tuple(nd * s.to(device=self.device) for s in core_state)
-            output, core_state = self.core(input.unsqueeze(0), core_state)
-            core_output_list.append(output)
-        core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
-
-        policy_logits = self.policy(core_output)
-        baseline = self.baseline(core_output)
-
-        if self.training:
-            action = torch.multinomial(
-                F.softmax(policy_logits, dim=1), num_samples=1)
-        else:
-            action = torch.argmax(policy_logits, dim=1)
-
-        policy_logits = policy_logits.view(T, B, -1)
-        baseline = baseline.view(T, B)
-        action = action.view(T, B)
-
-        return dict(policy_logits=policy_logits, baseline=baseline,
-                    action=action), core_state
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.net(obs.float())

@@ -30,20 +30,21 @@ def sample_with_minimum_distance(n=40, k=4, d=10):
 # ==============================================================================
 
 
-def read_habitat_data(data_path):
+def load_demo_pickle(data_path):
+    """
+    Load a trajectory pickle saved by collect_demos / save_opt_trajectories.
+    Flattens per-episode lists into contiguous arrays.
+    Returns a dict with keys: obs, action, reward, done.
+    """
     print('loading %s ...' % data_path)
-
-    # Merge trajectories
     data = pickle.load(open(data_path, 'rb'))
     n_trajectories = len(data['reward'])
-    data['obs'] = np.concatenate(data['obs'])
-    data['action'] = np.concatenate(data['action'])
-    data['reward'] = np.concatenate(data['reward'])
-    data['done'] = np.concatenate(data['done'])
-    data['true_state'] = np.concatenate(data['true_state'])
+
+    for k in ('obs', 'action', 'reward', 'done'):
+        if isinstance(data[k], list):
+            data[k] = np.concatenate(data[k])
 
     n_samples = len(data['reward'])
-    print('  ', '%d trajectories for a total of %d samples' % (n_trajectories, n_samples))
-    print('  ', 'avg. return is', data['reward'].sum() / n_trajectories)
-
+    print('  %d trajectories, %d samples, avg return %.2f' % (
+        n_trajectories, n_samples, data['reward'].sum() / max(n_trajectories, 1)))
     return data

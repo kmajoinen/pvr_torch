@@ -1,0 +1,42 @@
+name: pvr_torch
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    # ── Core ML ────────────────────────────────────────────────────────────────
+    # CPU-only wheels are installed by default here.
+    # For CUDA support, activate the env then run:
+    #   pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu124
+    - torch==2.7.1
+    - torchvision==0.22.1
+
+    # ── Environments ───────────────────────────────────────────────────────────
+    - gymnasium==1.3.0
+    - gymnasium-robotics==1.4.2    # includes FrankaKitchen-v1, Adroit, Fetch
+    - minigrid==3.1.0              # MiniGrid
+    - ale-py>=0.10                 # Atari
+    - shimmy[dm-control]>=2.0     # DMC → gymnasium bridge
+    - mujoco==3.8.1               # pinned: 3.9+ breaks dm_control 1.0.41
+    - opencv-python-headless>=4.0 # needed by ResizeObservation wrapper
+
+    # ── Vision models ──────────────────────────────────────────────────────────
+    - timm==1.0.27
+    - git+https://github.com/openai/CLIP.git
+    # MaskRCNN embedding only — large build, install separately if needed:
+    # - git+https://github.com/facebookresearch/detectron2.git
+
+    # ── Config & experiment management ─────────────────────────────────────────
+    - hydra-core==1.3.2
+    - omegaconf>=2.3
+
+    # ── Utils ──────────────────────────────────────────────────────────────────
+    - numpy==2.4.6
+    - Pillow==12.2.0
+    - tqdm==4.68.1
+    - pandas==3.0.3
+    - matplotlib==3.10.9
+    - seaborn==0.13.2
+    - submitit==1.5.4
+    - GitPython==3.1.50

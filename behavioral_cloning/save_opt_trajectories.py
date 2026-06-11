@@ -1,113 +1,122 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
+"""
+Collect demonstration trajectories from any environment and save to pickle.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+The saved pickle has keys: obs, action, reward, done
+where each value is a list of per-episode numpy arrays.
+This format is consumed by save_embedded_obs.py and main_bc_1.py.
+
+Usage:
+    python behavioral_cloning/save_opt_trajectories.py --env dm_control/cheetah-run-v0 \
+        --train_from_pixels --n_trajectories 1000
+
+Policy options:
+    random     (default) random actions — useful for pipeline testing
+    checkpoint load a trained policy from --policy_path
+"""
 
 import os
-import numpy as np
+import argparse
 import pickle
+import numpy as np
 from tqdm import tqdm
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.gym_wrappers import make_gym_env
 
-from habitat.datasets.utils import get_action_shortest_path
-from habitat_sim.errors import GreedyFollowerError
-
-import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--n_trajectories', type=int, default=10000)
-parser.add_argument('--env', type=str, default='HabitatPointNav-apartment_0')
-parser.add_argument('--save_path', type=str, default='behavioral_cloning')
+parser.add_argument('--env',              type=str, default='dm_control/cheetah-run-v0')
+parser.add_argument('--n_trajectories',   type=int, default=1000)
+parser.add_argument('--max_steps',        type=int, default=1000,
+                    help='Maximum steps per trajectory.')
+parser.add_argument('--train_from_pixels', action='store_true',
+                    help='Store pixel observations (84x84 CHW uint8).')
+parser.add_argument('--num_actions',      type=int, default=None,
+                    help='Discretise continuous actions into N bins. None = keep continuous.')
+parser.add_argument('--policy',           type=str, default='random',
+                    choices=['random', 'checkpoint'])
+parser.add_argument('--policy_path',      type=str, default=None,
+                    help='Path to policy checkpoint when --policy=checkpoint.')
+parser.add_argument('--save_path',        type=str, default='behavioral_cloning')
+parser.add_argument('--seed',             type=int, default=0)
 
 
-def get_shortest_path(env):
-    '''
-    Returns trajectory (obs, act, rwd, done, true_state) corresponding to the
-    shortest path to the goal.
-    `obs` shape is (H, W, 3) for PointNav (1 RGB frame) or (H, W, 6) for ImageNav (2 frames)
-    where (H, W) are defined in habitat_config/nav_task.yaml, while
-    `true_state = [agent_position, agent_orientation, goal_position, scene_id, scene_numer]`
-    (total size is 12).
-
-    If the goal cannot be reached within the episode steps limit, the best
-    path (closest to the goal) will be returned.
-
-    '''
-    max_steps = env.unwrapped._env._max_episode_steps
-    try:
-        shortest_path = [
-            get_action_shortest_path(
-                env.unwrapped._env._sim,
-                source_position=env.unwrapped._env._dataset.episodes[0].start_position,
-                source_rotation=env.unwrapped._env._dataset.episodes[0].start_rotation,
-                goal_position=env.unwrapped._env._dataset.episodes[0].goals[0].position,
-                success_distance=env.unwrapped._core_env_config.TASK.SUCCESS_DISTANCE,
-                max_episode_steps=max_steps,
-            )
-        ][0]
-
-        action = [p.action - 1 for p in shortest_path]
-
-        shortest_steps = len(action)
-        if shortest_steps == max_steps:
-            print('WARNING! Shortest path not found with the given steps limit ({steps}).'.format(steps=max_steps),
-                    'Returning best path.')
+def make_policy(policy_type, policy_path, env):
+    if policy_type == 'random':
+        return lambda obs: env.action_space.sample()
+    elif policy_type == 'checkpoint':
+        assert policy_path is not None, '--policy_path required for checkpoint policy'
+        import torch
+        from src.models import ContinuousPolicyNet
+        checkpoint = torch.load(policy_path, map_location='cpu')
+        obs_size = int(np.prod(env.observation_space.shape))
+        import gymnasium
+        if isinstance(env.action_space, gymnasium.spaces.Box):
+            action_dim = int(np.prod(env.action_space.shape))
         else:
-            print('Shortest path found: {steps} steps.'.format(steps=shortest_steps))
-
-        # Get MDP-like trajectory to include reward
-        obs = [env.reset()]
-        reward = []
-        done = []
-        true_state = [env._true_state]
-        for a in action:
-            o, r, d, _ = env.step(a)
-            obs.append(o)
-            reward.append(r)
-            done.append(d)
-            true_state.append(env._true_state)
-
-        return obs[:-1], action, reward, done, true_state[:-1]
-
-    except GreedyFollowerError:
-        print('WARNING! Cannot find shortest path (GreedyFollowerError).')
-        return None, None, None, None, None
+            action_dim = env.action_space.n
+        policy = ContinuousPolicyNet(obs_size, action_dim)
+        policy.load_state_dict(checkpoint['policy_state_dict'])
+        policy.eval()
+        def fn(obs):
+            with torch.no_grad():
+                obs_t = torch.from_numpy(np.asarray(obs, dtype=np.float32)).unsqueeze(0)
+                return policy(obs_t).squeeze(0).numpy()
+        return fn
+    else:
+        raise ValueError(f'Unknown policy type: {policy_type}')
 
 
-def gen_data_habitat(flags):
-    flags.num_input_frames = 1
-    flags.embedding_name = None
+def collect_trajectory(env, policy_fn, max_steps):
+    obs, _ = env.reset()
+    obs_list, act_list, rew_list, done_list = [], [], [], []
 
-    env = make_gym_env(flags)
+    for _ in range(max_steps):
+        action = policy_fn(obs)
+        obs_list.append(obs.copy() if hasattr(obs, 'copy') else obs)
+        act_list.append(action)
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        rew_list.append(float(reward))
+        done_list.append(bool(done))
+        if done:
+            break
 
-    obs = []
-    action = []
-    reward = []
-    done = []
-    true_state = []
-    for trajectory in tqdm(range(flags.n_trajectories), desc='trajectory'):
-        env.randomize()
-        env.reset()
-        o, a, r, d, s = get_shortest_path(env)
-        obs.append(np.asarray(o))
-        action.append(np.asarray(a))
-        reward.append(np.asarray(r))
-        done.append(np.asarray(d))
-        true_state.append(np.asarray(s))
+    return (np.array(obs_list), np.array(act_list),
+            np.array(rew_list),  np.array(done_list))
 
-    data = dict(obs=obs, action=action, reward=reward, done=done, true_state=true_state)
 
-    if not os.path.exists(flags.save_path):
-        os.makedirs(flags.save_path, exist_ok=True)
+def run(flags):
+    env = make_gym_env(
+        train_from_pixels=flags.train_from_pixels,
+        num_actions=flags.num_actions,
+        id=flags.env,
+    )
+    env.reset(seed=flags.seed)
 
-    with open(os.path.join(flags.save_path, flags.env + '.pickle'), 'wb') as handle:
-        pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    policy_fn = make_policy(flags.policy, flags.policy_path, env)
+
+    obs_all, act_all, rew_all, done_all = [], [], [], []
+    for _ in tqdm(range(flags.n_trajectories), desc='collecting'):
+        o, a, r, d = collect_trajectory(env, policy_fn, flags.max_steps)
+        obs_all.append(o)
+        act_all.append(a)
+        rew_all.append(r)
+        done_all.append(d)
 
     env.close()
+
+    data = dict(obs=obs_all, action=act_all, reward=rew_all, done=done_all)
+
+    os.makedirs(flags.save_path, exist_ok=True)
+    save_name = os.path.join(flags.save_path, flags.env.replace('/', '_') + '.pickle')
+    with open(save_name, 'wb') as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'Saved {flags.n_trajectories} trajectories to {save_name}')
 
 
 if __name__ == '__main__':
     flags = parser.parse_args()
-    gen_data_habitat(flags)
+    run(flags)

@@ -1,81 +1,60 @@
-import gym
 import torch
-from collections import deque
 import numpy as np
-
-from src.gym_wrappers import *
-
-
-def _format_observation(obs):
-    obs = torch.squeeze(torch.as_tensor(obs))
-    return obs.view((1, 1) + obs.shape)
+from src.gym_wrappers import make_gym_env
 
 
-def make_environment(flags, embedding_model, actor_id=1):
-    seed = (flags.run_id + 1) * (actor_id + 1)
-    gym_env = make_gym_env(flags, embedding_model, seed)
-    return Environment(gym_env)
+def make_environment(cfg):
+    """
+    Build an environment from a hydra config node.
+    cfg must have an 'env' sub-config with at least 'id',
+    and top-level 'train_from_pixels' and optionally 'num_actions'.
+    """
+    env_kwargs = dict(cfg.env)
+    return make_gym_env(
+        train_from_pixels=cfg.get("train_from_pixels", False),
+        num_actions=cfg.get("num_actions", None),
+        **env_kwargs,
+    )
 
 
 class Environment:
+    """
+    Thin stateful wrapper around a gymnasium env for evaluation loops.
+    Tracks per-episode return and step count; handles auto-reset on done.
+    The embedding (if any) is applied externally by the caller.
+    """
+
     def __init__(self, gym_env):
         self.gym_env = gym_env
-        self.episode_return = None
-        self.episode_success = None
-        self.episode_step = None
+        self.episode_return = 0.0
+        self.episode_step = 0
 
-    def render(self):
-        self.gym_env.render()
-
-    def initial(self):
-        initial_reward = torch.zeros(1, 1)
-        self.episode_return = torch.zeros(1, 1)
-        self.episode_success = torch.zeros(1, 1)
-        self.episode_step = torch.zeros(1, 1, dtype=torch.int32)
-        initial_done = torch.tensor(False, dtype=torch.bool).view(1, 1)
-        self.gym_env.randomize()
-        initial_obs = _format_observation(self.gym_env.reset())
-
-        return dict(
-            obs=initial_obs,
-            reward=initial_reward,
-            done=initial_done,
-            episode_return=self.episode_return,
-            episode_success=self.episode_success,
-            episode_step=self.episode_step,
-            )
+    def reset(self, seed=None):
+        obs, info = self.gym_env.reset(seed=seed)
+        self.episode_return = 0.0
+        self.episode_step = 0
+        return obs, info
 
     def step(self, action):
-        obs, reward, done, info = self.gym_env.step(action.item())
-        success = info['success']
-
+        obs, reward, terminated, truncated, info = self.gym_env.step(action)
+        done = terminated or truncated
+        self.episode_return += float(reward)
         self.episode_step += 1
-        episode_step = self.episode_step
-
-        self.episode_return += reward
-        self.episode_success += success
-        episode_return = self.episode_return
-        episode_success = self.episode_success
 
         if done:
-            self.gym_env.randomize()
-            obs = self.gym_env.reset()
-            self.episode_return = torch.zeros(1, 1)
-            self.episode_success = torch.zeros(1, 1)
-            self.episode_step = torch.zeros(1, 1, dtype=torch.int32)
+            obs, _ = self.gym_env.reset()
+            self.episode_return = 0.0
+            self.episode_step = 0
 
-        obs = _format_observation(obs)
-        reward = torch.tensor(reward).view(1, 1)
-        done = torch.tensor(done, dtype=torch.bool).view(1, 1)
-
-        return dict(
-            obs=obs,
-            reward=reward,
-            done=done,
-            episode_return=episode_return,
-            episode_success=episode_success,
-            episode_step=episode_step,
-            )
+        return obs, reward, done, info
 
     def close(self):
         self.gym_env.close()
+
+    @property
+    def observation_space(self):
+        return self.gym_env.observation_space
+
+    @property
+    def action_space(self):
+        return self.gym_env.action_space

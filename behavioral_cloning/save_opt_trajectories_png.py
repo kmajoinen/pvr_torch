@@ -1,65 +1,73 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
+"""
+Collect pixel trajectories and save each frame as a PNG file.
+Non-pixel data (actions, rewards, done) is saved alongside as a pickle per trajectory.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+This format is useful when trajectories are too large to keep in a single pickle
+but you still want to access individual frames efficiently.
+
+Usage:
+    python behavioral_cloning/save_opt_trajectories_png.py \
+        --env dm_control/cheetah-run-v0 --n_trajectories 100
+"""
 
 import os
-import numpy as np
+import argparse
 import pickle
-import cv2
+import numpy as np
 from tqdm import tqdm
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+import cv2
 from src.gym_wrappers import make_gym_env
+from behavioral_cloning.save_opt_trajectories import make_policy, collect_trajectory
 
-from habitat.datasets.utils import get_action_shortest_path
-from habitat_sim.errors import GreedyFollowerError
-
-from save_opt_trajectories import get_shortest_path
-
-import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--n_trajectories', type=int, default=10000)
-parser.add_argument('--env', type=str, default='HabitatImageNav-apartment_0')
-parser.add_argument('--save_path', type=str, default='behavioral_cloning')
+parser.add_argument('--env',             type=str,  default='dm_control/cheetah-run-v0')
+parser.add_argument('--n_trajectories',  type=int,  default=1000)
+parser.add_argument('--max_steps',       type=int,  default=1000)
+parser.add_argument('--num_actions',     type=int,  default=None)
+parser.add_argument('--policy',          type=str,  default='random',
+                    choices=['random', 'checkpoint'])
+parser.add_argument('--policy_path',     type=str,  default=None)
+parser.add_argument('--save_path',       type=str,  default='behavioral_cloning')
+parser.add_argument('--seed',            type=int,  default=0)
 
 
-def gen_data_habitat(flags):
-    flags.num_input_frames = 1
-    flags.embedding_name = None
+def run(flags):
+    env = make_gym_env(
+        train_from_pixels=True,
+        num_actions=flags.num_actions,
+        id=flags.env,
+    )
+    env.reset(seed=flags.seed)
 
-    env = make_gym_env(flags)
+    policy_fn = make_policy(flags.policy, flags.policy_path, env)
 
-    save_path = os.path.join(flags.save_path, flags.env)
-    if not os.path.exists(save_path):
-        os.makedirs(save_path, exist_ok=True)
+    save_dir = os.path.join(flags.save_path, flags.env.replace('/', '_'))
+    os.makedirs(save_dir, exist_ok=True)
 
-    for trajectory in tqdm(range(flags.n_trajectories), desc='trajectory'):
-        env.randomize()
-        env.reset()
-        o, a, r, d, s = get_shortest_path(env)
+    for t in tqdm(range(flags.n_trajectories), desc='collecting'):
+        obs_arr, act_arr, rew_arr, done_arr = collect_trajectory(
+            env, policy_fn, flags.max_steps
+        )
 
-        # Save obs frames
-        for i in range(0, len(o)):
-            # Save agent's view
-            img_name = str(trajectory) + '_' + str(i) + '.png'
-            cv2.imwrite(os.path.join(save_path, img_name), o[i][:,:,:3])
-        try:
-            # Save goal frame if ImageNav
-            img_name = str(trajectory) + '_goal.png'
-            cv2.imwrite(os.path.join(save_path, img_name), o[i][:,:,3:])
-        except:
-            # If PointNav
-            pass
+        # Save frames as PNG (obs is (T, C, H, W) uint8 — convert to HWC for cv2)
+        for i, frame in enumerate(obs_arr):
+            img = np.transpose(frame, (1, 2, 0))  # CHW → HWC
+            cv2.imwrite(os.path.join(save_dir, f'{t}_{i}.png'), img)
 
-        data = dict(action=a, reward=r, done=d, true_state=s)
-        with open(os.path.join(save_path, str(trajectory) + '.pickle'), 'wb') as handle:
-            pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        # Save non-pixel data
+        with open(os.path.join(save_dir, f'{t}.pickle'), 'wb') as f:
+            pickle.dump(dict(action=act_arr, reward=rew_arr, done=done_arr), f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
 
     env.close()
+    print(f'Saved {flags.n_trajectories} trajectories to {save_dir}')
 
 
 if __name__ == '__main__':
     flags = parser.parse_args()
-    gen_data_habitat(flags)
+    run(flags)

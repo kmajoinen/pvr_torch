@@ -1,12 +1,20 @@
+import os
 import numpy as np
-import gym
-from gym.spaces.box import Box
+import gymnasium as gym
+from gymnasium.spaces import Box
 
 import torch
 import torch.nn as nn
 from torch.nn.modules.linear import Identity
 import torchvision.models as models
 import torchvision.transforms as T
+
+# Checkpoint directory — all model files are expected here
+MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+
+
+def _ckpt(filename):
+    return os.path.join(MODELS_DIR, filename)
 
 try:
     import clip
@@ -18,7 +26,11 @@ from src.vision_models.moco import (
     moco_conv4_compressed,
     moco_conv5,
 )
-from src.vision_models.maskrcnn import mask_rcnn_model
+try:
+    from src.vision_models.maskrcnn import mask_rcnn_model
+    _HAS_DETECTRON2 = True
+except ImportError:
+    _HAS_DETECTRON2 = False
 from src.vision_models.resnet import (
     resnet_conv3_compressed,
     resnet_conv4_compressed,
@@ -110,86 +122,89 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
 
     # VANILLA RESNET
     elif embedding_name == 'resnet18':
-        model = models.resnet18(pretrained=pretrained, progress=False)
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet34':
-        model = models.resnet34(pretrained=pretrained, progress=False)
+        weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+        model = models.resnet34(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet50':
-        model = models.resnet50(pretrained=pretrained, progress=False)
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+        model = models.resnet50(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet50_places':
-        model = resnet_conv5(checkpoint_path='resnet50_places.pth.tar')
+        model = resnet_conv5(checkpoint_path=_ckpt('resnet50_places.pth.tar'))
     elif embedding_name == 'resnet50_l4':
-        model = resnet_conv4_compressed(checkpoint_path='resnet50_l4.pth.tar')
+        model = resnet_conv4_compressed(checkpoint_path=_ckpt('resnet50_l4.pth.tar'))
     elif embedding_name == 'resnet50_l3':
-        model = resnet_conv3_compressed(checkpoint_path='resnet50_l3.tar')
+        model = resnet_conv3_compressed(checkpoint_path=_ckpt('resnet50_l3.tar'))
     elif embedding_name == 'resnet50_places_l4':
-        model = resnet_conv4_compressed(checkpoint_path='resnet50_places_l4.tar')
+        model = resnet_conv4_compressed(checkpoint_path=_ckpt('resnet50_places_l4.tar'))
     elif embedding_name == 'resnet50_places_l3':
-        model = resnet_conv3_compressed(checkpoint_path='resnet50_places_l3.tar')
+        model = resnet_conv3_compressed(checkpoint_path=_ckpt('resnet50_places_l3.tar'))
 
     # DEMYSTIFY
     elif embedding_name == 'demy':
-        model = moco_conv5(checkpoint_path='demy.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('demy.pth'))
 
     # MAE
     elif embedding_name == 'mae_base':
         model = mae_vit_base_patch16()
-        checkpoint = torch.load('mae_pretrain_vit_base.pth', map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_base.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
     elif embedding_name == 'mae_large':
         model = mae_vit_large_patch16()
-        checkpoint = torch.load('mae_pretrain_vit_large.pth', map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_large.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
     elif embedding_name == 'mae_huge':
         model = mae_vit_huge_patch14()
-        checkpoint = torch.load('mae_pretrain_vit_huge.pth', map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
 
     # MOCO
     elif embedding_name == 'moco_aug':
-        model = moco_conv5(checkpoint_path='moco_aug.pth.tar')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_aug.pth.tar'))
     elif embedding_name == 'moco_aug_habitat':
-        model = moco_conv5(checkpoint_path='moco_aug_habitat_64.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_aug_habitat_64.pth'))
     elif embedding_name == 'moco_aug_mujoco':
-        model = moco_conv5(checkpoint_path='moco_aug_mujoco.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_aug_mujoco.pth'))
     elif embedding_name == 'moco_aug_uber':
-        model = moco_conv5(checkpoint_path='moco_aug_uber.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_aug_uber.pth'))
     elif embedding_name == 'moco_aug_places':
-        model = moco_conv5(checkpoint_path='moco_aug_places.pth.tar')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_aug_places.pth.tar'))
 
     elif embedding_name == 'moco_aug_l4':
-        model = moco_conv4_compressed(checkpoint_path='moco_aug_l4.pth')
+        model = moco_conv4_compressed(checkpoint_path=_ckpt('moco_aug_l4.pth'))
     elif embedding_name == 'moco_aug_places_l4':
-        model = moco_conv4_compressed(checkpoint_path='moco_aug_places_l4.pth')
+        model = moco_conv4_compressed(checkpoint_path=_ckpt('moco_aug_places_l4.pth'))
     elif embedding_name == 'moco_aug_l3':
-        model = moco_conv3_compressed(checkpoint_path='moco_aug_l3.pth')
+        model = moco_conv3_compressed(checkpoint_path=_ckpt('moco_aug_l3.pth'))
     elif embedding_name == 'moco_aug_places_l3':
-        model = moco_conv3_compressed(checkpoint_path='moco_aug_places_l3.pth')
+        model = moco_conv3_compressed(checkpoint_path=_ckpt('moco_aug_places_l3.pth'))
 
     elif embedding_name == 'moco_croponly':
-        model = moco_conv5(checkpoint_path='moco_croponly.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_croponly.pth'))
     elif embedding_name == 'moco_croponly_places':
-        model = moco_conv5(checkpoint_path='moco_croponly_places.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_croponly_places.pth'))
     elif embedding_name == 'moco_croponly_habitat':
-        model = moco_conv5(checkpoint_path='moco_croponly_habitat_64.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_croponly_habitat_64.pth'))
     elif embedding_name == 'moco_croponly_mujoco':
-        model = moco_conv5(checkpoint_path='moco_croponly_mujoco.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_croponly_mujoco.pth'))
     elif embedding_name == 'moco_croponly_uber':
-        model = moco_conv5(checkpoint_path='moco_croponly_uber.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_croponly_uber.pth'))
 
     elif embedding_name == 'moco_croponly_l4':
-        model = moco_conv4_compressed(checkpoint_path='moco_croponly_l4.pth')
+        model = moco_conv4_compressed(checkpoint_path=_ckpt('moco_croponly_l4.pth'))
     elif embedding_name == 'moco_croponly_l3':
-        model = moco_conv3_compressed(checkpoint_path='moco_croponly_l3.pth')
+        model = moco_conv3_compressed(checkpoint_path=_ckpt('moco_croponly_l3.pth'))
     elif embedding_name == 'moco_croponly_places_l4':
-        model = moco_conv4_compressed(checkpoint_path='moco_croponly_places_l4.pth')
+        model = moco_conv4_compressed(checkpoint_path=_ckpt('moco_croponly_places_l4.pth'))
     elif embedding_name == 'moco_croponly_places_l3':
-        model = moco_conv3_compressed(checkpoint_path='moco_croponly_places_l3.pth')
+        model = moco_conv3_compressed(checkpoint_path=_ckpt('moco_croponly_places_l3.pth'))
 
     elif embedding_name == 'moco_coloronly':
-        model = moco_conv5(checkpoint_path='moco_coloronly.pth')
+        model = moco_conv5(checkpoint_path=_ckpt('moco_coloronly.pth'))
 
     # MOCO UBER MODELS (AUG)
     elif embedding_name == 'moco_aug_places_uber_345':
@@ -281,6 +296,8 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
 
     # MASK
     elif embedding_name == 'maskrcnn_l3':
+        if not _HAS_DETECTRON2:
+            raise ImportError("maskrcnn_l3 requires detectron2. Install with: pip install git+https://github.com/facebookresearch/detectron2.git")
         # Input must be BGR and not normalized in [0, 1] (ie, keep them in [0, 255])
         class _rgb_to_bgr(nn.Module):
             def forward(self, x):
@@ -292,7 +309,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             T.CenterCrop(224),
             T.Normalize([103.530, 116.280, 123.675], [1.0, 1.0, 1.0]),
         )
-        model = mask_rcnn_model(checkpoint_path='maskrcnn_l3.pth')
+        model = mask_rcnn_model(checkpoint_path=_ckpt('maskrcnn_l3.pth'))
 
     # CLIP
     elif 'clip' in embedding_name:
@@ -341,11 +358,14 @@ class EmbeddingNet(nn.Module):
     Input shape must be (N, H, W, 3), where N is the number of frames.
     The class will then take care of transforming and normalizing frames.
     The output shape will be (N, O), where O is the embedding size.
-    """
-    def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False, disable_cuda=False):
-        super(EmbeddingNet, self).__init__()
 
-#        assert not train, 'Training the embedding is not supported.'
+    Augmentation (optional nn.Module) is applied to float [0, 1] tensors
+    after spatial transforms (resize/crop/dtype conversion) but before
+    mean/std normalisation — only when the model is in training mode.
+    """
+    def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
+                 disable_cuda=False, augmentation=None):
+        super(EmbeddingNet, self).__init__()
 
         self.embedding_name = embedding_name
 
@@ -356,14 +376,24 @@ class EmbeddingNet(nn.Module):
         self.embedding, self.transforms = \
             _get_embedding(embedding_name, in_channels, pretrained, train)
 
+        # Split transforms so augmentation runs on [0,1] floats, before normalisation.
+        # All transform pipelines end with T.Normalize; split there.
+        t_list = list(self.transforms.children())
+        if isinstance(t_list[-1], T.Normalize):
+            self._pre_aug = nn.Sequential(*t_list[:-1])
+            self._normalize = t_list[-1]
+        else:
+            self._pre_aug = self.transforms
+            self._normalize = nn.Identity()
+
+        self.augmentation = augmentation
+
         dummy_in = torch.zeros(1, in_channels, 64, 64)
         dummy_in = self.transforms(dummy_in)
         self.in_shape = dummy_in.shape[1:]
         dummy_out = self._forward(dummy_in)
         self.out_size = np.prod(dummy_out.shape)
 
-        # Always use CUDA, it is much faster for these models
-        # Disable it only for debugging
         if torch.cuda.is_available() and not disable_cuda:
             self.device = torch.device('cuda')
         else:
@@ -387,15 +417,19 @@ class EmbeddingNet(nn.Module):
         if self.embedding_name == 'true_state':
             return observation.squeeze().cpu().numpy()
 
-        # observation.shape -> (N, H, W, 3)
+        # observation.shape -> (N, C, H, W)  [channels-first, as returned by gym_wrappers]
         observation = observation.to(device=self.device)
-        observation = observation.transpose(1, 2).transpose(1, 3).contiguous()
-        observation = self.transforms(observation)
+        if not observation.is_contiguous():
+            observation = observation.contiguous()
+        observation = self._pre_aug(observation)          # resize, crop, → float [0, 1]
+        if self.training and self.augmentation is not None:
+            observation = self.augmentation(observation)  # augment in [0, 1] space
+        observation = self._normalize(observation)        # mean/std normalisation
         observation = observation.reshape(-1, *self.in_shape)
 
         if self.embedding.training:
             out = self._forward(observation)
-            return out.view(-1, self.out_size).squeeze()
+            return out.reshape(-1, self.out_size).squeeze()
         else:
             with torch.no_grad():
                 out = self._forward(observation)
@@ -407,19 +441,6 @@ class EmbeddingNet(nn.Module):
 # ==============================================================================
 
 class EmbeddingWrapper(gym.ObservationWrapper):
-    """
-    This wrapper places a convolution model over the observation.
-    The original observation shape must be (H, W, n * 3), where n is the number
-    of frames per observation.
-    If n > 1, each frame will pass through the convolution separately.
-    The outputs will then be stacked.
-
-    Args:
-        env (gym.Env): the environment,
-        embedding (torch.nn.Module): neural network defining the observation
-            embedding.
-
-    """
     def __init__(self, env, embedding):
         gym.ObservationWrapper.__init__(self, env)
 

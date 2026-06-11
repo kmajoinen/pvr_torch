@@ -1,175 +1,105 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
+"""
+Pass raw pixel observations through an embedding model and save the result.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+Input:  trajectory pickle produced by save_opt_trajectories.py
+        (dict with keys: obs [list of (T, C, H, W) uint8], action, reward, done)
+Output: pickle with the same structure but obs replaced by embedding vectors.
+
+This pre-computation speeds up main_bc_2.py, which loads the embedded obs
+directly and skips the embedding forward pass during training.
+
+Usage:
+    python behavioral_cloning/save_embedded_obs.py \
+        --env dm_control/cheetah-run-v0 \
+        --embedding_name resnet50
+"""
 
 import os
-import re
+import argparse
+import pickle
+import random
 import numpy as np
 import torch
-import itertools
-import pickle
 from tqdm import tqdm
-from torch.nn import functional as F
-from torch import nn
-import random
-import cv2
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.embeddings import EmbeddingNet
-from src.arguments import parser
-
-parser.add_argument('--n_trajectories', type=int, default=-1)
-parser.add_argument('--source', type=str, default='png', choices=['png', 'pickle'])
 
 
-def read_habitat_data_from_pickle(data_path, n_trajectories=-1):
+parser = argparse.ArgumentParser()
+parser.add_argument('--env',            type=str, default='dm_control/cheetah-run-v0')
+parser.add_argument('--embedding_name', type=str, default='resnet50')
+parser.add_argument('--data_path',      type=str, default='behavioral_cloning')
+parser.add_argument('--batch_size',     type=int, default=64)
+parser.add_argument('--disable_cuda',   action='store_true')
+parser.add_argument('--run_id',         type=int, default=1)
+
+
+def load_demo_pickle(data_path):
+    """Load trajectory pickle and flatten per-episode lists into arrays."""
     print('loading %s ...' % data_path)
-
-    data = pickle.load(open(data_path + '.pickle', 'rb'))
-    if n_trajectories == -1:
-        n_trajectories = len(data['reward'])
-
-    # Merge trajectories
-    data['obs'] = np.concatenate(data['obs'][:n_trajectories])
-    data['action'] = np.concatenate(data['action'][:n_trajectories])
-    data['reward'] = np.concatenate(data['reward'][:n_trajectories])
-    data['done'] = np.concatenate(data['done'][:n_trajectories])
-    data['true_state'] = np.concatenate(data['true_state'][:n_trajectories])
-
+    data = pickle.load(open(data_path, 'rb'))
+    n_trajectories = len(data['reward'])
+    for k in ('obs', 'action', 'reward', 'done'):
+        if isinstance(data[k], list):
+            data[k] = np.concatenate(data[k])
     n_samples = len(data['reward'])
-    print('  ', '%d trajectories for a total of %d samples' % (n_trajectories, n_samples))
-    print('  ', 'avg. return is', data['reward'].sum() / n_trajectories)
-
-    return data
-
-
-def read_habitat_data_from_png(data_path, model=None, n_trajectories=-1):
-    print('loading %s ...' % data_path)
-    data = dict(obs=[], action=[], reward=[], done=[], true_state=[], png=[])
-
-    if n_trajectories == -1:
-        # n_trajectories = len([f for f in os.listdir(data_path) if f.endswith('_0.png')]) # too slow
-        n_trajectories = 100000
-
-    # Merge trajectories
-    for t in tqdm(range(n_trajectories)):
-        try:
-            tmp = pickle.load(open(os.path.join(data_path, str(t) + '.pickle'), 'rb'))
-            for k in data.keys():
-                try:
-                    data[k].append(tmp[k])
-                except:
-                    pass
-            goal = cv2.imread(os.path.join(data_path, str(t) + '_goal' + '.png'))
-            if model is not None:
-                goal = model(torch.from_numpy(goal[None,:])).reshape(-1,)
-        except:
-            break
-        for s in range(500): # 500 is the max step per trajectory according to Habitat's YAML config
-            try:
-                obs = cv2.imread(os.path.join(data_path, str(t) + '_' + str(s) + '.png'))
-                if model is not None:
-                    obs = model(torch.from_numpy(obs[None,:])).reshape(-1,)
-                data['obs'].append(np.concatenate((obs, goal), -1))
-                data['png'] += [os.path.join(data_path, str(t) + '_' + str(s)) + '.png']
-            except:
-                break
-
-    n_trajectories = t
-    data['obs'] = np.stack(data['obs'])
-    data['action'] = np.concatenate(data['action'])
-    data['reward'] = np.concatenate(data['reward'])
-    data['done'] = np.concatenate(data['done'])
-    data['true_state'] = np.concatenate(data['true_state'])
-
-    n_samples = len(data['reward'])
-    print('  ', '%d trajectories for a total of %d samples' % (n_trajectories, n_samples))
-    print('  ', 'avg. return is', data['reward'].sum() / n_trajectories)
-
+    print(f'  {n_trajectories} trajectories, {n_samples} samples')
     return data
 
 
 def run(flags):
-    save_name = os.path.join(flags.data_path,
-                             flags.env + '_' +
-                             flags.embedding_name + '.pickle')
+    env_key = flags.env.replace('/', '_')
+    save_name = os.path.join(flags.data_path, f'{env_key}_{flags.embedding_name}.pickle')
     if os.path.isfile(save_name):
+        print(f'Already exists, skipping: {save_name}')
         return
 
-    # Fix seeds
     torch.manual_seed(flags.run_id)
-    torch.cuda.manual_seed(flags.run_id)
     np.random.seed(flags.run_id)
     random.seed(flags.run_id)
 
-    # Device setup
-    flags.device = None
-    if torch.cuda.is_available() and not flags.disable_cuda:
-        print('Using CUDA.')
-        flags.device = torch.device('cuda')
-    else:
-        print('Not using CUDA.')
-        flags.device = torch.device('cpu')
+    embedding_model = EmbeddingNet(
+        flags.embedding_name,
+        pretrained=True,
+        train=False,
+        disable_cuda=flags.disable_cuda,
+    )
 
-    # Init models, env, optimizer, ...
-    embedding_model = EmbeddingNet(flags.embedding_name,
-                                   in_channels=3,
-                                   pretrained=flags.pretrained_embedding,
-                                   train=flags.train_embedding,
-                                   disable_cuda=flags.disable_cuda) # Always on GPU, unless CUDA is disabled
-
-    # Save model that will be used in main_bc
+    # Save embedding weights (needed to reproduce random embedding experiments)
     emb_path = os.path.join(flags.data_path, flags.embedding_name)
     if flags.embedding_name == 'random':
         emb_path += '_' + str(flags.run_id)
-    torch.save({
-        'embedding_model_state_dict': embedding_model.state_dict(),
-    }, emb_path + '.tar')
+    torch.save({'embedding_model_state_dict': embedding_model.state_dict()},
+               emb_path + '.tar')
 
-    print('=== Loading trajectories ===')
+    data_path = os.path.join(flags.data_path, env_key + '.pickle')
+    data = load_demo_pickle(data_path)
 
-    if flags.source == 'png':
-        data = read_habitat_data_from_png(
-            os.path.join(flags.data_path, flags.env),
-            embedding_model,
-            flags.n_trajectories
-        )
+    print('Embedding observations ...')
+    n_samples = data['obs'].shape[0]
 
-    if flags.source == 'pickle':
-        data = read_habitat_data_from_pickle(
-            os.path.join(flags.data_path, flags.env)
-        )
+    # obs shape: (N, C, H, W) — channels-first from new wrappers
+    obs_raw = data['obs']
+    obs_embedded = []
+    for i in tqdm(range(0, n_samples, flags.batch_size)):
+        batch = torch.from_numpy(obs_raw[i:i + flags.batch_size])
+        emb = embedding_model(batch)          # returns numpy in eval mode
+        obs_embedded.append(emb)
+    obs_embedded = np.concatenate(obs_embedded)[:n_samples]
 
-        print('  ', 'passing observations through embedding model')
-        n_samples = data['obs'].shape[0]
-        n_frames = max(data['obs'].shape[3] // 3, 1)
-        obs_scene = []
-        for i in tqdm(range(0, n_samples, flags.batch_size)): # To avoid OutOfMemory we loop through mini-batches
-            o = data['obs'][i:i+flags.batch_size]
-            o = np.concatenate(np.split(o, n_frames, axis=3), axis=0) # (N, H, W, n_frames * 3) -> (N * n_frames, H, W, 3)
-            o = embedding_model(torch.from_numpy(o)) # (N * n_frames, O)
-            o = np.concatenate(np.split(o, n_frames, axis=0), axis=-1) # (N, O * n_frames)
-            obs_scene.append(o)
-        obs_scene = np.concatenate(obs_scene)[:n_samples]
+    out = dict(
+        obs=obs_embedded,
+        action=data['action'][:n_samples],
+        reward=data['reward'][:n_samples],
+        done=data['done'][:n_samples],
+    )
 
-        obs = np.array(obs_scene)
-        true_state = data['true_state'][:n_samples]
-        action = data['action'][:n_samples]
-        reward = data['reward'][:n_samples]
-        done = data['done'][:n_samples]
-
-        data = dict(obs=obs, action=action, reward=reward, done=done, true_state=true_state)
-
-    n_samples = len(data['reward'])
-    assert n_samples > 0, 'no data found'
-    print('  ', 'total number of samples', n_samples)
-
-    with open(save_name, 'wb') as handle:
-        pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(save_name, 'wb') as f:
+        pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f'Saved to {save_name}')
 
 
 if __name__ == '__main__':
