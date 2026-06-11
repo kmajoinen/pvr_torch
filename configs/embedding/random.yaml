@@ -1,0 +1,4 @@
+name: random
+pretrained: false
+train: false
+augmentation: null

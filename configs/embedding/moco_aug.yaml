@@ -1,0 +1,4 @@
+name: moco_aug
+pretrained: true
+train: false
+augmentation: null

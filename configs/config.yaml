@@ -1,0 +1,14 @@
+defaults:
+  - env: franka_kitchen
+  - algo: bc
+  - embedding: resnet50
+  - replay: uniform
+  - _self_
+
+seed: 1
+device: cuda
+train_from_pixels: true
+num_actions: null        # null = continuous actions; set int to discretise (e.g. for DQN)
+
+save_path: results
+data_path: behavioral_cloning

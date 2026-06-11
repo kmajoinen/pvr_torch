@@ -1,0 +1,4 @@
+name: clip_vit
+pretrained: true
+train: false
+augmentation: null

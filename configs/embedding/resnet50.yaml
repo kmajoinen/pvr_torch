@@ -1,0 +1,4 @@
+name: resnet50
+pretrained: true
+train: false
+augmentation: null

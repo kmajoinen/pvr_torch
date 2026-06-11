@@ -1,0 +1,9 @@
+name: iql
+batch_size: 256
+learning_rate: 3.0e-4
+total_steps: 1000000
+tau: 0.7                # expectile for value function
+beta: 3.0               # inverse temperature for advantage-weighted regression
+gamma: 0.99
+target_update_freq: 1
+target_tau: 0.005

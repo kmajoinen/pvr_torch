@@ -1,0 +1,11 @@
+name: sac
+batch_size: 256
+learning_rate: 3.0e-4
+total_steps: 1000000
+update_frequency: 1
+warmup_steps: 5000
+target_update_freq: 2
+tau: 0.005              # soft target update coefficient
+gamma: 0.99
+alpha: 0.2              # entropy coefficient (auto-tune recommended)
+auto_tune_alpha: true
