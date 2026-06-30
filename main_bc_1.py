@@ -11,15 +11,18 @@ import random
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-from src.models import PolicyNet
+import gymnasium
+
+from src.models import PolicyNet, ContinuousPolicyNet
 from src.embeddings import EmbeddingNet
-from src.env_utils import make_environment
+from src.gym_wrappers import make_gym_env
+from src.env_utils import Environment
 from src.test_model import test
 from src.arguments import parser
 from src.utils_bc import (
     is_essential_save,
     sample_with_minimum_distance,
-    read_habitat_data,
+    load_demo_pickle,
 )
 
 
@@ -72,10 +75,21 @@ def run(flags):
                                    disable_cuda=flags.disable_cuda)
 
     flags.env = to_env
-    env = make_environment(flags, embedding_model)
-    obs_shape = env.gym_env.observation_space.shape
+    _gym_env = make_gym_env(
+        train_from_pixels=getattr(flags, 'train_from_pixels', False),
+        num_actions=getattr(flags, 'num_actions', None),
+        id=flags.env,
+    )
+    env = Environment(_gym_env)
+    obs_shape = env.observation_space.shape
 
-    actor_model = PolicyNet(obs_shape, env.gym_env.action_space.n, flags.batch_norm).to(device=flags.device)
+    if isinstance(env.action_space, gymnasium.spaces.Box):
+        action_dim = int(np.prod(env.action_space.shape))
+        actor_model = ContinuousPolicyNet(
+            int(np.prod(obs_shape)), action_dim, batch_norm=flags.batch_norm
+        ).to(device=flags.device)
+    else:
+        actor_model = PolicyNet(obs_shape, env.action_space.n, flags.batch_norm).to(device=flags.device)
 
     optimizer = torch.optim.RMSprop(
         actor_model.parameters(),
@@ -97,7 +111,8 @@ def run(flags):
         optimizer.load_state_dict(checkpoint["actor_model_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-    test_model = PolicyNet(obs_shape, env.gym_env.action_space.n, flags.batch_norm).to(device=flags.device)
+    import copy
+    test_model = copy.deepcopy(actor_model).to(device=flags.device)
     test_model.load_state_dict(actor_model.state_dict())
     test_model.eval()
 
@@ -115,26 +130,30 @@ def run(flags):
     print('=== Loading trajectories ===')
     first = True
     for env_id in from_env.split(','):
-        data = read_habitat_data(os.path.join(flags.data_path, env_id + '.pickle'))
+        env_key = env_id.replace('/', '_')
+        data = load_demo_pickle(os.path.join(flags.data_path, env_key + '.pickle'))
 
         if flags.debug:
             n_samples_scene = flags.batch_size * flags.unroll_length
         else:
             n_samples_scene = data['obs'].shape[0]
 
-        # The random embedding is not pre-trained, but randomly initialized
-        # So its weights depend on the seed, and we need to pass the obs through it every time
+        # obs shape: (N, C, H, W) — channels-first from new wrappers
+        # n_frames encoded in channel dim: C = n_frames * 3
         print('  ', 'passing observations through embedding model')
-        n_frames = max(data['obs'].shape[3] // 3, 1)
+        n_frames = max(data['obs'].shape[1] // 3, 1)
         obs_scene = []
-        for i in tqdm(range(0, n_samples_scene, flags.batch_size)): # To avoid OutOfMemory we loop through mini-batches
-            o = data['obs'][i:i+flags.batch_size]
-            if o.shape[-1] == 1: # grayscale (Atari)
-                o = np.repeat(o, 3, -1)
-            o = np.concatenate(np.split(o, n_frames, axis=3), axis=0) # (N, H, W, n_frames * 3) -> (N * n_frames, H, W, 3)
-            o = embedding_model(torch.from_numpy(o)) # (N * n_frames, O)
-            o = np.concatenate(np.split(o, n_frames, axis=0), axis=-1) # (N, O * n_frames)
-            obs_scene.append(o)
+        for i in tqdm(range(0, n_samples_scene, flags.batch_size)):
+            o = data['obs'][i:i+flags.batch_size]   # (B, C, H, W)
+            if n_frames > 1:
+                # split along channel dim into n_frames batches
+                o_split = np.split(o, n_frames, axis=1)           # n_frames x (B, 3, H, W)
+                o_cat   = np.concatenate(o_split, axis=0)         # (B * n_frames, 3, H, W)
+                emb     = embedding_model(torch.from_numpy(o_cat))
+                emb     = np.concatenate(np.split(emb, n_frames, axis=0), axis=-1)
+            else:
+                emb = embedding_model(torch.from_numpy(o))
+            obs_scene.append(emb)
         obs_scene = np.concatenate(obs_scene)[:n_samples_scene]
 
         if first:

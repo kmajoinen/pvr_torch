@@ -4,13 +4,15 @@ Behavioral Cloning training script.
 Supports:
   - State observations (no embedding needed)
   - Pixel observations (via EmbeddingNet, set cfg.embedding to a model name)
+  - Minari offline RL datasets (cfg.dataset.format: minari)
+  - Pickle trajectory files from save_opt_trajectories.py (cfg.dataset.format: pickle)
 
 Usage:
-    python train_bc.py                              # door expert, default config
-    python train_bc.py dataset=door_expert          # explicit dataset
-    python train_bc.py algo.batch_size=128          # override any param
-    python train_bc.py device=cpu                   # force CPU
-    python train_bc.py dataset.max_episodes=100     # quick smoke test
+    python train_bc.py                                     # door expert, default config
+    python train_bc.py dataset=dmc_cheetah_random embedding=resnet50
+    python train_bc.py algo.batch_size=128                 # override any param
+    python train_bc.py device=cpu                          # force CPU
+    python train_bc.py dataset.max_episodes=10             # quick smoke test
 """
 
 import os
@@ -27,7 +29,6 @@ from torch.utils.data import DataLoader, random_split
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.data.minari_dataset import MinariDataset
 from src.models import ContinuousPolicyNet
 
 
@@ -35,11 +36,11 @@ from src.models import ContinuousPolicyNet
 # Evaluation
 # ------------------------------------------------------------------------------
 
-def evaluate(policy, env_id: str, n_episodes: int, device, embedding=None) -> dict:
-    import gymnasium as gym
-    import gymnasium_robotics  # noqa: F401 — registers Adroit envs
+def evaluate(policy, env_id: str, n_episodes: int, device,
+             embedding=None, train_from_pixels: bool = False) -> dict:
+    from src.gym_wrappers import make_gym_env
 
-    env = gym.make(env_id)
+    env = make_gym_env(train_from_pixels=train_from_pixels, id=env_id)
     policy.eval()
 
     returns, successes = [], []
@@ -48,12 +49,16 @@ def evaluate(policy, env_id: str, n_episodes: int, device, embedding=None) -> di
         ep_return, ep_success = 0.0, 0.0
         done = False
         while not done:
-            obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(device)
+            if train_from_pixels:
+                obs_t = torch.from_numpy(np.asarray(obs)).unsqueeze(0).to(device)  # uint8
+            else:
+                obs_t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0).to(device)
+
             if embedding is not None:
                 with torch.no_grad():
                     obs_t = torch.as_tensor(
                         embedding(obs_t), device=device, dtype=torch.float32
-                    ).unsqueeze(0)
+                    )  # (1, embed_dim)
             with torch.no_grad():
                 action = policy(obs_t).squeeze(0).cpu().numpy()
             obs, reward, term, trunc, info = env.step(action)
@@ -66,8 +71,8 @@ def evaluate(policy, env_id: str, n_episodes: int, device, embedding=None) -> di
     env.close()
     policy.train()
     return {
-        'return_mean': np.mean(returns),
-        'return_std':  np.std(returns),
+        'return_mean':  np.mean(returns),
+        'return_std':   np.std(returns),
         'success_rate': np.mean(successes),
     }
 
@@ -87,12 +92,23 @@ def main(cfg: DictConfig) -> None:
     print(f"\nDevice: {device}")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    print(f"\nLoading dataset: {cfg.dataset.id}")
-    dataset = MinariDataset(
-        cfg.dataset.id,
-        max_episodes=cfg.dataset.max_episodes,
-        obs_key=cfg.dataset.obs_key,
-    )
+    fmt = cfg.dataset.get('format', 'minari')
+    train_from_pixels = bool(cfg.dataset.get('train_from_pixels', False))
+
+    print(f"\nLoading dataset [{fmt}]: {cfg.dataset.id}")
+    if fmt == 'pickle':
+        from src.data.pickle_dataset import PickleDataset
+        dataset = PickleDataset(
+            cfg.dataset.id,
+            max_episodes=cfg.dataset.max_episodes,
+        )
+    else:
+        from src.data.minari_dataset import MinariDataset
+        dataset = MinariDataset(
+            cfg.dataset.id,
+            max_episodes=cfg.dataset.max_episodes,
+            obs_key=cfg.dataset.obs_key,
+        )
 
     n_val = max(1, int(len(dataset) * 0.05))
     n_train = len(dataset) - n_val
@@ -109,12 +125,13 @@ def main(cfg: DictConfig) -> None:
     # ── Optional embedding ────────────────────────────────────────────────────
     embedding = None
     obs_size = int(np.prod(dataset.obs_shape))
-    if cfg.embedding is not None:
+    emb_name = cfg.embedding.get('name', None)
+    if emb_name is not None:
         from src.embeddings import EmbeddingNet
-        embedding = EmbeddingNet(cfg.embedding, disable_cuda=(str(device) == 'cpu'))
+        embedding = EmbeddingNet(emb_name, disable_cuda=(str(device) == 'cpu'))
         embedding.eval()
         obs_size = embedding.out_size
-        print(f"\nEmbedding: {cfg.embedding}  →  obs_size: {obs_size}")
+        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}")
 
     # ── Policy ────────────────────────────────────────────────────────────────
     policy = ContinuousPolicyNet(
@@ -133,7 +150,6 @@ def main(cfg: DictConfig) -> None:
 
     # ── Training loop ─────────────────────────────────────────────────────────
     n_batches = len(train_loader)
-    # Print a batch-level update roughly every 10% of an epoch (min every 100 batches)
     log_every = max(100, n_batches // 10)
 
     print(f"\nTraining for {cfg.algo.max_epochs} epochs  "
@@ -197,12 +213,16 @@ def main(cfg: DictConfig) -> None:
                   f"  lr={scheduler.get_last_lr()[0]:.2e}"
                   f"  ({elapsed:.1f}s)")
 
-            # Live evaluation in env
             if cfg.dataset.eval_env_id is not None:
-                stats = evaluate(policy, cfg.dataset.eval_env_id,
-                                 n_episodes=cfg.algo.n_episodes_test, device=device,
-                                 embedding=embedding)
-                print(f"         eval  return={stats['return_mean']:.1f}±{stats['return_std']:.1f}"
+                stats = evaluate(
+                    policy, cfg.dataset.eval_env_id,
+                    n_episodes=cfg.algo.n_episodes_test,
+                    device=device,
+                    embedding=embedding,
+                    train_from_pixels=train_from_pixels,
+                )
+                print(f"         eval  return={stats['return_mean']:.1f}"
+                      f"±{stats['return_std']:.1f}"
                       f"  success={stats['success_rate']:.2%}")
 
     print(f"\nBest val loss: {best_val_loss:.4f}")

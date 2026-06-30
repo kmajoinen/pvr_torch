@@ -1,12 +1,10 @@
 defaults:
   - dataset: door_expert
   - algo: bc
+  - embedding: none
   - _self_
 
 seed: 1
 device: cuda                # set to cpu if no GPU
 hidden_size: 1024
 batch_norm: false
-
-# No embedding for state-based BC — set to a model name to enable vision pipeline
-embedding: null

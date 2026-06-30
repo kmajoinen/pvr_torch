@@ -11,15 +11,18 @@ import random
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-from src.models import PolicyNet
+import gymnasium
+
+from src.models import PolicyNet, ContinuousPolicyNet
 from src.embeddings import EmbeddingNet
-from src.env_utils import make_environment
+from src.gym_wrappers import make_gym_env
+from src.env_utils import Environment
 from src.test_model import test
 from src.arguments import parser
 from src.utils_bc import (
     is_essential_save,
     sample_with_minimum_distance,
-    read_habitat_data,
+    load_demo_pickle,
 )
 
 
@@ -72,10 +75,21 @@ def run(flags):
                                    disable_cuda=flags.disable_cuda)
 
     flags.env = to_env
-    env = make_environment(flags, embedding_model)
-    obs_shape = env.gym_env.observation_space.shape
+    _gym_env = make_gym_env(
+        train_from_pixels=getattr(flags, 'train_from_pixels', False),
+        num_actions=getattr(flags, 'num_actions', None),
+        id=flags.env,
+    )
+    env = Environment(_gym_env)
+    obs_shape = env.observation_space.shape
 
-    actor_model = PolicyNet(obs_shape, env.gym_env.action_space.n, flags.batch_norm).to(device=flags.device)
+    if isinstance(env.action_space, gymnasium.spaces.Box):
+        action_dim = int(np.prod(env.action_space.shape))
+        actor_model = ContinuousPolicyNet(
+            int(np.prod(obs_shape)), action_dim, batch_norm=flags.batch_norm
+        ).to(device=flags.device)
+    else:
+        actor_model = PolicyNet(obs_shape, env.action_space.n, flags.batch_norm).to(device=flags.device)
 
     optimizer = torch.optim.RMSprop(
         actor_model.parameters(),
@@ -97,7 +111,8 @@ def run(flags):
         optimizer.load_state_dict(checkpoint["actor_model_optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-    test_model = PolicyNet(obs_shape, env.gym_env.action_space.n, flags.batch_norm).to(device=flags.device)
+    import copy
+    test_model = copy.deepcopy(actor_model).to(device=flags.device)
     test_model.load_state_dict(actor_model.state_dict())
     test_model.eval()
 
@@ -112,13 +127,13 @@ def run(flags):
     print('=== Loading trajectories ===')
     first = True
     for env_id in from_env.split(','):
+        env_key = env_id.replace('/', '_')
         if flags.embedding_name == 'true_state':
-            # True state is saved for all embeddings, just take one
-            data_path = os.path.join(flags.data_path, env_id + '_resnet50' + '.pickle')
+            data_path = os.path.join(flags.data_path, env_key + '_resnet50' + '.pickle')
         else:
-            data_path = os.path.join(flags.data_path, env_id + '_' + flags.embedding_name + '.pickle')
+            data_path = os.path.join(flags.data_path, env_key + '_' + flags.embedding_name + '.pickle')
 
-        data = pickle.load(open(data_path, 'rb'))
+        data = load_demo_pickle(data_path)
 
         if flags.debug:
             n_samples_scene = flags.batch_size * flags.unroll_length

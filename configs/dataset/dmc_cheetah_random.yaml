@@ -1,0 +1,11 @@
+# Random-policy pixel trajectories collected on DMC cheetah-run.
+# Collect with:
+#   python behavioral_cloning/save_opt_trajectories.py \
+#       --env dm_control/cheetah-run-v0 --train_from_pixels \
+#       --n_trajectories 50 --max_steps 500
+id: behavioral_cloning/dm_control_cheetah-run-v0.pickle
+format: pickle
+max_episodes: null
+obs_key: null
+eval_env_id: dm_control/cheetah-run-v0
+train_from_pixels: true

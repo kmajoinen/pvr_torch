@@ -10,7 +10,7 @@ figures/*
 recording/*
 *.png
 *.pickle
-configs
+# configs
 data
 Replica-Dataset
 env/
