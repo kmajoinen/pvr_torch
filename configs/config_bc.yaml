@@ -8,3 +8,9 @@ seed: 1
 device: cuda                # set to cpu if no GPU
 hidden_size: 1024
 batch_norm: false
+
+wandb:
+  enabled: false
+  project: pvr_torch
+  entity: null              # your wandb username or team
+  run_name: null            # auto-generated if null

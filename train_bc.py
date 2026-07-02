@@ -91,6 +91,19 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
 
+    # ── Weights & Biases ──────────────────────────────────────────────────────
+    use_wandb = cfg.wandb.enabled
+    if use_wandb:
+        import wandb
+        from omegaconf import OmegaConf
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=cfg.wandb.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        print(f"wandb run: {wandb.run.url}")
+
     # ── Dataset ───────────────────────────────────────────────────────────────
     fmt = cfg.dataset.get('format', 'minari')
     train_from_pixels = bool(cfg.dataset.get('train_from_pixels', False))
@@ -206,12 +219,16 @@ def main(cfg: DictConfig) -> None:
             best_val_loss = val_loss
             torch.save(policy.state_dict(), os.path.join(save_dir, 'best_policy.pt'))
 
+        lr = scheduler.get_last_lr()[0]
+        if use_wandb:
+            wandb.log({'train/loss': train_loss, 'val/loss': val_loss,
+                       'train/lr': lr}, step=epoch)
+
         if epoch % cfg.algo.eval_frequency == 0 or epoch == 1:
             elapsed = time.time() - t0
             print(f"  epoch {epoch:4d}/{cfg.algo.max_epochs}"
                   f"  train={train_loss:.4f}  val={val_loss:.4f}"
-                  f"  lr={scheduler.get_last_lr()[0]:.2e}"
-                  f"  ({elapsed:.1f}s)")
+                  f"  lr={lr:.2e}  ({elapsed:.1f}s)")
 
             if cfg.dataset.eval_env_id is not None:
                 stats = evaluate(
@@ -224,7 +241,13 @@ def main(cfg: DictConfig) -> None:
                 print(f"         eval  return={stats['return_mean']:.1f}"
                       f"±{stats['return_std']:.1f}"
                       f"  success={stats['success_rate']:.2%}")
+                if use_wandb:
+                    wandb.log({'eval/return_mean': stats['return_mean'],
+                               'eval/return_std':  stats['return_std'],
+                               'eval/success_rate': stats['success_rate']}, step=epoch)
 
+    if use_wandb:
+        wandb.finish()
     print(f"\nBest val loss: {best_val_loss:.4f}")
     print(f"Model saved to: {save_dir}/best_policy.pt")
 
