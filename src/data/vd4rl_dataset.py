@@ -2,17 +2,20 @@
 PyTorch Dataset for V-D4RL (Visual D4RL) — pixel-based offline RL datasets.
 HuggingFace repo: conglu/vd4rl
 
-Observations are (C, H, W) uint8 — same format as PickleDataset / gym_wrappers.
-Actions are continuous float32.
+Files are NPZ shards: vd4rl/main/{task}/{quality}/{resolution}px/{id}-501.npz
+Each shard is one episode (~501 steps). Downloaded via snapshot_download and cached.
 
 Available tasks:    cheetah_run, walker_walk, reacher_easy, cartpole_swingup
 Available quality:  expert, medium, medium_replay, medium_expert
-Available res:      64, 84  (pixels)
+Available res:      64  (84px exists only in the distracting variant)
 
 Usage:
-    ds = VD4RLDataset('cheetah_run', 'expert', resolution=84)
-    obs, action = ds[0]   # (3, 84, 84) uint8, (6,) float32
+    ds = VD4RLDataset('cheetah_run', 'expert')
+    obs, action = ds[0]   # (3, 64, 64) uint8, (6,) float32
 """
+
+import glob
+import os
 
 import numpy as np
 import torch
@@ -25,6 +28,7 @@ _TASK_TO_ENV = {
     'cartpole_swingup': 'dm_control/cartpole-swingup-v0',
 }
 
+
 def task_to_env_id(task: str) -> str:
     if task not in _TASK_TO_ENV:
         raise ValueError(f"Unknown V-D4RL task '{task}'. Known: {list(_TASK_TO_ENV)}")
@@ -34,67 +38,67 @@ def task_to_env_id(task: str) -> str:
 class VD4RLDataset(Dataset):
     REPO = "conglu/vd4rl"
 
-    def __init__(self, task: str, quality: str, resolution: int = 84,
-                 seed: int = 1, max_episodes: int = None, cache_dir: str = None):
+    def __init__(self, task: str, quality: str, resolution: int = 64,
+                 max_episodes: int = None, cache_dir: str = None):
         try:
-            from huggingface_hub import hf_hub_download
+            from huggingface_hub import snapshot_download
         except ImportError:
             raise ImportError("pip install huggingface_hub")
-        try:
-            import zarr
-        except ImportError:
-            raise ImportError("pip install zarr")
 
-        filename = f"{task}/{quality}/{resolution}px/{seed}.zarr"
-        print(f"  Downloading {self.REPO}/{filename} ...")
-        path = hf_hub_download(
+        prefix = f"vd4rl/main/{task}/{quality}/{resolution}px"
+        print(f"  Downloading {self.REPO}/{prefix} ...")
+
+        local_dir = snapshot_download(
             repo_id=self.REPO,
-            filename=filename,
             repo_type="dataset",
+            allow_patterns=[f"{prefix}/*.npz"],
             cache_dir=cache_dir,
         )
 
-        # zarr files on HuggingFace may be a zip store or a directory store
-        try:
-            store = zarr.ZipStore(path, mode='r')
-            data  = zarr.open(store, mode='r')
-        except Exception:
-            data = zarr.open(path, mode='r')
-
-        # Print keys on first open to help debug structure mismatches
-        print(f"  zarr keys: {list(data.keys())}")
-
-        obs  = self._load_key(data, ('observation', 'obs', 'observations'))
-        acts = self._load_key(data, ('action', 'actions'))
-
-        # V-D4RL stores images as (N, H, W, C) — convert to (N, C, H, W)
-        if obs.ndim == 4 and obs.shape[-1] in (1, 3):
-            obs = obs.transpose(0, 3, 1, 2)
+        shards = sorted(glob.glob(os.path.join(local_dir, prefix, "*.npz")))
+        if not shards:
+            raise FileNotFoundError(
+                f"No NPZ files found under {prefix}. "
+                f"Check task/quality — available resolutions may differ per split."
+            )
 
         if max_episodes is not None:
-            # Approximate episode boundary by terminal/done flags
-            try:
-                done = self._load_key(data, ('terminal', 'done', 'dones')).astype(bool)
-                ends = np.where(done)[0][:max_episodes]
-                cut  = int(ends[-1]) + 1 if len(ends) else len(obs)
-                obs, acts = obs[:cut], acts[:cut]
-            except KeyError:
-                obs  = obs[:max_episodes * 1000]
-                acts = acts[:max_episodes * 1000]
+            shards = shards[:max_episodes]
 
-        self._obs     = obs.astype(np.uint8)
-        self._actions = acts.astype(np.float32)
-        self.obs_shape  = self._obs.shape[1:]       # (C, H, W)
+        print(f"  Loading {len(shards)} episode shards ...")
+        obs_list, act_list = [], []
+
+        # Peek at the first shard to learn key names
+        sample = np.load(shards[0])
+        obs_key = self._find_key(sample, ('observation', 'obs', 'observations'))
+        act_key = self._find_key(sample, ('action', 'actions'))
+        print(f"  NPZ keys — obs: '{obs_key}', action: '{act_key}'")
+
+        for path in shards:
+            data = np.load(path)
+            obs_list.append(data[obs_key])
+            act_list.append(data[act_key])
+
+        obs_all = np.concatenate(obs_list, axis=0)
+        act_all = np.concatenate(act_list, axis=0)
+
+        # V-D4RL stores images as (N, H, W, C) — convert to (N, C, H, W)
+        if obs_all.ndim == 4 and obs_all.shape[-1] in (1, 3):
+            obs_all = obs_all.transpose(0, 3, 1, 2)
+
+        self._obs     = obs_all.astype(np.uint8)
+        self._actions = act_all.astype(np.float32)
+        self.obs_shape  = self._obs.shape[1:]
         self.action_dim = self._actions.shape[1]
 
         print(f"  {len(self._obs):,} steps | obs {self.obs_shape} → action ({self.action_dim},)")
 
     @staticmethod
-    def _load_key(data, candidates):
+    def _find_key(data, candidates):
         for key in candidates:
             if key in data:
-                return np.array(data[key])
-        raise KeyError(f"None of {candidates} found in zarr. Keys: {list(data.keys())}")
+                return key
+        raise KeyError(f"None of {candidates} found. Keys: {list(data.keys())}")
 
     def __len__(self) -> int:
         return len(self._obs)
