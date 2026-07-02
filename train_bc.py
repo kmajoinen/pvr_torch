@@ -27,7 +27,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader, random_split
 
 import sys
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from src.models import ContinuousPolicyNet
 
@@ -100,6 +100,7 @@ def main(cfg: DictConfig) -> None:
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
             name=cfg.wandb.run_name,
+            mode=cfg.wandb.get('mode', 'online'),
             config=OmegaConf.to_container(cfg, resolve=True),
         )
         print(f"wandb run: {wandb.run.url}")
@@ -115,15 +116,20 @@ def main(cfg: DictConfig) -> None:
             cfg.dataset.id,
             max_episodes=cfg.dataset.max_episodes,
         )
+        eval_env_id_override = cfg.dataset.eval_env_id
     elif fmt == 'vd4rl':
-        from src.data.vd4rl_dataset import VD4RLDataset
+        from src.data.vd4rl_dataset import VD4RLDataset, task_to_env_id
         dataset = VD4RLDataset(
             task=cfg.dataset.task,
             quality=cfg.dataset.quality,
             resolution=cfg.dataset.resolution,
-            seed=cfg.dataset.seed,
             max_episodes=cfg.dataset.max_episodes,
         )
+        # Derive eval env from task name if not set explicitly in config
+        if cfg.dataset.eval_env_id is None:
+            eval_env_id_override = task_to_env_id(cfg.dataset.task)
+        else:
+            eval_env_id_override = cfg.dataset.eval_env_id
     else:
         from src.data.minari_dataset import MinariDataset
         dataset = MinariDataset(
@@ -131,6 +137,7 @@ def main(cfg: DictConfig) -> None:
             max_episodes=cfg.dataset.max_episodes,
             obs_key=cfg.dataset.obs_key,
         )
+        eval_env_id_override = cfg.dataset.eval_env_id
 
     n_val = max(1, int(len(dataset) * 0.05))
     n_train = len(dataset) - n_val
@@ -239,9 +246,9 @@ def main(cfg: DictConfig) -> None:
                   f"  train={train_loss:.4f}  val={val_loss:.4f}"
                   f"  lr={lr:.2e}  ({elapsed:.1f}s)")
 
-            if cfg.dataset.eval_env_id is not None:
+            if eval_env_id_override is not None:
                 stats = evaluate(
-                    policy, cfg.dataset.eval_env_id,
+                    policy, eval_env_id_override,
                     n_episodes=cfg.algo.n_episodes_test,
                     device=device,
                     embedding=embedding,

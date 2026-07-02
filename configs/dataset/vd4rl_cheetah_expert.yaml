@@ -2,7 +2,6 @@ format: vd4rl
 task: cheetah_run
 quality: expert
 resolution: 64
-seed: 1
 max_episodes: null
 obs_key: null
 eval_env_id: dm_control/cheetah-run-v0
