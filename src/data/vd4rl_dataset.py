@@ -70,7 +70,7 @@ class VD4RLDataset(Dataset):
 
         # Peek at the first shard to learn key names
         sample = np.load(shards[0])
-        obs_key = self._find_key(sample, ('observation', 'obs', 'observations'))
+        obs_key = self._find_key(sample, ('observation', 'obs', 'observations', 'image'))
         act_key = self._find_key(sample, ('action', 'actions'))
         print(f"  NPZ keys — obs: '{obs_key}', action: '{act_key}'")
 
