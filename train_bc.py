@@ -115,6 +115,15 @@ def main(cfg: DictConfig) -> None:
             cfg.dataset.id,
             max_episodes=cfg.dataset.max_episodes,
         )
+    elif fmt == 'vd4rl':
+        from src.data.vd4rl_dataset import VD4RLDataset
+        dataset = VD4RLDataset(
+            task=cfg.dataset.task,
+            quality=cfg.dataset.quality,
+            resolution=cfg.dataset.resolution,
+            seed=cfg.dataset.seed,
+            max_episodes=cfg.dataset.max_episodes,
+        )
     else:
         from src.data.minari_dataset import MinariDataset
         dataset = MinariDataset(
