@@ -1,0 +1,6 @@
+format: minari
+id: d4rl_halfcheetah-expert-v0
+max_episodes: null
+obs_key: null
+eval_env_id: HalfCheetah-v4
+train_from_pixels: false
