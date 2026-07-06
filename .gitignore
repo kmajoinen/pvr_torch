@@ -13,3 +13,5 @@ recording/*
 # configs
 Replica-Dataset
 env/
+pvr_env/
+

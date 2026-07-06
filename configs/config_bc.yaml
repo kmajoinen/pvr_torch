@@ -12,5 +12,5 @@ batch_norm: false
 wandb:
   enabled: false
   project: pvr_torch
-  entity: null              # your wandb username or team
-  run_name: null            # auto-generated if null
+  entity: majoinen-karri              # your wandb username or team
+  run_name: test            # auto-generated if null
