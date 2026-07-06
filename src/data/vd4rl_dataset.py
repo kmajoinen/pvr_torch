@@ -41,21 +41,16 @@ class VD4RLDataset(Dataset):
     def __init__(self, task: str, quality: str, resolution: int = 64,
                  max_episodes: int = None, cache_dir: str = None):
         try:
-            from huggingface_hub import snapshot_download
+            from huggingface_hub import list_repo_files, hf_hub_download
         except ImportError:
             raise ImportError("pip install huggingface_hub")
 
         prefix = f"vd4rl/main/{task}/{quality}/{resolution}px"
-        print(f"  Downloading {self.REPO}/{prefix} ...")
+        print(f"  Listing shards for {self.REPO}/{prefix} ...")
 
-        local_dir = snapshot_download(
-            repo_id=self.REPO,
-            repo_type="dataset",
-            allow_patterns=[f"{prefix}/*.npz"],
-            cache_dir=cache_dir,
-        )
+        all_files = list(list_repo_files(self.REPO, repo_type="dataset"))
+        shards = sorted(f for f in all_files if f.startswith(prefix) and f.endswith('.npz'))
 
-        shards = sorted(glob.glob(os.path.join(local_dir, prefix, "*.npz")))
         if not shards:
             raise FileNotFoundError(
                 f"No NPZ files found under {prefix}. "
@@ -64,6 +59,13 @@ class VD4RLDataset(Dataset):
 
         if max_episodes is not None:
             shards = shards[:max_episodes]
+
+        print(f"  Downloading {len(shards)} episode shards ...")
+        shards = [
+            hf_hub_download(repo_id=self.REPO, filename=s,
+                            repo_type="dataset", cache_dir=cache_dir)
+            for s in shards
+        ]
 
         print(f"  Loading {len(shards)} episode shards ...")
         obs_list, act_list = [], []
