@@ -1,0 +1,9 @@
+format: vd4rl
+task: cheetah_run       # cheetah_run | walker_walk | reacher_easy | cartpole_swingup
+quality: expert         # expert | medium | medium_replay | medium_expert
+resolution: 64
+max_episodes: null
+obs_key: null
+eval_env_id: null              # derived automatically from task in train_bc.py
+train_from_pixels: true
+id: vd4rl/${task}/${quality}   # label for logging/wandb
