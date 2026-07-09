@@ -1,248 +1,254 @@
 """
-Smoke-test script for the PVR + SAC + Stable-Baselines3 pipeline.
+SAC (via Stable-Baselines3) training script, mirroring train_bc.py's
+hydra-configured structure.
 
 Three MODES, meant to be run in order so you isolate failures instead of
 debugging SAC + pixels + a custom encoder all at once:
 
-  1. state   Vanilla SAC on a state-based env (Pendulum-v1).
-             Confirms SAC itself learns -- no vision involved.
+  state   Vanilla SAC on a state-based env (Pendulum-v1).
+          Confirms SAC itself learns -- no vision involved.
 
-  2. pixels  SAC on a pixel env using SB3's default CNN (NatureCNN).
-             Confirms the pixel plumbing works: VecTransposeImage,
-             image dtype/normalization, replay buffer with image obs.
+  pixels  SAC on cfg.env using SB3's default CNN (NatureCNN).
+          Confirms the pixel plumbing works: image dtype/normalization,
+          replay buffer with image obs.
 
-  3. pvr     Same pixel env, but the CNN is replaced by a frozen ResNet18
-             via PVRFeaturesExtractor. This is the config you'll actually
-             use to benchmark PVRs against each other.
-
-Two ENVS are supported for the pixel modes:
-  --env carracing   gymnasium's CarRacing-v3. Only needs `gymnasium[box2d]`.
-                     Good for a same-laptop wiring check.
-  --env dmc_cheetah  DeepMind Control's cheetah-run, via `dm_control` +
-                     `shimmy` (the Gymnasium-compatibility shim). This is
-                     closer to what PVR papers actually benchmark on, but
-                     has a heavier dependency stack (mujoco, dm_control).
+  pvr     Same env, but the CNN is replaced by cfg.embedding via
+          PVRFeaturesExtractor. This is the config you'll actually use to
+          benchmark PVRs against each other.
 
 Usage
 -----
-    pip install "stable-baselines3[extra]" "gymnasium[box2d]" torch torchvision
-    # for dmc_cheetah: pip install dm_control shimmy opencv-python
-
-    # 1) wiring check on your laptop -- tiny numbers, just confirm no crash
-    python train_sac.py --mode state  --debug
-    python train_sac.py --mode pixels --env carracing --debug
-    python train_sac.py --mode pvr    --env carracing --debug
-
-    # 2) real runs -- move to the cluster, esp. for --mode pvr / dmc_cheetah
-    python train_sac.py --mode pvr --env dmc_cheetah \
-        --total-timesteps 500000 --buffer-size 100000
-
-TODO
-----
-  - Swap torchvision resnet18 for your pvr_torch encoder / R3M / VC-1
-    checkpoint -- PVRFeaturesExtractor only needs forward(x)->(B,embed_dim).
-  - Add EvalCallback + tensorboard logging (tensorboard_log=... on SAC)
-    for anything beyond a smoke test.
-  - Once a policy trains, the `imitation` library (built on top of SB3)
-    can both roll out an expert policy into trajectories and train BC on
-    them -- likely less work than hand-rolling the trajectory collection.
+    python train_sac.py mode=state
+    python train_sac.py mode=pixels env=dmc_cheetah
+    python train_sac.py mode=pvr env=dmc_cheetah embedding=resnet50
+    python train_sac.py mode=pvr embedding=mae_base algo.total_timesteps=500000
+    python train_sac.py mode=pvr algo.total_timesteps=300 algo.buffer_size=1000  # quick smoke test
 """
-import argparse
 
-import gymnasium as gym
+import os
+
+import hydra
+import numpy as np
+import torch
+from omegaconf import DictConfig
 from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import VecTransposeImage
-# torchvision is imported lazily inside run_pvr() -- state/pixels modes
-# don't need it, and its compiled extensions are a separate, more fragile
-# dependency (torch/torchvision ABI mismatch) than anything else here.
+
+import sys
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from feature_extractor import PVRFeaturesExtractor
+from src.gym_wrappers import make_gym_env
 
+
+# ------------------------------------------------------------------------------
+# Envs
+# ------------------------------------------------------------------------------
 
 def make_state_env():
     return make_vec_env("Pendulum-v1", n_envs=1)
 
 
-def _make_carracing():
-    # Ships with gymnasium (pip install gymnasium[box2d]); needs no extra
-    # simulator, good for a same-laptop wiring check.
-    return gym.make("CarRacing-v3", render_mode="rgb_array")
+def make_pixel_env(env_id: str):
+    # make_gym_env's train_from_pixels path already applies
+    # AddRenderObservation + ResizeObservation(84,84) + ChannelsFirstWrapper,
+    # so the resulting obs are already (C, H, W) -- no VecTransposeImage needed.
+    return make_vec_env(lambda: make_gym_env(train_from_pixels=True, id=env_id), n_envs=1)
 
 
-def _make_dmc_cheetah(image_size: int = 84):
-    # dm_control's tasks return proprioceptive state by default -- getting
-    # pixels requires explicitly rendering and swapping it in as the obs.
-    #
-    # MuJoCo/dm_control default to a windowed (GLFW) rendering backend,
-    # which fails on a headless cluster node / SSH session with no X11
-    # display. `osmesa` is a safe, universal, CPU-only fallback; `egl` is
-    # faster (hardware-accelerated offscreen rendering) but needs a GPU
-    # node with EGL configured -- try that once osmesa is confirmed working.
-    # Must be set before dm_control's C extension loads, hence setdefault()
-    # here rather than relying on it being exported in the shell.
-    import os
-    os.environ.setdefault("MUJOCO_GL", "osmesa")
+# ------------------------------------------------------------------------------
+# Safety nets (cheap, generically useful -- not backbone-specific)
+# ------------------------------------------------------------------------------
 
-    import shimmy  # noqa: F401  (import registers "dm_control/*-v0" ids)
-    from gymnasium.wrappers import AddRenderObservation, ResizeObservation
-
-    env = gym.make("dm_control/cheetah-run-v0", render_mode="rgb_array")
-    env = AddRenderObservation(env, render_only=True)  # obs <- rendered frame
-    env = ResizeObservation(env, (image_size, image_size))
-    return env
-
-
-ENV_BUILDERS = {
-    "carracing": _make_carracing,
-    "dmc_cheetah": _make_dmc_cheetah,
-}
-
-
-def make_pixel_env(env_name: str):
-    env = make_vec_env(ENV_BUILDERS[env_name], n_envs=1)
-    env = VecTransposeImage(env)  # HWC -> CHW, what SB3's CNN policies expect
-    return env
-
-
-def maybe_init_wandb(args, run_name: str):
+class NaNGuardCallback(BaseCallback):
     """
-    Returns a wandb run if --wandb was passed, else None. Uses
-    sync_tensorboard=True, which piggybacks on the tensorboard_log you
-    already pass to SAC() -- wandb patches the SummaryWriter, so every
-    scalar SB3 (and EvalCallback) writes to tensorboard is mirrored to
-    wandb automatically, no separate logging code needed. Must be called
-    BEFORE the SAC(...) model is constructed so the patch is in place
-    before SB3 creates its writer.
+    Raises immediately, with the actual cause, the first time a reward goes
+    non-finite -- instead of letting the run continue until SB3's Normal(...)
+    constructor rejects a NaN action mean several steps later deep in
+    torch.distributions, with no context on whether the NaN originated from
+    env/reward divergence or from the optimizer.
 
-    If your cluster's compute nodes have no outbound internet (plausible,
-    given you needed to pre-fetch torchvision weights on the login node
-    earlier), set `WANDB_MODE=offline` in the job script -- wandb then
-    writes locally with no network calls, and you `wandb sync <run_dir>`
-    from the login node afterward.
+    Deliberately does NOT check policy parameters here: SB3's off-policy loop
+    runs predict() -> env.step() -> callback.on_step() for a step, and only
+    calls train() *after* that -- immediately followed by the next step's
+    predict(), with no callback in between. See guard_train() below.
     """
-    if not args.wandb:
+
+    def _on_step(self) -> bool:
+        rewards = self.locals.get("rewards")
+        if rewards is not None and not np.isfinite(rewards).all():
+            raise RuntimeError(
+                f"Non-finite reward at step {self.num_timesteps}: {rewards} "
+                "-- env/physics likely diverged, not a policy/encoder issue."
+            )
+        return True
+
+
+def guard_train(model):
+    """
+    Wraps model.train() so a non-finite parameter is caught the instant a
+    gradient update produces it, with the gradient-step count and parameter
+    name -- the one window NaNGuardCallback structurally can't cover.
+    """
+    original_train = model.train
+
+    def guarded_train(*args, **kwargs):
+        original_train(*args, **kwargs)
+        for name, param in model.policy.named_parameters():
+            if not torch.isfinite(param).all():
+                raise RuntimeError(
+                    f"Non-finite parameter '{name}' immediately after train() "
+                    f"at step {model.num_timesteps} -- gradient update diverged "
+                    "(rewards were finite, so this isn't an env/physics issue)."
+                )
+
+    model.train = guarded_train
+
+
+# ------------------------------------------------------------------------------
+# Wandb / callbacks
+# ------------------------------------------------------------------------------
+
+def maybe_init_wandb(cfg: DictConfig, run_name: str):
+    """
+    Returns a wandb run if cfg.wandb.enabled, else None. Uses
+    sync_tensorboard=True, which piggybacks on the tensorboard_log SAC
+    writes to -- wandb patches the SummaryWriter, so every scalar SB3 (and
+    EvalCallback) writes to tensorboard is mirrored to wandb automatically.
+    Must be called BEFORE the SAC(...) model is constructed so the patch is
+    in place before SB3 creates its writer.
+
+    If cluster compute nodes have no outbound internet, set
+    WANDB_MODE=offline in the job script -- wandb then writes locally with
+    no network calls, and you `wandb sync <run_dir>` from the login node
+    afterward.
+    """
+    if not cfg.wandb.enabled:
         return None
     import wandb
+    from omegaconf import OmegaConf
     return wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=run_name,
-        config=vars(args),
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        name=cfg.wandb.run_name or run_name,
+        config=OmegaConf.to_container(cfg, resolve=True),
         sync_tensorboard=True,
         save_code=False,
     )
 
 
-def build_callbacks(args, eval_env, run_name: str, wandb_run=None):
+def build_callbacks(cfg: DictConfig, eval_env, save_dir: str, wandb_run=None):
     """
-    EvalCallback: periodically runs the current policy on a held-out env
-    and logs mean reward -- your actual "is it learning anything" signal
-    while the job is running, rather than waiting for it to finish.
-    Its `log_path` writes small .npz reward arrays regardless of --no-save;
-    that's the number you actually want for a "did it learn" check.
+    EvalCallback: periodically runs the current policy on a held-out env and
+    logs mean reward -- the "is it learning anything" signal while the job
+    is running. Its log_path writes small .npz reward arrays regardless of
+    cfg.no_save.
 
-    CheckpointCallback: saves the full model every `checkpoint_freq` steps.
-    Skipped entirely under --no-save. Useful for a real run you might need
-    to resume after a job timeout; unnecessary disk writes for a throwaway
-    "does it learn" check.
+    CheckpointCallback: saves the full model every checkpoint_freq steps.
+    Skipped entirely under cfg.no_save.
 
-    WandbCallback (only if --wandb): also uploads gradients/model info to
-    wandb directly. Its own model_save_path is likewise skipped under
-    --no-save -- the tensorboard-mirrored scalars (returns, losses, eval
-    reward) still show up in the wandb dashboard either way.
+    WandbCallback: also uploads gradients/model info to wandb directly, if
+    enabled. Its own model_save_path is likewise skipped under cfg.no_save.
     """
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path=None if args.no_save else f"./checkpoints/{run_name}/best",
-        log_path=f"./checkpoints/{run_name}/eval",
-        eval_freq=args.eval_freq,
-        n_eval_episodes=args.n_eval_episodes,
+        best_model_save_path=None if cfg.no_save else os.path.join(save_dir, "best"),
+        log_path=os.path.join(save_dir, "eval"),
+        eval_freq=cfg.algo.eval_freq,
+        n_eval_episodes=cfg.algo.n_eval_episodes,
         deterministic=True,
     )
-    callbacks = [eval_callback]
-    if not args.no_save:
+    callbacks = [eval_callback, NaNGuardCallback()]
+    if not cfg.no_save:
         callbacks.append(CheckpointCallback(
-            save_freq=args.checkpoint_freq,
-            save_path=f"./checkpoints/{run_name}",
-            name_prefix=run_name,
+            save_freq=cfg.algo.checkpoint_freq,
+            save_path=save_dir,
+            name_prefix="sac",
         ))
     if wandb_run is not None:
         from wandb.integration.sb3 import WandbCallback
         callbacks.append(WandbCallback(
-            model_save_path=None if args.no_save else f"./checkpoints/{run_name}/wandb_models",
+            model_save_path=None if cfg.no_save else os.path.join(save_dir, "wandb_models"),
             verbose=2,
         ))
     return callbacks
 
 
-def run_state(args):
+def sac_kwargs(cfg: DictConfig, save_dir: str) -> dict:
+    """Hyperparameters shared by all three modes, read from cfg.algo."""
+    return dict(
+        verbose=1,
+        device=cfg.device,
+        tensorboard_log=save_dir,
+        learning_rate=cfg.algo.learning_rate,
+        batch_size=cfg.algo.batch_size,
+        gamma=cfg.algo.gamma,
+        tau=cfg.algo.tau,
+        train_freq=cfg.algo.train_freq,
+        gradient_steps=cfg.algo.gradient_steps,
+        target_update_interval=cfg.algo.target_update_interval,
+        ent_coef=cfg.algo.ent_coef,
+        # Clamp so small smoke-test runs (algo.total_timesteps overridden low)
+        # still exceed learning_starts and actually exercise training.
+        learning_starts=min(cfg.algo.learning_starts, cfg.algo.total_timesteps),
+    )
+
+
+# ------------------------------------------------------------------------------
+# Modes
+# ------------------------------------------------------------------------------
+
+def run_state(cfg: DictConfig, save_dir: str):
     env = make_state_env()
     eval_env = make_state_env()
-    run_name = "sac_pendulum_state"
-    wandb_run = maybe_init_wandb(args, run_name)
-    model = SAC(
-        "MlpPolicy", env, verbose=1,
-        tensorboard_log=args.tensorboard_log,
-        learning_starts=min(500, args.total_timesteps),
-    )
+    wandb_run = maybe_init_wandb(cfg, "sac_pendulum_state")
+
+    model = SAC("MlpPolicy", env, **sac_kwargs(cfg, save_dir))
+    guard_train(model)
     model.learn(
-        total_timesteps=args.total_timesteps,
-        callback=build_callbacks(args, eval_env, run_name, wandb_run),
+        total_timesteps=cfg.algo.total_timesteps,
+        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
     )
-    if not args.no_save:
-        model.save(run_name)
+    if not cfg.no_save:
+        model.save(os.path.join(save_dir, "final_model"))
     if wandb_run is not None:
         wandb_run.finish()
 
 
-def run_pixels(args):
-    env = make_pixel_env(args.env)
-    eval_env = make_pixel_env(args.env)
-    run_name = f"sac_{args.env}_defaultcnn"
-    wandb_run = maybe_init_wandb(args, run_name)
+def run_pixels(cfg: DictConfig, save_dir: str):
+    env = make_pixel_env(cfg.env.id)
+    eval_env = make_pixel_env(cfg.env.id)
+    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_defaultcnn")
+
     model = SAC(
         "CnnPolicy",  # SB3's default NatureCNN
         env,
-        verbose=1,
-        tensorboard_log=args.tensorboard_log,
-        buffer_size=args.buffer_size,
-        learning_starts=min(1_000, args.total_timesteps),
+        buffer_size=cfg.algo.buffer_size,
+        **sac_kwargs(cfg, save_dir),
     )
+    guard_train(model)
     model.learn(
-        total_timesteps=args.total_timesteps,
-        callback=build_callbacks(args, eval_env, run_name, wandb_run),
+        total_timesteps=cfg.algo.total_timesteps,
+        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
     )
-    if not args.no_save:
-        model.save(run_name)
+    if not cfg.no_save:
+        model.save(os.path.join(save_dir, "final_model"))
     if wandb_run is not None:
         wandb_run.finish()
 
 
-RESNET_EMBED_DIMS = {"resnet18": 512, "resnet34": 512, "resnet50": 2048}
-
-
-def run_pvr(args):
-    import torch.nn as nn
-    import torchvision.models as tv_models
-
-    env = make_pixel_env(args.env)
-    eval_env = make_pixel_env(args.env)
-    run_name = f"sac_{args.env}_{args.backbone}"
-    wandb_run = maybe_init_wandb(args, run_name)
-
-    encoder = getattr(tv_models, args.backbone)(weights="IMAGENET1K_V1")
-    encoder.fc = nn.Identity()  # strip classifier -> pooled feature vector
-    embed_dim = RESNET_EMBED_DIMS[args.backbone]
+def run_pvr(cfg: DictConfig, save_dir: str):
+    env = make_pixel_env(cfg.env.id)
+    eval_env = make_pixel_env(cfg.env.id)
+    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}")
 
     policy_kwargs = dict(
         features_extractor_class=PVRFeaturesExtractor,
         features_extractor_kwargs=dict(
-            encoder=encoder,
-            embed_dim=embed_dim,
-            input_size=224,
+            embedding_name=cfg.embedding.name,
             freeze=True,  # standard PVR-eval protocol: probe, don't finetune
+            disable_cuda=(cfg.device == "cpu"),
         ),
         net_arch=[256, 256],
         normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm
@@ -252,56 +258,42 @@ def run_pvr(args):
         "CnnPolicy",
         env,
         policy_kwargs=policy_kwargs,
-        verbose=1,
-        tensorboard_log=args.tensorboard_log,
-        buffer_size=args.buffer_size,
-        learning_starts=min(1_000, args.total_timesteps),
+        buffer_size=cfg.algo.buffer_size,
+        **sac_kwargs(cfg, save_dir),
     )
+    guard_train(model)
     model.learn(
-        total_timesteps=args.total_timesteps,
-        callback=build_callbacks(args, eval_env, run_name, wandb_run),
+        total_timesteps=cfg.algo.total_timesteps,
+        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
     )
-    if not args.no_save:
-        model.save(run_name)
+    if not cfg.no_save:
+        model.save(os.path.join(save_dir, "final_model"))
     if wandb_run is not None:
         wandb_run.finish()
 
 
+MODES = {"state": run_state, "pixels": run_pixels, "pvr": run_pvr}
+
+
+@hydra.main(config_path="configs", config_name="config_sac", version_base=None)
+def main(cfg: DictConfig) -> None:
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    # The resnet50 NaN (see project memory) turned out to be an aliased-
+    # encoder polyak-update corruption, fixed structurally in
+    # PVRFeaturesExtractor -- not a numerics issue. So these default to
+    # PyTorch's Hopper-friendly settings; toggle off via perf.* only if ever
+    # bisecting a numerics issue again.
+    torch.backends.cuda.matmul.allow_tf32 = cfg.perf.tf32
+    torch.backends.cudnn.allow_tf32 = cfg.perf.tf32
+    torch.backends.cudnn.benchmark = cfg.perf.cudnn_benchmark
+
+    save_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    print(f"\nMode: {cfg.mode}  Device: {cfg.device}  Output dir: {save_dir}")
+
+    MODES[cfg.mode](cfg, save_dir)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["state", "pixels", "pvr"], required=True)
-    parser.add_argument("--env", choices=list(ENV_BUILDERS.keys()), default="carracing",
-                         help="Only used for --mode pixels/pvr.")
-    parser.add_argument("--total-timesteps", type=int, default=100_000)
-    parser.add_argument("--buffer-size", type=int, default=50_000)
-    parser.add_argument("--tensorboard-log", type=str, default="./tb_logs",
-                         help="View with: tensorboard --logdir ./tb_logs")
-    parser.add_argument("--eval-freq", type=int, default=10_000,
-                         help="Run eval episodes every N training steps.")
-    parser.add_argument("--n-eval-episodes", type=int, default=5)
-    parser.add_argument("--checkpoint-freq", type=int, default=20_000,
-                         help="Save a checkpoint every N training steps.")
-    parser.add_argument("--backbone", choices=list(RESNET_EMBED_DIMS.keys()),
-                         default="resnet18", help="Only used for --mode pvr.")
-    parser.add_argument("--no-save", action="store_true",
-                         help="Skip all model checkpointing (final save, "
-                              "best-model save, periodic checkpoints). Eval "
-                              "reward numbers are still logged (small .npz "
-                              "files, not full model weights).")
-    parser.add_argument("--wandb", action="store_true",
-                         help="Mirror tensorboard logs (returns, losses, "
-                              "eval reward) to Weights & Biases.")
-    parser.add_argument("--wandb-project", type=str, default="pvr-sac")
-    parser.add_argument("--wandb-entity", type=str, default=None,
-                         help="Defaults to your wandb account's default entity.")
-    parser.add_argument("--debug", action="store_true",
-                         help="Override to tiny numbers -- just check nothing crashes.")
-    args = parser.parse_args()
-
-    if args.debug:
-        args.total_timesteps = 300
-        args.buffer_size = 1_000
-        args.eval_freq = 100
-        args.checkpoint_freq = 100
-
-    {"state": run_state, "pixels": run_pixels, "pvr": run_pvr}[args.mode](args)
+    main()

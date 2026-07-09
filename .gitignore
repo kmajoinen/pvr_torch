@@ -16,3 +16,7 @@ env/
 pvr_env/
 models/
 outputs/
+wandb/
+tb_logs/
+outs/
+checkpoints/

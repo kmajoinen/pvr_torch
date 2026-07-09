@@ -1,0 +1,18 @@
+name: sac_sb3
+# Maps directly onto stable_baselines3.SAC(...) constructor kwargs.
+batch_size: 256
+learning_rate: 3.0e-4
+buffer_size: 100000
+learning_starts: 1000
+train_freq: 1
+gradient_steps: 1
+target_update_interval: 1
+tau: 0.005              # soft target update coefficient
+gamma: 0.99
+ent_coef: auto           # SB3's automatic entropy-coefficient tuning
+
+# Training-loop / callback settings, not passed to SAC() itself.
+total_timesteps: 200000
+eval_freq: 10000
+n_eval_episodes: 5
+checkpoint_freq: 20000

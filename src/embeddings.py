@@ -376,6 +376,19 @@ class EmbeddingNet(nn.Module):
         self.embedding, self.transforms = \
             _get_embedding(embedding_name, in_channels, pretrained, train)
 
+        bad = [
+            name for name, tensor in
+            list(self.embedding.named_parameters()) + list(self.embedding.named_buffers())
+            if not torch.isfinite(tensor).all()
+        ]
+        if bad:
+            raise RuntimeError(
+                f"Non-finite value(s) in {embedding_name!r} weights immediately "
+                f"after loading, before any forward pass: {bad[:5]}"
+                f"{'...' if len(bad) > 5 else ''}. The checkpoint/cache file is "
+                "likely corrupted or truncated -- delete it and let it re-download."
+            )
+
         # Split transforms so augmentation runs on [0,1] floats, before normalisation.
         # All transform pipelines end with T.Normalize; split there.
         t_list = list(self.transforms.children())
@@ -413,10 +426,17 @@ class EmbeddingNet(nn.Module):
                 out = out['res4']
         return out
 
-    def forward(self, observation):
-        if self.embedding_name == 'true_state':
-            return observation.squeeze().cpu().numpy()
-
+    def encode(self, observation):
+        """
+        Same computation as forward(), but returns a (N, out_size)
+        torch.Tensor on this module's device -- batch dimension always
+        intact (forward()'s squeeze() silently drops it when N==1) and no
+        numpy conversion (forward() always detaches to numpy, even in
+        training mode, which breaks callers that need a differentiable
+        tensor -- e.g. a trainable head sitting on top of this embedding
+        inside another nn.Module's forward pass, like an SB3 features
+        extractor).
+        """
         # observation.shape -> (N, C, H, W)  [channels-first, as returned by gym_wrappers]
         observation = observation.to(device=self.device)
         if not observation.is_contiguous():
@@ -429,11 +449,15 @@ class EmbeddingNet(nn.Module):
 
         if self.embedding.training:
             out = self._forward(observation)
-            return out.reshape(-1, self.out_size).squeeze()
         else:
             with torch.no_grad():
                 out = self._forward(observation)
-                return out.view(-1, self.out_size).squeeze().cpu().numpy()
+        return out.reshape(-1, self.out_size)
+
+    def forward(self, observation):
+        if self.embedding_name == 'true_state':
+            return observation.squeeze().cpu().numpy()
+        return self.encode(observation).squeeze().cpu().numpy()
 
 
 # ==============================================================================
