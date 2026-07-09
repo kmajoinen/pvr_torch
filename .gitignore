@@ -12,11 +12,11 @@ recording/*
 *.pickle
 # configs
 Replica-Dataset
-env/
-pvr_env/
-models/
-outputs/
-wandb/
-tb_logs/
-outs/
-checkpoints/
+/env/
+/pvr_env/
+/models/
+/outputs/
+/wandb/
+/tb_logs/
+/outs/
+/checkpoints/
