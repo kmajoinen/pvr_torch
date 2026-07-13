@@ -1,0 +1,32 @@
+defaults:
+  - env: dmc_cheetah_pixels
+  - algo: sac_fable5
+  - embedding: resnet50
+  - _self_
+
+seed: 1
+device: cuda             # set to cpu if no GPU
+
+save:
+  enabled: true          # best_actor.pt on new best eval + final_checkpoint.pt
+
+wandb:
+  enabled: false
+  project: pvr_torch
+  entity: majoinen-karri
+  run_name: null         # auto-generated if null
+
+perf:
+  tf32: true             # Hopper/GH200 reduced-precision matmul/conv
+  cudnn_benchmark: true
+  amp_bf16: true         # bf16 autocast for frozen-encoder inference
+  compile_encoder: false # torch.compile the frozen encoder (try once stable)
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: outputs/sac/${env.name}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/sac_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${embedding.name}_seed${seed}

@@ -46,8 +46,11 @@ from src.gym_wrappers import make_gym_env
 # Envs
 # ------------------------------------------------------------------------------
 
-def make_state_env():
-    return make_vec_env("Pendulum-v1", n_envs=1)
+def make_state_env(env_id: str):
+    # train_from_pixels=False -> make_gym_env's non-pixel branch, which
+    # FlattenObservations whatever the env natively returns (proprioceptive
+    # sensors for dm_control/FrankaKitchen/etc, not pixels).
+    return make_vec_env(lambda: make_gym_env(train_from_pixels=False, id=env_id), n_envs=1)
 
 
 def make_pixel_env(env_id: str):
@@ -200,9 +203,9 @@ def sac_kwargs(cfg: DictConfig, save_dir: str) -> dict:
 # ------------------------------------------------------------------------------
 
 def run_state(cfg: DictConfig, save_dir: str):
-    env = make_state_env()
-    eval_env = make_state_env()
-    wandb_run = maybe_init_wandb(cfg, "sac_pendulum_state")
+    env = make_state_env(cfg.env.id)
+    eval_env = make_state_env(cfg.env.id)
+    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_state")
 
     model = SAC("MlpPolicy", env, **sac_kwargs(cfg, save_dir))
     guard_train(model)

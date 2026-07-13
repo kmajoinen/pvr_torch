@@ -1,0 +1,17 @@
+name: sac
+total_timesteps: 500_000
+buffer_size: 100_000
+learning_starts: 5000
+batch_size: 256
+gamma: 0.99
+tau: 0.005                    # polyak coefficient for target critics
+policy_lr: 3.0e-4
+q_lr: 1.0e-3
+policy_frequency: 2           # actor updated every N critic updates (then N times)
+target_network_frequency: 1
+alpha: 0.2                    # entropy coefficient (ignored if autotune_alpha)
+autotune_alpha: true
+net_arch: [256, 256]
+log_frequency: 1000           # steps between wandb/stdout training logs
+eval_frequency: 10_000
+n_episodes_test: 5
