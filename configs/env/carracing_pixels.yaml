@@ -1,0 +1,5 @@
+name: carracing
+builder: carracing
+id: CarRacing-v3
+image_size: 96    # native render size; GPU-side resize to encoder input
+n_envs: 1

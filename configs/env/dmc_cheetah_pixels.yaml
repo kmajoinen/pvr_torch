@@ -1,0 +1,5 @@
+name: dmc_cheetah
+builder: dmc
+id: dm_control/cheetah-run-v0
+image_size: 224   # rendered natively at encoder resolution; use 84 for mode=pixels
+n_envs: 1         # >1 uses SubprocVecEnv (dm_control physics is CPU-bound)
