@@ -1,3 +1,4 @@
+import glob
 import os
 import numpy as np
 import gymnasium as gym
@@ -15,6 +16,63 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 
 def _ckpt(filename):
     return os.path.join(MODELS_DIR, filename)
+
+
+def _resolve_model_dir_override(embedding_name, model_dir):
+    """
+    If model_dir is given, look there for a checkpoint file named
+    <embedding_name>.<any extension> (e.g. resnet18.pth, moco_aug.pth.tar)
+    instead of this embedding's normal default location/behavior. Crashes
+    loudly if model_dir is given but no matching file is found -- an
+    explicit model_dir means the caller wants exactly that file, not a
+    silent fallback to the default. Returns None if model_dir is None,
+    signalling "use the default behavior for this embedding_name".
+    """
+    if model_dir is None:
+        return None
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"model_dir {model_dir!r} does not exist.")
+    matches = glob.glob(os.path.join(model_dir, embedding_name + '.*'))
+    if not matches:
+        raise FileNotFoundError(
+            f"No checkpoint found for {embedding_name!r} in {model_dir!r} "
+            f"(looked for {embedding_name}.*)."
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple checkpoints match {embedding_name!r} in {model_dir!r}: {matches}"
+        )
+    return matches[0]
+
+
+def _load_custom_state_dict(model, path, embedding_name):
+    """
+    Loads a model_dir-provided checkpoint into an architecture built with
+    weights=None (torchvision resnets, which otherwise have no local-file
+    loading path at all -- they only ever auto-download). Unwraps the
+    common 'state_dict'/'model' wrapper-dict conventions used elsewhere in
+    this file (see the MAE branches below), then loads with strict=False
+    since a custom checkpoint's exact key names aren't guaranteed to match
+    torchvision's. Warns on partial mismatches; crashes if literally
+    nothing matched, since that means the file is very likely the wrong
+    architecture or format for embedding_name, not just a minor difference.
+    """
+    state_dict = torch.load(path, map_location='cpu')
+    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
+    elif isinstance(state_dict, dict) and 'model' in state_dict:
+        state_dict = state_dict['model']
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if len(missing) == len(list(model.state_dict())):
+        raise RuntimeError(
+            f"Loaded {path!r} for {embedding_name!r} but zero parameters matched "
+            f"the expected architecture -- this checkpoint is very likely the "
+            f"wrong architecture or format for {embedding_name!r}."
+        )
+    if missing or unexpected:
+        print(f"[embeddings] Warning: loading {path!r} for {embedding_name!r} -- "
+              f"missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}, "
+              f"unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
 try:
     import clip
@@ -69,7 +127,7 @@ class UberModel(nn.Module):
             dim=1 if x.ndim > 1 else 0)
 
 
-def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, train=False):
+def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, train=False, model_dir=None):
     """
     See https://pytorch.org/vision/stable/models.html
 
@@ -80,8 +138,21 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             from torchvision (if possible),
         train (bool, False): if True the model will be trained during learning,
             if False its parameters will not change.
+        model_dir (str, optional): if given, look here for a checkpoint file
+            named <embedding_name>.<any extension> instead of this
+            embedding's normal default location/behavior. Raises if no
+            matching file is found. See _resolve_model_dir_override().
 
     """
+    # Resolved lazily (only if a branch below actually needs a checkpoint
+    # file) rather than once up front -- the MoCo "uber" ensemble branches
+    # recursively call _get_embedding() for each sub-model instead of
+    # loading a file directly themselves, so eagerly resolving a file for
+    # e.g. 'moco_aug_uber_345' would crash looking for a file that was never
+    # supposed to exist; each recursive call resolves its own sub-name instead.
+    def _ckpt(filename):
+        override = _resolve_model_dir_override(embedding_name, model_dir)
+        return override if override is not None else os.path.join(MODELS_DIR, filename)
 
     # Default transforms: https://pytorch.org/vision/stable/models.html
     # All pre-trained models expect input images normalized in the same way,
@@ -121,17 +192,35 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     # This works for the models below but may not work for any network
 
     # VANILLA RESNET
+    # These normally never touch a local file at all (torchvision
+    # auto-downloads to its own cache) -- model_dir is the one way to make
+    # them load a specific local checkpoint instead.
     elif embedding_name == 'resnet18':
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        model = models.resnet18(weights=weights)
+        override = _resolve_model_dir_override(embedding_name, model_dir)
+        if override is not None:
+            model = models.resnet18(weights=None)
+            _load_custom_state_dict(model, override, embedding_name)
+        else:
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            model = models.resnet18(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet34':
-        weights = models.ResNet34_Weights.DEFAULT if pretrained else None
-        model = models.resnet34(weights=weights)
+        override = _resolve_model_dir_override(embedding_name, model_dir)
+        if override is not None:
+            model = models.resnet34(weights=None)
+            _load_custom_state_dict(model, override, embedding_name)
+        else:
+            weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+            model = models.resnet34(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet50':
-        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
-        model = models.resnet50(weights=weights)
+        override = _resolve_model_dir_override(embedding_name, model_dir)
+        if override is not None:
+            model = models.resnet50(weights=None)
+            _load_custom_state_dict(model, override, embedding_name)
+        else:
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            model = models.resnet50(weights=weights)
         model.fc = Identity()
     elif embedding_name == 'resnet50_places':
         model = resnet_conv5(checkpoint_path=_ckpt('resnet50_places.pth.tar'))
@@ -209,89 +298,89 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     # MOCO UBER MODELS (AUG)
     elif embedding_name == 'moco_aug_places_uber_345':
         model = UberModel([
-            _get_embedding('moco_aug_places_l3')[0],
-            _get_embedding('moco_aug_places_l4')[0],
-            _get_embedding('moco_aug_places')[0]
+            _get_embedding('moco_aug_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_places_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_aug_uber_345':
         model = UberModel([
-            _get_embedding('moco_aug_l3')[0],
-            _get_embedding('moco_aug_l4')[0],
-            _get_embedding('moco_aug')[0]
+            _get_embedding('moco_aug_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_aug', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_aug_places_uber_35':
         model = UberModel([
-            _get_embedding('moco_aug_places_l3')[0],
-            _get_embedding('moco_aug_places')[0]
+            _get_embedding('moco_aug_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_aug_uber_35':
         model = UberModel([
-            _get_embedding('moco_aug_l3')[0],
-            _get_embedding('moco_aug')[0]
+            _get_embedding('moco_aug_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_aug_places_uber_34':
         model = UberModel([
-            _get_embedding('moco_aug_places_l3')[0],
-            _get_embedding('moco_aug_places_l4')[0],
+            _get_embedding('moco_aug_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_places_l4', model_dir=model_dir)[0],
         ])
     elif embedding_name == 'moco_aug_uber_34':
         model = UberModel([
-            _get_embedding('moco_aug_l3')[0],
-            _get_embedding('moco_aug_l4')[0],
+            _get_embedding('moco_aug_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_l4', model_dir=model_dir)[0],
         ])
     elif embedding_name == 'moco_aug_places_uber_45':
         model = UberModel([
-            _get_embedding('moco_aug_places_l4')[0],
-            _get_embedding('moco_aug_places')[0]
+            _get_embedding('moco_aug_places_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_aug_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_aug_uber_45':
         model = UberModel([
-            _get_embedding('moco_aug_l4')[0],
-            _get_embedding('moco_aug')[0]
+            _get_embedding('moco_aug_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_aug', model_dir=model_dir)[0]
         ])
 
     # MOCO UBER MODELS (CROP)
     elif embedding_name == 'moco_croponly_places_uber_345':
         model = UberModel([
-            _get_embedding('moco_croponly_places_l3')[0],
-            _get_embedding('moco_croponly_places_l4')[0],
-            _get_embedding('moco_croponly_places')[0]
+            _get_embedding('moco_croponly_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_places_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_croponly_uber_345':
         model = UberModel([
-            _get_embedding('moco_croponly_l3')[0],
-            _get_embedding('moco_croponly_l4')[0],
-            _get_embedding('moco_croponly')[0]
+            _get_embedding('moco_croponly_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_croponly_places_uber_35':
         model = UberModel([
-            _get_embedding('moco_croponly_places_l3')[0],
-            _get_embedding('moco_croponly_places')[0]
+            _get_embedding('moco_croponly_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_croponly_uber_35':
         model = UberModel([
-            _get_embedding('moco_croponly_l3')[0],
-            _get_embedding('moco_croponly')[0]
+            _get_embedding('moco_croponly_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_croponly_places_uber_34':
         model = UberModel([
-            _get_embedding('moco_croponly_places_l3')[0],
-            _get_embedding('moco_croponly_places_l4')[0],
+            _get_embedding('moco_croponly_places_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_places_l4', model_dir=model_dir)[0],
         ])
     elif embedding_name == 'moco_croponly_uber_34':
         model = UberModel([
-            _get_embedding('moco_croponly_l3')[0],
-            _get_embedding('moco_croponly_l4')[0],
+            _get_embedding('moco_croponly_l3', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_l4', model_dir=model_dir)[0],
         ])
     elif embedding_name == 'moco_croponly_places_uber_45':
         model = UberModel([
-            _get_embedding('moco_croponly_places_l4')[0],
-            _get_embedding('moco_croponly_places')[0]
+            _get_embedding('moco_croponly_places_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly_places', model_dir=model_dir)[0]
         ])
     elif embedding_name == 'moco_croponly_uber_45':
         model = UberModel([
-            _get_embedding('moco_croponly_l4')[0],
-            _get_embedding('moco_croponly')[0]
+            _get_embedding('moco_croponly_l4', model_dir=model_dir)[0],
+            _get_embedding('moco_croponly', model_dir=model_dir)[0]
         ])
 
     # MASK
@@ -364,7 +453,7 @@ class EmbeddingNet(nn.Module):
     mean/std normalisation — only when the model is in training mode.
     """
     def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
-                 disable_cuda=False, augmentation=None):
+                 disable_cuda=False, augmentation=None, model_dir=None):
         super(EmbeddingNet, self).__init__()
 
         self.embedding_name = embedding_name
@@ -374,7 +463,7 @@ class EmbeddingNet(nn.Module):
 
         self.in_channels = in_channels
         self.embedding, self.transforms = \
-            _get_embedding(embedding_name, in_channels, pretrained, train)
+            _get_embedding(embedding_name, in_channels, pretrained, train, model_dir=model_dir)
 
         bad = [
             name for name, tensor in

@@ -56,6 +56,11 @@ class PVRFeaturesExtractor(BaseFeaturesExtractor):
         of a fixed representation. Set False to finetune the encoder jointly.
     disable_cuda : bool
         Forces EmbeddingNet onto CPU regardless of GPU availability.
+    model_dir : str, optional
+        If given, look here for a checkpoint file named
+        <embedding_name>.<any extension> instead of the default location
+        (e.g. to load from cluster scratch storage, separate from where
+        the code itself lives). See src.embeddings._resolve_model_dir_override.
     """
 
     def __init__(
@@ -64,9 +69,11 @@ class PVRFeaturesExtractor(BaseFeaturesExtractor):
         embedding_name: str,
         freeze: bool = True,
         disable_cuda: bool = False,
+        model_dir: str = None,
     ):
         embedding_net = EmbeddingNet(
-            embedding_name, pretrained=True, train=not freeze, disable_cuda=disable_cuda
+            embedding_name, pretrained=True, train=not freeze, disable_cuda=disable_cuda,
+            model_dir=model_dir,
         )
         super().__init__(observation_space, features_dim=int(embedding_net.out_size))
         self.embedding_net = embedding_net

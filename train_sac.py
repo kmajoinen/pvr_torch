@@ -252,6 +252,7 @@ def run_pvr(cfg: DictConfig, save_dir: str):
             embedding_name=cfg.embedding.name,
             freeze=True,  # standard PVR-eval protocol: probe, don't finetune
             disable_cuda=(cfg.device == "cpu"),
+            model_dir=cfg.model_dir,
         ),
         net_arch=[256, 256],
         normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm

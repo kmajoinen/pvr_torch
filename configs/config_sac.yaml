@@ -18,6 +18,13 @@ mode: pvr
 no_save: false               # skip all checkpointing (final/best/periodic);
                               # eval reward is still logged either way
 
+model_dir: null              # if set, embedding checkpoints are looked up here
+                              # first (matched by filename minus extension, e.g.
+                              # resnet18.pth) -- crashes if set but no matching
+                              # file is found. Useful when checkpoints live on a
+                              # different filesystem than the code (e.g. scratch
+                              # vs projappl on the cluster).
+
 wandb:
   enabled: false
   project: pvr-sac
