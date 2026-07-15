@@ -26,7 +26,7 @@ from stable_baselines3 import SAC
 from train_sac import make_pixel_env
 from feature_extractor import PVRFeaturesExtractor
 
-env_id = sys.argv[1] if len(sys.argv) > 1 else "dmc_cheetah"
+env_id = sys.argv[1] if len(sys.argv) > 1 else "dm_control/cheetah-run-v0"
 embedding_name = sys.argv[2] if len(sys.argv) > 2 else "resnet18"
 
 env = make_pixel_env(env_id)
