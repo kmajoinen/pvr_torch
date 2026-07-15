@@ -411,8 +411,18 @@ def main(cfg: DictConfig) -> None:
             print(f"  step {global_step:>8,}  EVAL return={stats['return_mean']:.1f}"
                   f"±{stats['return_std']:.1f}")
             if use_wandb:
-                wandb.log({"eval/return_mean": stats["return_mean"],
-                           "eval/return_std": stats["return_std"]}, step=global_step)
+                # Keys match SB3's EvalCallback convention (eval/mean_reward)
+                # so this stays comparable in the same wandb dashboard as
+                # train_sac.py/train_sac_fable5.py -- but SB3's own
+                # EvalCallback computes std_reward and only uses it for its
+                # console printout, never actually logging it (verified
+                # against SB3 2.9.0 source). We log it anyway: it's a real,
+                # already-computed diagnostic (how consistent the policy is
+                # across eval episodes, not just its average), and dropping
+                # it to match SB3's more limited automatic path would throw
+                # away information for no benefit.
+                wandb.log({"eval/mean_reward": stats["return_mean"],
+                           "eval/std_reward": stats["return_std"]}, step=global_step)
             if cfg.save.enabled and stats["return_mean"] > best_eval_return:
                 best_eval_return = stats["return_mean"]
                 torch.save(actor.state_dict(), os.path.join(save_dir, "best_actor.pt"))
