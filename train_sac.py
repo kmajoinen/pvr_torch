@@ -2,27 +2,45 @@
 SAC (via Stable-Baselines3) training script, mirroring train_bc.py's
 hydra-configured structure.
 
-Three MODES, meant to be run in order so you isolate failures instead of
+Five MODES, meant to be run in order so you isolate failures instead of
 debugging SAC + pixels + a custom encoder all at once:
 
-  state   Vanilla SAC on a state-based env (Pendulum-v1).
-          Confirms SAC itself learns -- no vision involved.
+  state     Vanilla SAC on a state-based env (Pendulum-v1).
+            Confirms SAC itself learns -- no vision involved.
 
-  pixels  SAC on cfg.env using SB3's default CNN (NatureCNN).
-          Confirms the pixel plumbing works: image dtype/normalization,
-          replay buffer with image obs.
+  pixels    SAC on cfg.env using SB3's default CNN (NatureCNN), trained
+            end-to-end from scratch. Confirms the pixel plumbing works:
+            image dtype/normalization, replay buffer with image obs. This
+            is also the "CNN trained from scratch" baseline for comparison
+            against the pvr* modes below.
 
-  pvr     Same env, but the CNN is replaced by cfg.embedding via
-          PVRFeaturesExtractor. This is the config you'll actually use to
-          benchmark PVRs against each other.
+  pvr       Frozen cfg.embedding backbone, SLOW: the encoder lives inside
+            PVRFeaturesExtractor as part of the SB3 policy, so it gets
+            re-run on every gradient step's sampled minibatch even though
+            its weights never change. Simple, but wasteful.
+
+  pvr_fast  Frozen cfg.embedding backbone, FAST: the encoder lives outside
+            the policy entirely (FrozenPVRVecWrapper), encoding each frame
+            exactly once per env step; the replay buffer stores feature
+            vectors, not pixels, and gradient steps never touch the
+            encoder. Same result as pvr, much less compute -- this is the
+            config you'll actually use to benchmark PVRs against each
+            other. Cannot finetune (see FrozenPVRVecWrapper's docstring
+            for why not, by construction, not as a missing feature).
+
+  pvr_ft    Same as pvr, but the encoder trains jointly with the RL head
+            (freeze=False) -- necessarily the "slow", in-policy mechanism,
+            since finetuning requires gradients to flow through the
+            encoder on every step.
 
 Usage
 -----
     python train_sac.py mode=state
     python train_sac.py mode=pixels env=dmc_cheetah
-    python train_sac.py mode=pvr env=dmc_cheetah embedding=resnet50
-    python train_sac.py mode=pvr embedding=mae_base algo.total_timesteps=500000
-    python train_sac.py mode=pvr algo.total_timesteps=300 algo.buffer_size=1000  # quick smoke test
+    python train_sac.py mode=pvr_fast env=dmc_cheetah embedding=resnet50
+    python train_sac.py mode=pvr_fast embedding=mae_base algo.total_timesteps=500000
+    python train_sac.py mode=pvr_ft embedding=resnet18
+    python train_sac.py mode=pvr_fast algo.total_timesteps=300 algo.buffer_size=1000  # quick smoke test
 """
 
 import os
@@ -38,7 +56,7 @@ from stable_baselines3.common.env_util import make_vec_env
 import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from feature_extractor import PVRFeaturesExtractor
+from feature_extractor import FrozenPVRVecWrapper, LayerNormExtractor, PVRFeaturesExtractor
 from src.gym_wrappers import make_gym_env
 
 
@@ -242,29 +260,59 @@ def run_pixels(cfg: DictConfig, save_dir: str):
 
 
 def run_pvr(cfg: DictConfig, save_dir: str):
-    env = make_pixel_env(cfg.env.id)
-    eval_env = make_pixel_env(cfg.env.id)
-    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}")
+    """Handles mode in {pvr, pvr_fast, pvr_ft} -- see module docstring for
+    what each one means. pvr and pvr_ft share the same in-policy plumbing
+    (differing only in freeze=True/False); pvr_fast is the only genuinely
+    different code path, since it can't be used for finetuning."""
+    if cfg.mode == "pvr_fast":
+        env = FrozenPVRVecWrapper(
+            make_pixel_env(cfg.env.id), cfg.embedding.name,
+            disable_cuda=(cfg.device == "cpu"), model_dir=cfg.model_dir,
+            amp_bf16=cfg.perf.amp_bf16,
+        )
+        eval_env = FrozenPVRVecWrapper(
+            make_pixel_env(cfg.env.id), cfg.embedding.name,
+            disable_cuda=(cfg.device == "cpu"), model_dir=cfg.model_dir,
+            amp_bf16=cfg.perf.amp_bf16,
+        )
+        wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}_fast")
+        policy_kwargs = dict(
+            features_extractor_class=LayerNormExtractor,
+            net_arch=[256, 256],
+        )
+        model = SAC(
+            "MlpPolicy",
+            env,
+            policy_kwargs=policy_kwargs,
+            buffer_size=cfg.algo.buffer_size,
+            **sac_kwargs(cfg, save_dir),
+        )
+    else:
+        freeze = (cfg.mode == "pvr")  # "pvr" = frozen/slow, "pvr_ft" = finetune
+        env = make_pixel_env(cfg.env.id)
+        eval_env = make_pixel_env(cfg.env.id)
+        wandb_run = maybe_init_wandb(
+            cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}{'' if freeze else '_ft'}"
+        )
+        policy_kwargs = dict(
+            features_extractor_class=PVRFeaturesExtractor,
+            features_extractor_kwargs=dict(
+                embedding_name=cfg.embedding.name,
+                freeze=freeze,
+                disable_cuda=(cfg.device == "cpu"),
+                model_dir=cfg.model_dir,
+            ),
+            net_arch=[256, 256],
+            normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm
+        )
+        model = SAC(
+            "CnnPolicy",
+            env,
+            policy_kwargs=policy_kwargs,
+            buffer_size=cfg.algo.buffer_size,
+            **sac_kwargs(cfg, save_dir),
+        )
 
-    policy_kwargs = dict(
-        features_extractor_class=PVRFeaturesExtractor,
-        features_extractor_kwargs=dict(
-            embedding_name=cfg.embedding.name,
-            freeze=True,  # standard PVR-eval protocol: probe, don't finetune
-            disable_cuda=(cfg.device == "cpu"),
-            model_dir=cfg.model_dir,
-        ),
-        net_arch=[256, 256],
-        normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm
-    )
-
-    model = SAC(
-        "CnnPolicy",
-        env,
-        policy_kwargs=policy_kwargs,
-        buffer_size=cfg.algo.buffer_size,
-        **sac_kwargs(cfg, save_dir),
-    )
     guard_train(model)
     model.learn(
         total_timesteps=cfg.algo.total_timesteps,
@@ -276,7 +324,13 @@ def run_pvr(cfg: DictConfig, save_dir: str):
         wandb_run.finish()
 
 
-MODES = {"state": run_state, "pixels": run_pixels, "pvr": run_pvr}
+MODES = {
+    "state": run_state,
+    "pixels": run_pixels,
+    "pvr": run_pvr,
+    "pvr_fast": run_pvr,
+    "pvr_ft": run_pvr,
+}
 
 
 @hydra.main(config_path="configs", config_name="config_sac", version_base=None)

@@ -7,13 +7,17 @@ defaults:
 seed: 1
 device: cuda                # set to cpu if no GPU
 
-# state   Vanilla SAC on Pendulum-v1 -- confirms SAC itself learns, no vision.
-# pixels  SAC on cfg.env using SB3's default CNN (NatureCNN) -- confirms the
-#         pixel plumbing works (image dtype/normalization, replay buffer).
-# pvr     Same env, but the CNN is replaced by cfg.embedding via
-#         PVRFeaturesExtractor -- the config you'll actually use to
-#         benchmark PVRs against each other.
-mode: pvr
+# state     Vanilla SAC on Pendulum-v1 -- confirms SAC itself learns, no vision.
+# pixels    SAC on cfg.env using SB3's default CNN (NatureCNN), trained from
+#           scratch -- confirms the pixel plumbing works, and is the "CNN
+#           trained from scratch" baseline vs the pvr* modes.
+# pvr       Frozen cfg.embedding, SLOW: encoder lives inside the SB3 policy,
+#           re-run on every gradient step even though it never changes.
+# pvr_fast  Frozen cfg.embedding, FAST: encoder lives outside the policy
+#           (FrozenPVRVecWrapper), encoded once per env step -- the config
+#           you'll actually use to benchmark PVRs against each other.
+# pvr_ft    Same as pvr, but the encoder finetunes jointly (freeze=False).
+mode: pvr_fast
 
 no_save: false               # skip all checkpointing (final/best/periodic);
                               # eval reward is still logged either way
@@ -34,6 +38,7 @@ wandb:
 perf:
   tf32: true             # Hopper/GH200 reduced-precision matmul/conv
   cudnn_benchmark: true  # let cuDNN autotune conv algorithms per input shape
+  amp_bf16: true          # bf16 autocast for frozen-encoder inference (mode=pvr_fast)
 
 hydra:
   run:
