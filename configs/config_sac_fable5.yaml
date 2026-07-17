@@ -4,6 +4,21 @@ defaults:
   - embedding: resnet50
   - _self_
 
+
+finetune:
+  enabled: false          # false -> frozen fast path (wrapper, features in buffer)
+  encoder_grads: critic   # none | critic | actor | both  (none = slow-frozen mode)
+  encoder_lr: 1.0e-5      # separate encoder LR, well below q_lr/policy_lr
+  grad_clip: 10.0         # clip norm on encoder gradients before each step
+  aux_loss: none          # none | l2sp  (l2sp = anchor to pretrained weights)
+  aux_weight: 1.0
+
+# Reminder for finetune runs: pixels go in the buffer, so override
+#   env.image_size=112 (or 84)  and/or  algo.buffer_size
+# to keep obs+next_obs memory sane (printed at startup). The frozen fast
+# path keeps rendering at 224 as before.
+
+
 seed: 1
 device: cuda             # set to cpu if no GPU
 

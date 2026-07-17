@@ -111,6 +111,28 @@ def init(module, weight_init, bias_init, gain=1):
 # GET EMBEDDING
 # ==============================================================================
 
+# forward_fn(model, x) -> raw model output. _get_embedding() picks one of
+# these per branch (explicitly, at the same place the model itself is
+# built) instead of EmbeddingNet._forward() re-deriving "how do I call this
+# model" from embedding_name substrings in a second, separate place that can
+# drift out of sync with the loading logic.
+def _forward_default(model, x):
+    return model(x)
+
+
+def _forward_clip(model, x):
+    return model.encode_image(x)
+
+
+def _forward_mae(model, x):
+    out, *_ = model.forward_encoder(x, mask_ratio=0.0)
+    return out[:, 0, :]
+
+
+def _forward_maskrcnn(model, x):
+    return model(x)['res4']
+
+
 class UberModel(nn.Module):
     def __init__(self, models):
         super(UberModel, self).__init__()
@@ -166,6 +188,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         T.ConvertImageDtype(torch.float),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     )
+    forward_fn = _forward_default
 
     assert in_channels == 3, 'Current models accept 3-channel inputs only.'
 
@@ -242,14 +265,17 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         model = mae_vit_base_patch16()
         checkpoint = torch.load(_ckpt('mae_pretrain_vit_base.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
+        forward_fn = _forward_mae
     elif embedding_name == 'mae_large':
         model = mae_vit_large_patch16()
         checkpoint = torch.load(_ckpt('mae_pretrain_vit_large.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
+        forward_fn = _forward_mae
     elif embedding_name == 'mae_huge':
         model = mae_vit_huge_patch14()
         checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
+        forward_fn = _forward_mae
 
     # MOCO
     elif embedding_name == 'moco_aug':
@@ -399,6 +425,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             T.Normalize([103.530, 116.280, 123.675], [1.0, 1.0, 1.0]),
         )
         model = mask_rcnn_model(checkpoint_path=_ckpt('maskrcnn_l3.pth'))
+        forward_fn = _forward_maskrcnn
 
     # CLIP
     elif 'clip' in embedding_name:
@@ -418,10 +445,14 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             T.ConvertImageDtype(torch.float),
             T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
         )
+        forward_fn = _forward_clip
 
     # TRUE STATE (BASELINE)
+    # Unreachable via EmbeddingNet (it short-circuits before calling
+    # _get_embedding for 'true_state') -- kept 3-tuple for consistency in
+    # case anything ever calls this function directly with that name.
     elif embedding_name == 'true_state':
-        return nn.Sequential(Identity()), nn.Sequential(Identity())
+        return nn.Sequential(Identity()), nn.Sequential(Identity()), _forward_default
 
     else:
         raise NotImplementedError("Requested model not available.")
@@ -435,7 +466,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         for p in model.parameters():
             p.requires_grad = False
 
-    return model, transforms
+    return model, transforms, forward_fn
 
 
 # ==============================================================================
@@ -462,7 +493,7 @@ class EmbeddingNet(nn.Module):
             return
 
         self.in_channels = in_channels
-        self.embedding, self.transforms = \
+        self.embedding, self.transforms, self._forward_fn = \
             _get_embedding(embedding_name, in_channels, pretrained, train, model_dir=model_dir)
 
         bad = [
@@ -504,16 +535,7 @@ class EmbeddingNet(nn.Module):
         self.training = self.embedding.training
 
     def _forward(self, observation):
-        if 'clip' in self.embedding_name:
-            out = self.embedding.encode_image(observation)
-        elif 'mae' in self.embedding_name:
-            out, *_ = self.embedding.forward_encoder(observation, mask_ratio=0.0)
-            out = out[:,0,:]
-        else:
-            out = self.embedding(observation)
-            if self.embedding_name == 'maskrcnn_l3':
-                out = out['res4']
-        return out
+        return self._forward_fn(self.embedding, observation)
 
     def encode(self, observation):
         """
