@@ -165,7 +165,7 @@ def maybe_init_wandb(cfg: DictConfig, run_name: str, save_dir: str):
         name=cfg.wandb.run_name or run_name,
         config=OmegaConf.to_container(cfg, resolve=True),
         sync_tensorboard=True,
-        save_code=False,
+        save_code=True,
     )
 
 
