@@ -1,4 +1,4 @@
-name: sac
+name: sac_cleanrl
 total_timesteps: 500_000
 buffer_size: 100_000
 learning_starts: 5000

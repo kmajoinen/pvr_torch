@@ -131,7 +131,7 @@ def guard_train(model):
 # Wandb / callbacks
 # ------------------------------------------------------------------------------
 
-def maybe_init_wandb(cfg: DictConfig, run_name: str):
+def maybe_init_wandb(cfg: DictConfig, run_name: str, save_dir: str):
     """
     Returns a wandb run if cfg.wandb.enabled, else None. Uses
     sync_tensorboard=True, which piggybacks on the tensorboard_log SAC
@@ -139,6 +139,15 @@ def maybe_init_wandb(cfg: DictConfig, run_name: str):
     EvalCallback) writes to tensorboard is mirrored to wandb automatically.
     Must be called BEFORE the SAC(...) model is constructed so the patch is
     in place before SB3 creates its writer.
+
+    wandb.tensorboard.patch(root_logdir=save_dir) is called explicitly,
+    before wandb.init(), so wandb.init(sync_tensorboard=True) sees
+    wandb.patched["tensorboard"] already populated and skips its own
+    auto-patch (verified against wandb 0.28.0 source -- no double-patch).
+    Without this, wandb's patch defaults to root_logdir="" -> resolved as
+    os.getcwd(), which never contains save_dir's absolute Hydra output
+    path -- every SB3-created event-file writer then logs "Found log
+    directory outside of given root_logdir, dropping given root_logdir".
 
     If cluster compute nodes have no outbound internet, set
     WANDB_MODE=offline in the job script -- wandb then writes locally with
@@ -149,6 +158,7 @@ def maybe_init_wandb(cfg: DictConfig, run_name: str):
         return None
     import wandb
     from omegaconf import OmegaConf
+    wandb.tensorboard.patch(root_logdir=save_dir)
     return wandb.init(
         project=cfg.wandb.project,
         entity=cfg.wandb.entity,
@@ -223,7 +233,7 @@ def sac_kwargs(cfg: DictConfig, save_dir: str) -> dict:
 def run_state(cfg: DictConfig, save_dir: str):
     env = make_state_env(cfg.env.id)
     eval_env = make_state_env(cfg.env.id)
-    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_state")
+    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_state", save_dir)
 
     model = SAC("MlpPolicy", env, **sac_kwargs(cfg, save_dir))
     guard_train(model)
@@ -240,7 +250,7 @@ def run_state(cfg: DictConfig, save_dir: str):
 def run_pixels(cfg: DictConfig, save_dir: str):
     env = make_pixel_env(cfg.env.id)
     eval_env = make_pixel_env(cfg.env.id)
-    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_defaultcnn")
+    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_defaultcnn", save_dir)
 
     model = SAC(
         "CnnPolicy",  # SB3's default NatureCNN
@@ -275,7 +285,7 @@ def run_pvr(cfg: DictConfig, save_dir: str):
             disable_cuda=(cfg.device == "cpu"), model_dir=cfg.model_dir,
             amp_bf16=cfg.perf.amp_bf16,
         )
-        wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}_fast")
+        wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}_fast", save_dir)
         policy_kwargs = dict(
             features_extractor_class=LayerNormExtractor,
             net_arch=[256, 256],
@@ -292,7 +302,7 @@ def run_pvr(cfg: DictConfig, save_dir: str):
         env = make_pixel_env(cfg.env.id)
         eval_env = make_pixel_env(cfg.env.id)
         wandb_run = maybe_init_wandb(
-            cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}{'' if freeze else '_ft'}"
+            cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}{'' if freeze else '_ft'}", save_dir
         )
         policy_kwargs = dict(
             features_extractor_class=PVRFeaturesExtractor,
@@ -304,6 +314,19 @@ def run_pvr(cfg: DictConfig, save_dir: str):
             ),
             net_arch=[256, 256],
             normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm
+            # SB3 defaults share_features_extractor to False: actor, critic,
+            # and critic_target would each get their OWN independently
+            # constructed PVRFeaturesExtractor (verified against SB3 2.9.0
+            # source). Harmless when frozen (three copies of the same fixed
+            # function), but for pvr_ft it means three SEPARATE encoders
+            # drifting apart under their own network's gradients only --
+            # not "one PVR finetuned by the agent". True either way: forces
+            # actor+critic to share one instance (critic_target still gets
+            # its own, hard-synced then polyak-updated toward it -- the
+            # normal, correct SAC target-network mechanism, safe here since
+            # PVRFeaturesExtractor always builds a fresh EmbeddingNet from a
+            # string, never aliasing a live module).
+            share_features_extractor=True,
         )
         model = SAC(
             "CnnPolicy",

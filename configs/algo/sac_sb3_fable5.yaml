@@ -1,4 +1,4 @@
-name: sac
+name: sac_sb3
 # Maps onto stable_baselines3.SAC(...) constructor kwargs (see sac_kwargs()
 # in train_sac_fable5.py) plus that script's own loop-level settings.
 total_timesteps: 500_000
