@@ -1,0 +1,4 @@
+name: openclip_vit_b32
+pretrained: true
+train: false
+augmentation: null

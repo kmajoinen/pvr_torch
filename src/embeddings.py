@@ -79,6 +79,12 @@ try:
 except:
     print('clip not found, launch pip install git+https://github.com/openai/CLIP.git')
 
+try:
+    import open_clip
+    _HAS_OPENCLIP = True
+except ImportError:
+    _HAS_OPENCLIP = False
+
 from src.vision_models.moco import (
     moco_conv3_compressed,
     moco_conv4_compressed,
@@ -131,6 +137,47 @@ def _forward_mae(model, x):
 
 def _forward_maskrcnn(model, x):
     return model(x)['res4']
+
+
+# One config-friendly name -> (open_clip arch, pretrained tag) per supported
+# variant. embedding_name has to be a single self-contained string (it's
+# what configs/embedding/*.yaml's `name:` field passes straight through to
+# EmbeddingNet), so this stands in for open_clip's separate arch/pretrained
+# arguments rather than trying to cram both into one free-form name.
+OPENCLIP_CONFIGS = {
+    'openclip_vit_b32': ('ViT-B-32', 'laion2b_s34b_b79k'),
+    'openclip_vit_l14': ('ViT-L-14', 'laion2b_s32b_b82k'),
+    'openclip_rn50': ('RN50', 'openai'),
+}
+
+
+def _extract_openclip_transform_params(preprocess_val):
+    """
+    open_clip.create_model_and_transforms() returns a torchvision Compose
+    built for PIL inputs (Resize -> CenterCrop -> ToTensor -> Normalize).
+    This file's pipeline instead runs on already-batched uint8 CHW tensors,
+    so that Compose can't be reused directly -- pull just the resize size
+    and normalize mean/std out of it and rebuild with this file's own
+    transform idiom. Reading these two steps out of preprocess_val is more
+    robust than reading a model attribute: the resolution attribute name on
+    model.visual is inconsistent across architectures (image_size vs
+    input_resolution), but every preprocess_val always contains a Resize
+    and a Normalize step.
+    """
+    resize_size, mean, std = None, None, None
+    for t in preprocess_val.transforms:
+        if isinstance(t, T.Resize):
+            size = t.size
+            resize_size = size[0] if isinstance(size, (tuple, list)) else size
+        elif isinstance(t, T.Normalize):
+            mean, std = t.mean, t.std
+    if resize_size is None or mean is None:
+        raise RuntimeError(
+            "Could not find a Resize/Normalize step in open_clip's "
+            "preprocess_val pipeline -- open_clip's transform internals "
+            "may have changed."
+        )
+    return resize_size, mean, std
 
 
 class UberModel(nn.Module):
@@ -426,6 +473,25 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         )
         model = mask_rcnn_model(checkpoint_path=_ckpt('maskrcnn_l3.pth'))
         forward_fn = _forward_maskrcnn
+
+    # OPENCLIP
+    # Checked before the 'clip' in embedding_name branch below since
+    # 'clip' is a substring of every 'openclip_*' name.
+    elif embedding_name in OPENCLIP_CONFIGS:
+        if not _HAS_OPENCLIP:
+            raise ImportError("openclip requires: pip install open_clip_torch")
+        arch, pretrained_tag = OPENCLIP_CONFIGS[embedding_name]
+        model, _, preprocess_val = open_clip.create_model_and_transforms(
+            arch, pretrained=pretrained_tag if pretrained else None
+        )
+        resize_size, mean, std = _extract_openclip_transform_params(preprocess_val)
+        transforms = nn.Sequential(
+            T.Resize(resize_size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+            T.CenterCrop(resize_size),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize(list(mean), list(std)),
+        )
+        forward_fn = _forward_clip
 
     # CLIP
     elif 'clip' in embedding_name:
