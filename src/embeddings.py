@@ -511,6 +511,13 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             # this file (named_parameters(), .to(device), etc, without the
             # replicate-on-every-forward overhead DataParallel adds).
             model = model.module
+        # load_r3m() also auto-moves the model onto cuda itself when a GPU
+        # is present -- unlike every other branch here, which builds on CPU
+        # and lets EmbeddingNet.__init__ move it to self.device uniformly,
+        # after running a CPU dummy-forward sanity check. Force back to CPU
+        # so that invariant holds (same reason clip.load(..., device='cpu')
+        # is explicit below).
+        model = model.cpu()
         transforms = nn.Sequential(
             T.Resize(256),
             T.CenterCrop(224),
