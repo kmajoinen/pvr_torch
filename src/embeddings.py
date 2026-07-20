@@ -610,7 +610,11 @@ class EmbeddingNet(nn.Module):
         bad = [
             name for name, tensor in
             list(self.embedding.named_parameters()) + list(self.embedding.named_buffers())
-            if not torch.isfinite(tensor).all()
+            # OpenCLIP's text-tower causal attn_mask is a non-persistent,
+            # runtime-constructed buffer deliberately filled with -inf
+            # (never loaded from a checkpoint, and unused here since we
+            # only call .encode_image()) -- not a sign of corruption.
+            if not name.endswith('attn_mask') and not torch.isfinite(tensor).all()
         ]
         if bad:
             raise RuntimeError(
