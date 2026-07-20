@@ -85,6 +85,12 @@ try:
 except ImportError:
     _HAS_OPENCLIP = False
 
+try:
+    from r3m import load_r3m
+    _HAS_R3M = True
+except ImportError:
+    _HAS_R3M = False
+
 from src.vision_models.moco import (
     moco_conv3_compressed,
     moco_conv4_compressed,
@@ -139,6 +145,15 @@ def _forward_maskrcnn(model, x):
     return model(x)['res4']
 
 
+class _ScaleTo255(nn.Module):
+    """R3M expects [0, 255]-range input with no external mean/std
+    normalization -- that's baked into the model itself. This runs after
+    T.ConvertImageDtype(torch.float) (which produces [0, 1]) to undo the
+    usual /255 convention every other branch in this file relies on."""
+    def forward(self, x):
+        return x * 255.0
+
+
 # One config-friendly name -> (open_clip arch, pretrained tag) per supported
 # variant. embedding_name has to be a single self-contained string (it's
 # what configs/embedding/*.yaml's `name:` field passes straight through to
@@ -148,6 +163,15 @@ OPENCLIP_CONFIGS = {
     'openclip_vit_b32': ('ViT-B-32', 'laion2b_s34b_b79k'),
     'openclip_vit_l14': ('ViT-L-14', 'laion2b_s32b_b82k'),
     'openclip_rn50': ('RN50', 'openai'),
+}
+
+# load_r3m() takes a bare torchvision resnet name ('resnet18'/'resnet34'/
+# 'resnet50') and only ever loads R3M's own pretrained checkpoint for it --
+# there's no random-init path, unlike the plain 'resnetNN' branches above.
+R3M_ARCHS = {
+    'r3m_resnet18': 'resnet18',
+    'r3m_resnet34': 'resnet34',
+    'r3m_resnet50': 'resnet50',
 }
 
 
@@ -473,6 +497,27 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         )
         model = mask_rcnn_model(checkpoint_path=_ckpt('maskrcnn_l3.pth'))
         forward_fn = _forward_maskrcnn
+
+    # R3M
+    elif embedding_name in R3M_ARCHS:
+        if not _HAS_R3M:
+            raise ImportError("r3m requires: pip install git+https://github.com/facebookresearch/r3m.git")
+        if not pretrained:
+            raise NotImplementedError("R3M has no random-init path -- load_r3m() always loads its pretrained checkpoint.")
+        model = load_r3m(R3M_ARCHS[embedding_name])
+        if isinstance(model, nn.DataParallel):
+            # load_r3m() always wraps in DataParallel, even on a single GPU/CPU;
+            # unwrap so this behaves like every other single-module branch in
+            # this file (named_parameters(), .to(device), etc, without the
+            # replicate-on-every-forward overhead DataParallel adds).
+            model = model.module
+        transforms = nn.Sequential(
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),  # -> [0, 1]
+            _ScaleTo255(),                     # -> [0, 255]; R3M normalizes internally
+        )
+        # forward_fn stays _forward_default: R3M's forward() takes the [0, 255] tensor directly.
 
     # OPENCLIP
     # Checked before the 'clip' in embedding_name branch below since
