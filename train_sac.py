@@ -1,379 +1,772 @@
 """
-SAC (via Stable-Baselines3) training script, mirroring train_bc.py's
-hydra-configured structure.
+Soft Actor-Critic on pretrained visual representations (PVRs), written as an
+explicit training loop in the style of train_bc.py.
 
-Five MODES, meant to be run in order so you isolate failures instead of
-debugging SAC + pixels + a custom encoder all at once:
+The SAC update math is adapted from CleanRL's sac_continuous_action.py
+(https://github.com/vwxyzjn/cleanrl, MIT license), which is benchmarked
+against reference results -- the tanh-Gaussian log-prob correction, twin-Q
+target, and automatic entropy tuning are kept verbatim. Nothing from CleanRL
+needs to be installed; this file is self-contained.
 
-  state     Vanilla SAC on a state-based env (Pendulum-v1).
-            Confirms SAC itself learns -- no vision involved.
+Two encoder regimes, selected by cfg.finetune.enabled:
 
-  pixels    SAC on cfg.env using SB3's default CNN (NatureCNN), trained
-            end-to-end from scratch. Confirms the pixel plumbing works:
-            image dtype/normalization, replay buffer with image obs. This
-            is also the "CNN trained from scratch" baseline for comparison
-            against the pvr* modes below.
+  FROZEN-FAST (finetune.enabled=false, the standard PVR-eval protocol)
+      The frozen encoder lives in an env wrapper (FrozenEncoderWrapper): each
+      frame is encoded exactly once at env-step time, the replay buffer
+      stores feature vectors, and gradient updates never touch the encoder.
 
-  pvr       Frozen cfg.embedding backbone, SLOW: the encoder lives inside
-            PVRFeaturesExtractor as part of the SB3 policy, so it gets
-            re-run on every gradient step's sampled minibatch even though
-            its weights never change. Simple, but wasteful.
+  FINETUNE (finetune.enabled=true)
+      Pixels are stored in the replay buffer and the encoder sits inside the
+      gradient path, re-encoding each sampled minibatch -- necessarily slower
+      (that cost is the definition of finetuning, not a defect). Gradient
+      routing into the encoder is one visible enum:
 
-  pvr_fast  Frozen cfg.embedding backbone, FAST: the encoder lives outside
-            the policy entirely (FrozenPVRVecWrapper), encoding each frame
-            exactly once per env step; the replay buffer stores feature
-            vectors, not pixels, and gradient steps never touch the
-            encoder. Same result as pvr, much less compute -- this is the
-            config you'll actually use to benchmark PVRs against each
-            other. Cannot finetune (see FrozenPVRVecWrapper's docstring
-            for why not, by construction, not as a missing feature).
+        finetune.encoder_grads:
+          none    Encoder weights never update. This is the SLOW-FROZEN mode:
+                  protocol-compatible with in-policy frozen extraction, and
+                  the structural prerequisite for per-sample augmentation
+                  (PIE-G / DrQ-style), which the fast path cannot express.
+          critic  DrQ-v2 recipe: critic loss trains the encoder, actor takes
+                  detached features. The literature's default choice.
+          actor   Actor loss trains the encoder (both gradient paths of the
+                  actor loss -- through the policy input AND through the Q
+                  evaluation). NOTE: this is the FULL actor-loss gradient;
+                  SB3's share_features_extractor=True routes only the
+                  policy-input path (verified empirically on SB3 2.9.0).
+                  TODO: to replicate SB3's variant exactly, detach the Q-eval
+                  input (see the marked line in the actor update).
+          both    critic + actor gradients. NOTE: applied as SEQUENTIAL
+                  Adam steps (one critic-phase step every update, plus
+                  policy_frequency actor-phase steps on firing steps, each
+                  re-encoding), not as one summed-gradient step -- summing
+                  would require evaluating the actor loss against
+                  pre-critic-update Q networks, changing SAC's ordering.
+                  Same for aux_loss, which always rides the critic-phase
+                  cadence regardless of routing (so actor+l2sp alternates
+                  pure-aux and pure-actor steps). With Adam these dynamics
+                  differ from a combined step; compare routings via
+                  train/encoder_drift_l2, which is routing-agnostic.
 
-  pvr_ft    Same as pvr, but the encoder trains jointly with the RL head
-            (freeze=False) -- necessarily the "slow", in-policy mechanism,
-            since finetuning requires gradients to flow through the
-            encoder on every step.
+      Independently of routing, an auxiliary objective can train the encoder
+      (finetune.aux_loss): 'l2sp' anchors weights to their pretrained values
+      (||theta - theta_0||^2, Xuhong et al. 2018) -- adapt while penalizing
+      drift. aux_loss with encoder_grads=none = adaptation without RL
+      gradients at all.
 
-Usage
------
-    python train_sac.py mode=state
-    python train_sac.py mode=pixels env=dmc_cheetah
-    python train_sac.py mode=pvr_fast env=dmc_cheetah embedding=resnet50
-    python train_sac.py mode=pvr_fast embedding=mae_base algo.total_timesteps=500000
-    python train_sac.py mode=pvr_ft embedding=resnet18
-    python train_sac.py mode=pvr_fast algo.total_timesteps=300 algo.buffer_size=1000  # quick smoke test
+Design notes:
+  - Actor and critics each apply their own LayerNorm to input features.
+  - Bootstrapping is masked on `terminated` only, so truncation-only envs
+    (dm_control, 1000-step episodes) bootstrap through the time limit.
+  - No target encoder: target-Q features come from the live encoder under
+    no_grad (DrQ-v2 convention -- target networks exist for the Q heads only).
+  - Encoder stays in eval() mode even while its weights train: pretrained
+    ResNets carry BatchNorm, and letting BN running stats update on RL frames
+    is a known silent-corruption source (and the failure mode behind this
+    project's original resnet50 NaN). Frozen BN statistics, trainable BN
+    affine params -- the standard finetuning choice.
+  - Finetune buffer memory: uint8 pixels cost 2 * buffer_size * H * W * 3
+    bytes (obs + next_obs). At the frozen path's native 224 render that is
+    ~30 GB per 100k -- override env.image_size (e.g. 112 or 84) or shrink
+    algo.buffer_size for finetune runs; EmbeddingNet's transforms resize
+    internally either way. The script prints the estimate at startup.
+
+Usage:
+    python train_sac.py                                  # frozen fast path
+    python train_sac.py finetune.enabled=true finetune.encoder_grads=critic \
+        env.image_size=112 embedding=resnet18
+    python train_sac.py finetune.enabled=true finetune.encoder_grads=none \
+        env.image_size=112                                      # slow-frozen protocol
+    python train_sac.py finetune.enabled=true finetune.aux_loss=l2sp \
+        finetune.encoder_grads=none env.image_size=112          # aux-only adaptation
+    python train_sac.py env=pendulum embedding=none      # state-based sanity check
 """
 
 import os
 
+# Must be set before dm_control's C extension loads; EGL = GPU offscreen
+# rendering, the fast option on a GPU node. Override in the shell if needed.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import random
+import time
+
 import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig
-from stable_baselines3 import SAC
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
-from stable_baselines3.common.env_util import make_vec_env
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import gymnasium as gym
+from omegaconf import DictConfig, OmegaConf
 
-import sys
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+from feature_extractor import FrozenEncoderWrapper
 
-from feature_extractor import FrozenPVRVecWrapper, LayerNormExtractor, PVRFeaturesExtractor
-from src.gym_wrappers import make_gym_env
-
-
-# ------------------------------------------------------------------------------
-# Envs
-# ------------------------------------------------------------------------------
-
-def make_state_env(env_id: str):
-    # train_from_pixels=False -> make_gym_env's non-pixel branch, which
-    # FlattenObservations whatever the env natively returns (proprioceptive
-    # sensors for dm_control/FrankaKitchen/etc, not pixels).
-    return make_vec_env(lambda: make_gym_env(train_from_pixels=False, id=env_id), n_envs=1)
-
-
-def make_pixel_env(env_id: str):
-    # make_gym_env's train_from_pixels path already applies
-    # AddRenderObservation + ResizeObservation(84,84) + ChannelsFirstWrapper,
-    # so the resulting obs are already (C, H, W) -- no VecTransposeImage needed.
-    return make_vec_env(lambda: make_gym_env(train_from_pixels=True, id=env_id), n_envs=1)
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
 
 
 # ------------------------------------------------------------------------------
-# Safety nets (cheap, generically useful -- not backbone-specific)
+# Environments
 # ------------------------------------------------------------------------------
 
-class NaNGuardCallback(BaseCallback):
-    """
-    Raises immediately, with the actual cause, the first time a reward goes
-    non-finite -- instead of letting the run continue until SB3's Normal(...)
-    constructor rejects a NaN action mean several steps later deep in
-    torch.distributions, with no context on whether the NaN originated from
-    env/reward divergence or from the optimizer.
 
-    Deliberately does NOT check policy parameters here: SB3's off-policy loop
-    runs predict() -> env.step() -> callback.on_step() for a step, and only
-    calls train() *after* that -- immediately followed by the next step's
-    predict(), with no callback in between. See guard_train() below.
-    """
+def _make_dmc(env_id: str, image_size: int):
+    import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
+    from gymnasium.wrappers import AddRenderObservation
 
-    def _on_step(self) -> bool:
-        rewards = self.locals.get("rewards")
-        if rewards is not None and not np.isfinite(rewards).all():
-            raise RuntimeError(
-                f"Non-finite reward at step {self.num_timesteps}: {rewards} "
-                "-- env/physics likely diverged, not a policy/encoder issue."
-            )
-        return True
-
-
-def guard_train(model):
-    """
-    Wraps model.train() so a non-finite parameter is caught the instant a
-    gradient update produces it, with the gradient-step count and parameter
-    name -- the one window NaNGuardCallback structurally can't cover.
-    """
-    original_train = model.train
-
-    def guarded_train(*args, **kwargs):
-        original_train(*args, **kwargs)
-        for name, param in model.policy.named_parameters():
-            if not torch.isfinite(param).all():
-                raise RuntimeError(
-                    f"Non-finite parameter '{name}' immediately after train() "
-                    f"at step {model.num_timesteps} -- gradient update diverged "
-                    "(rewards were finite, so this isn't an env/physics issue)."
-                )
-
-    model.train = guarded_train
-
-
-# ------------------------------------------------------------------------------
-# Wandb / callbacks
-# ------------------------------------------------------------------------------
-
-def maybe_init_wandb(cfg: DictConfig, run_name: str, save_dir: str):
-    """
-    Returns a wandb run if cfg.wandb.enabled, else None. Uses
-    sync_tensorboard=True, which piggybacks on the tensorboard_log SAC
-    writes to -- wandb patches the SummaryWriter, so every scalar SB3 (and
-    EvalCallback) writes to tensorboard is mirrored to wandb automatically.
-    Must be called BEFORE the SAC(...) model is constructed so the patch is
-    in place before SB3 creates its writer.
-
-    wandb.tensorboard.patch(root_logdir=save_dir) is called explicitly,
-    before wandb.init(), so wandb.init(sync_tensorboard=True) sees
-    wandb.patched["tensorboard"] already populated and skips its own
-    auto-patch (verified against wandb 0.28.0 source -- no double-patch).
-    Without this, wandb's patch defaults to root_logdir="" -> resolved as
-    os.getcwd(), which never contains save_dir's absolute Hydra output
-    path -- every SB3-created event-file writer then logs "Found log
-    directory outside of given root_logdir, dropping given root_logdir".
-
-    If cluster compute nodes have no outbound internet, set
-    WANDB_MODE=offline in the job script -- wandb then writes locally with
-    no network calls, and you `wandb sync <run_dir>` from the login node
-    afterward.
-    """
-    if not cfg.wandb.enabled:
-        return None
-    import wandb
-    from omegaconf import OmegaConf
-    wandb.tensorboard.patch(root_logdir=save_dir)
-    return wandb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        name=cfg.wandb.run_name or run_name,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        sync_tensorboard=True,
-        save_code=True,
+    env = gym.make(
+        env_id,
+        render_mode="rgb_array",
+        render_kwargs=dict(height=image_size, width=image_size, camera_id=0),
     )
+    return AddRenderObservation(env, render_only=True)
 
 
-def build_callbacks(cfg: DictConfig, eval_env, save_dir: str, wandb_run=None):
+def _make_carracing(env_id: str, image_size: int):
+    return gym.make(env_id, render_mode="rgb_array")
+
+
+def _make_state(env_id: str, image_size: int):
+    return gym.make(env_id)
+
+
+ENV_BUILDERS = {"dmc": _make_dmc, "carracing": _make_carracing, "state": _make_state}
+
+
+def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     """
-    EvalCallback: periodically runs the current policy on a held-out env and
-    logs mean reward -- the "is it learning anything" signal while the job
-    is running. Its log_path writes small .npz reward arrays regardless of
-    cfg.no_save.
-
-    CheckpointCallback: saves the full model every checkpoint_freq steps.
-    Skipped entirely under cfg.no_save.
-
-    WandbCallback: also uploads gradients/model info to wandb directly, if
-    enabled. Its own model_save_path is likewise skipped under cfg.no_save.
+    wrap_encoder=True  -> frozen fast path: env emits feature vectors.
+    wrap_encoder=False -> finetune path: env emits raw uint8 HWC pixels;
+                          encoding happens inside the training loop.
     """
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=None if cfg.no_save else os.path.join(save_dir, "best"),
-        log_path=os.path.join(save_dir, "eval"),
-        eval_freq=cfg.algo.eval_freq,
-        n_eval_episodes=cfg.algo.n_eval_episodes,
-        deterministic=True,
-    )
-    callbacks = [eval_callback, NaNGuardCallback()]
-    if not cfg.no_save:
-        callbacks.append(CheckpointCallback(
-            save_freq=cfg.algo.checkpoint_freq,
-            save_path=save_dir,
-            name_prefix="sac",
-        ))
-    if wandb_run is not None:
-        from wandb.integration.sb3 import WandbCallback
-        callbacks.append(WandbCallback(
-            model_save_path=None if cfg.no_save else os.path.join(save_dir, "wandb_models"),
-            verbose=2,
-        ))
-    return callbacks
-
-
-def sac_kwargs(cfg: DictConfig, save_dir: str) -> dict:
-    """Hyperparameters shared by all three modes, read from cfg.algo."""
-    return dict(
-        verbose=1,
-        device=cfg.device,
-        tensorboard_log=save_dir,
-        learning_rate=cfg.algo.learning_rate,
-        batch_size=cfg.algo.batch_size,
-        gamma=cfg.algo.gamma,
-        tau=cfg.algo.tau,
-        train_freq=cfg.algo.train_freq,
-        gradient_steps=cfg.algo.gradient_steps,
-        target_update_interval=cfg.algo.target_update_interval,
-        ent_coef=cfg.algo.ent_coef,
-        # Clamp so small smoke-test runs (algo.total_timesteps overridden low)
-        # still exceed learning_starts and actually exercise training.
-        learning_starts=min(cfg.algo.learning_starts, cfg.algo.total_timesteps),
-    )
+    env = ENV_BUILDERS[cfg.env.builder](cfg.env.id, cfg.env.get("image_size", 84))
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    if embedding_net is not None and wrap_encoder:
+        env = FrozenEncoderWrapper(env, embedding_net, amp_bf16=cfg.perf.amp_bf16)
+    return env
 
 
 # ------------------------------------------------------------------------------
-# Modes
+# Replay buffer (float32 feature/state vectors OR uint8 image frames)
 # ------------------------------------------------------------------------------
 
-def run_state(cfg: DictConfig, save_dir: str):
-    env = make_state_env(cfg.env.id)
-    eval_env = make_state_env(cfg.env.id)
-    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_state", save_dir)
 
-    model = SAC("MlpPolicy", env, **sac_kwargs(cfg, save_dir))
-    guard_train(model)
-    model.learn(
-        total_timesteps=cfg.algo.total_timesteps,
-        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
-    )
-    if not cfg.no_save:
-        model.save(os.path.join(save_dir, "final_model"))
-    if wandb_run is not None:
-        wandb_run.finish()
-
-
-def run_pixels(cfg: DictConfig, save_dir: str):
-    env = make_pixel_env(cfg.env.id)
-    eval_env = make_pixel_env(cfg.env.id)
-    wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_defaultcnn", save_dir)
-
-    model = SAC(
-        "CnnPolicy",  # SB3's default NatureCNN
-        env,
-        buffer_size=cfg.algo.buffer_size,
-        **sac_kwargs(cfg, save_dir),
-    )
-    guard_train(model)
-    model.learn(
-        total_timesteps=cfg.algo.total_timesteps,
-        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
-    )
-    if not cfg.no_save:
-        model.save(os.path.join(save_dir, "final_model"))
-    if wandb_run is not None:
-        wandb_run.finish()
-
-
-def run_pvr(cfg: DictConfig, save_dir: str):
-    """Handles mode in {pvr, pvr_fast, pvr_ft} -- see module docstring for
-    what each one means. pvr and pvr_ft share the same in-policy plumbing
-    (differing only in freeze=True/False); pvr_fast is the only genuinely
-    different code path, since it can't be used for finetuning."""
-    if cfg.mode == "pvr_fast":
-        env = FrozenPVRVecWrapper(
-            make_pixel_env(cfg.env.id), cfg.embedding.name,
-            disable_cuda=(cfg.device == "cpu"), model_dir=cfg.model_dir,
-            amp_bf16=cfg.perf.amp_bf16,
+class ReplayBuffer:
+    def __init__(
+        self,
+        capacity: int,
+        obs_shape: tuple,
+        action_dim: int,
+        device,
+        obs_dtype=np.float32,
+    ):
+        self.capacity = capacity
+        self.device = device
+        # Pre-flight estimate BEFORE allocating, so an oversized
+        # buffer_size/image_size combination announces itself instead of
+        # dying inside np.zeros.
+        itemsize = np.dtype(obs_dtype).itemsize
+        gb = 2 * capacity * int(np.prod(obs_shape)) * itemsize / 1e9
+        print(
+            f"Replay buffer: {capacity:,} x {obs_shape} {np.dtype(obs_dtype).name}"
+            f"  ({gb:.1f} GB for obs+next_obs)"
         )
-        eval_env = FrozenPVRVecWrapper(
-            make_pixel_env(cfg.env.id), cfg.embedding.name,
-            disable_cuda=(cfg.device == "cpu"), model_dir=cfg.model_dir,
-            amp_bf16=cfg.perf.amp_bf16,
+        self.obs = np.zeros((capacity, *obs_shape), dtype=obs_dtype)
+        self.next_obs = np.zeros((capacity, *obs_shape), dtype=obs_dtype)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.terminations = np.zeros(capacity, dtype=np.float32)
+        self.pos, self.full = 0, False
+
+    def add(self, obs, next_obs, action, reward, terminated):
+        self.obs[self.pos] = obs
+        self.next_obs[self.pos] = next_obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.terminations[self.pos] = float(terminated)
+        self.pos = (self.pos + 1) % self.capacity
+        self.full = self.full or self.pos == 0
+
+    def __len__(self):
+        return self.capacity if self.full else self.pos
+
+    def sample(self, batch_size: int):
+        idx = np.random.randint(0, len(self), size=batch_size)
+        to = lambda x: torch.as_tensor(x, device=self.device)
+        # TODO(augmentation): per-sample random shift/crop (PIE-G / DrQ style)
+        # goes here, applied to to(self.obs[idx]) / to(self.next_obs[idx])
+        # before returning -- only meaningful when the buffer stores pixels.
+        return (
+            to(self.obs[idx]),
+            to(self.next_obs[idx]),
+            to(self.actions[idx]),
+            to(self.rewards[idx]),
+            to(self.terminations[idx]),
         )
-        wandb_run = maybe_init_wandb(cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}_fast", save_dir)
-        policy_kwargs = dict(
-            features_extractor_class=LayerNormExtractor,
-            net_arch=[256, 256],
-        )
-        model = SAC(
-            "MlpPolicy",
-            env,
-            policy_kwargs=policy_kwargs,
-            buffer_size=cfg.algo.buffer_size,
-            **sac_kwargs(cfg, save_dir),
-        )
-    else:
-        freeze = (cfg.mode == "pvr")  # "pvr" = frozen/slow, "pvr_ft" = finetune
-        env = make_pixel_env(cfg.env.id)
-        eval_env = make_pixel_env(cfg.env.id)
-        wandb_run = maybe_init_wandb(
-            cfg, f"sac_{cfg.env.id}_{cfg.embedding.name}{'' if freeze else '_ft'}", save_dir
-        )
-        policy_kwargs = dict(
-            features_extractor_class=PVRFeaturesExtractor,
-            features_extractor_kwargs=dict(
-                embedding_name=cfg.embedding.name,
-                freeze=freeze,
-                disable_cuda=(cfg.device == "cpu"),
-                model_dir=cfg.model_dir,
+
+
+# ------------------------------------------------------------------------------
+# Networks (CleanRL SAC, plus input LayerNorm for large-scale PVR features)
+# ------------------------------------------------------------------------------
+
+
+class SoftQNetwork(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden: list):
+        super().__init__()
+        self.obs_norm = nn.LayerNorm(obs_dim)
+        self.fc1 = nn.Linear(obs_dim + action_dim, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc3 = nn.Linear(hidden[1], 1)
+
+    def forward(self, obs, action):
+        x = torch.cat([self.obs_norm(obs), action], dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+
+class Actor(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden: list, action_space):
+        super().__init__()
+        self.obs_norm = nn.LayerNorm(obs_dim)
+        self.fc1 = nn.Linear(obs_dim, hidden[0])
+        self.fc2 = nn.Linear(hidden[0], hidden[1])
+        self.fc_mean = nn.Linear(hidden[1], action_dim)
+        self.fc_logstd = nn.Linear(hidden[1], action_dim)
+        self.register_buffer(
+            "action_scale",
+            torch.tensor(
+                (action_space.high - action_space.low) / 2.0, dtype=torch.float32
             ),
-            net_arch=[256, 256],
-            normalize_images=False,  # PVRFeaturesExtractor does its own /255 + ImageNet norm
-            # SB3 defaults share_features_extractor to False: actor, critic,
-            # and critic_target would each get their OWN independently
-            # constructed PVRFeaturesExtractor (verified against SB3 2.9.0
-            # source). Harmless when frozen (three copies of the same fixed
-            # function), but for pvr_ft it means three SEPARATE encoders
-            # drifting apart under their own network's gradients only --
-            # not "one PVR finetuned by the agent". True either way: forces
-            # actor+critic to share one instance (critic_target still gets
-            # its own, hard-synced then polyak-updated toward it -- the
-            # normal, correct SAC target-network mechanism, safe here since
-            # PVRFeaturesExtractor always builds a fresh EmbeddingNet from a
-            # string, never aliasing a live module).
-            share_features_extractor=True,
         )
-        model = SAC(
-            "CnnPolicy",
-            env,
-            policy_kwargs=policy_kwargs,
-            buffer_size=cfg.algo.buffer_size,
-            **sac_kwargs(cfg, save_dir),
+        self.register_buffer(
+            "action_bias",
+            torch.tensor(
+                (action_space.high + action_space.low) / 2.0, dtype=torch.float32
+            ),
         )
 
-    guard_train(model)
-    model.learn(
-        total_timesteps=cfg.algo.total_timesteps,
-        callback=build_callbacks(cfg, eval_env, save_dir, wandb_run),
-    )
-    if not cfg.no_save:
-        model.save(os.path.join(save_dir, "final_model"))
-    if wandb_run is not None:
-        wandb_run.finish()
+    def forward(self, x):
+        x = self.obs_norm(x)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        mean = self.fc_mean(x)
+        log_std = torch.tanh(self.fc_logstd(x))
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+        return mean, log_std
+
+    def get_action(self, x):
+        mean, log_std = self(x)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()  # reparameterization trick
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_scale + self.action_bias
+        log_prob = normal.log_prob(x_t)
+        log_prob = log_prob - torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
+        return action, log_prob, mean_action
 
 
-MODES = {
-    "state": run_state,
-    "pixels": run_pixels,
-    "pvr": run_pvr,
-    "pvr_fast": run_pvr,
-    "pvr_ft": run_pvr,
-}
+# ------------------------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------------------------
+
+
+def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None) -> dict:
+    """encode_fn: obs -> feature tensor (finetune path, where env emits
+    pixels); None when the env already emits features/state vectors."""
+    actor.eval()
+    returns = []
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        ep_return, done = 0.0, False
+        while not done:
+            if encode_fn is not None:
+                obs_t = encode_fn(obs)
+            else:
+                obs_t = torch.as_tensor(
+                    obs, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+            with torch.no_grad():
+                _, _, mean_action = actor.get_action(obs_t)  # deterministic
+            obs, reward, term, trunc, _ = env.step(mean_action.squeeze(0).cpu().numpy())
+            ep_return += float(reward)
+            done = term or trunc
+        returns.append(ep_return)
+    actor.train()
+    return {
+        "return_mean": float(np.mean(returns)),
+        "return_std": float(np.std(returns)),
+    }
+
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 
 
 @hydra.main(config_path="configs", config_name="config_sac", version_base=None)
 def main(cfg: DictConfig) -> None:
+    print(OmegaConf.to_yaml(cfg))
+
+    # ── Reproducibility / perf ────────────────────────────────────────────────
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
-
-    # The resnet50 NaN (see project memory) turned out to be an aliased-
-    # encoder polyak-update corruption, fixed structurally in
-    # PVRFeaturesExtractor -- not a numerics issue. So these default to
-    # PyTorch's Hopper-friendly settings; toggle off via perf.* only if ever
-    # bisecting a numerics issue again.
+    random.seed(cfg.seed)
     torch.backends.cuda.matmul.allow_tf32 = cfg.perf.tf32
     torch.backends.cudnn.allow_tf32 = cfg.perf.tf32
     torch.backends.cudnn.benchmark = cfg.perf.cudnn_benchmark
 
-    save_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    print(f"\nMode: {cfg.mode}  Device: {cfg.device}  Output dir: {save_dir}")
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
 
-    MODES[cfg.mode](cfg, save_dir)
+    # ── Finetune configuration ────────────────────────────────────────────────
+    if "finetune" not in cfg:
+        raise KeyError(
+            "cfg.finetune missing -- add a `finetune:` block to "
+            "configs/config_sac.yaml "
+            "(top level, alongside seed/device/save/wandb/perf)."
+        )
+    ft = cfg.finetune
+    finetune = bool(ft.enabled)
+    routing = str(ft.encoder_grads) if finetune else "none"
+    aux_name = str(ft.aux_loss) if finetune else "none"
+    assert routing in ("none", "critic", "actor", "both"), routing
+    assert aux_name in ("none", "l2sp"), aux_name
+    encoder_trains = finetune and (routing != "none" or aux_name != "none")
+    if finetune:
+        print(
+            f"Finetune: encoder_grads={routing}  aux_loss={aux_name}"
+            f"  encoder_lr={ft.encoder_lr}"
+            f"{'  (slow-frozen: pixels in buffer, encoder never updates)' if not encoder_trains else ''}"
+        )
+
+    # ── Weights & Biases ──────────────────────────────────────────────────────
+    use_wandb = cfg.wandb.enabled
+    if use_wandb:
+        import wandb
+
+        emb_tag = cfg.embedding.get("name") or "state"
+        ft_tag = (
+            f"_ft-{routing}" + (f"-{aux_name}" if aux_name != "none" else "")
+            if finetune
+            else ""
+        )
+        run_name = (
+            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{ft_tag}_s{cfg.seed}"
+        )
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=run_name,
+            mode=cfg.wandb.get("mode", "online"),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            save_code=True,
+        )
+        print(f"wandb run: {wandb.run.url}")
+
+    # ── Encoder ───────────────────────────────────────────────────────────────
+    emb_name = cfg.embedding.get("name", None)
+    assert not (finetune and emb_name is None), "finetune.enabled requires an embedding"
+    embedding_net = None
+    if emb_name is not None:
+        from src.embeddings import EmbeddingNet
+
+        embedding_net = EmbeddingNet(
+            emb_name,
+            pretrained=True,
+            train=encoder_trains,
+            disable_cuda=(str(device) == "cpu"),
+        )
+        # eval() ALWAYS, even while weights train: freeze BatchNorm running
+        # stats (see module docstring). Trainability is controlled purely via
+        # requires_grad below, never via train()-mode.
+        embedding_net.eval()
+        for p in embedding_net.parameters():
+            p.requires_grad_(encoder_trains)
+        print(
+            f"\nEmbedding: {emb_name}  →  obs_size: {embedding_net.out_size}"
+            f"  (trainable={encoder_trains})"
+        )
+
+    # ── Envs ──────────────────────────────────────────────────────────────────
+    # Frozen fast path: env wrapper encodes, buffer stores features.
+    # Finetune path: env emits pixels, encoding happens in the loop.
+    wrap = not finetune
+    env = make_env(cfg, embedding_net, wrap_encoder=wrap)
+    eval_env = make_env(cfg, embedding_net, wrap_encoder=wrap)
+    assert isinstance(env.action_space, gym.spaces.Box), "continuous actions only"
+    env.action_space.seed(cfg.seed)
+
+    action_dim = int(np.prod(env.action_space.shape))
+    if finetune:
+        obs_shape = env.observation_space.shape  # (H, W, C) uint8
+        feat_dim = int(embedding_net.out_size)
+        buffer_dtype = np.uint8
+    else:
+        obs_shape = env.observation_space.shape  # (feat_dim,) or state
+        feat_dim = int(np.prod(obs_shape))
+        buffer_dtype = np.float32
+
+    # ── Encoding helper (finetune path) ───────────────────────────────────────
+    amp_on = cfg.perf.amp_bf16 and device.type == "cuda"
+    _grad_contract_checked = False
+
+    def encode(obs_batch, grad: bool) -> torch.Tensor:
+        """(B, H, W, C) uint8 (tensor or ndarray) -> (B, feat_dim) float32.
+        Same layout/dtype contract as FrozenEncoderWrapper: uint8 CHW into
+        EmbeddingNet.encode, which handles resize/normalization internally."""
+        nonlocal _grad_contract_checked
+        x = (
+            torch.as_tensor(np.ascontiguousarray(obs_batch))
+            if not torch.is_tensor(obs_batch)
+            else obs_batch
+        )
+        x = x.to(device).permute(0, 3, 1, 2)
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        with ctx, torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
+            feats = embedding_net.encode(x)
+        if grad and not _grad_contract_checked:
+            # TODO(EmbeddingNet contract): if this trips, EmbeddingNet.encode
+            # breaks the graph internally (no_grad/inference_mode, a numpy
+            # round-trip, or a non-differentiable jit path, e.g. some CLIP
+            # torch.jit archives). Fix inside src/embeddings.py for
+            # train=True, or add a grad-capable encode_train() there.
+            assert (
+                torch.is_tensor(feats) and feats.requires_grad
+            ), "EmbeddingNet.encode returned a graph-less result under enable_grad"
+            _grad_contract_checked = True
+        if not torch.is_tensor(feats):
+            feats = torch.as_tensor(feats, device=device)
+        return feats.float()
+
+    def encode_single(obs_np) -> torch.Tensor:
+        return encode(np.asarray(obs_np)[None], grad=False)
+
+    # ── Networks / optimizers ─────────────────────────────────────────────────
+    hidden = list(cfg.algo.net_arch)
+    actor = Actor(feat_dim, action_dim, hidden, env.action_space).to(device)
+    qf1 = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
+    qf2 = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
+    qf1_target = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
+    qf2_target = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
+    qf1_target.load_state_dict(qf1.state_dict())
+    qf2_target.load_state_dict(qf2.state_dict())
+
+    q_optimizer = optim.Adam(
+        list(qf1.parameters()) + list(qf2.parameters()), lr=cfg.algo.q_lr
+    )
+    actor_optimizer = optim.Adam(actor.parameters(), lr=cfg.algo.policy_lr)
+
+    enc_optimizer, theta0 = None, None
+    if encoder_trains:
+        # Separate, much lower LR: at the head LRs a resnet18's weight sums
+        # drift ~3% in 50 gradient steps (measured) -- far too fast for a
+        # pretrained representation you want to adapt, not destroy.
+        enc_optimizer = optim.Adam(embedding_net.parameters(), lr=ft.encoder_lr)
+        theta0 = {n: p.detach().clone() for n, p in embedding_net.named_parameters()}
+
+    def aux_loss_fn() -> torch.Tensor:
+        if aux_name == "l2sp":
+            return sum(
+                ((p - theta0[n]) ** 2).sum()
+                for n, p in embedding_net.named_parameters()
+            )
+        # TODO(aux): add reconstruction / temporal-contrastive objectives here
+        # as new aux_name branches; they receive the encoder via closure.
+        raise ValueError(aux_name)
+
+    def encoder_drift() -> float:
+        with torch.no_grad():
+            return float(
+                sum(
+                    ((p - theta0[n]) ** 2).sum()
+                    for n, p in embedding_net.named_parameters()
+                ).sqrt()
+            )
+
+    # automatic entropy tuning
+    if cfg.algo.autotune_alpha:
+        target_entropy = -float(action_dim)
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        alpha = log_alpha.exp().item()
+        a_optimizer = optim.Adam([log_alpha], lr=cfg.algo.q_lr)
+    else:
+        alpha = cfg.algo.alpha
+
+    rb = ReplayBuffer(
+        cfg.algo.buffer_size, obs_shape, action_dim, device, obs_dtype=buffer_dtype
+    )
+    save_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    best_eval_return = -float("inf")
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    print(
+        f"\nTraining for {cfg.algo.total_timesteps:,} steps "
+        f"(learning starts at {cfg.algo.learning_starts:,})"
+    )
+    obs, _ = env.reset(seed=cfg.seed)
+    t0 = time.time()
+    # Per-phase encoder grad norms: each written ONLY by its own phase and
+    # reset when that phase doesn't step this global_step -- so `both` mode
+    # logs both norms instead of the actor norm shadowing the critic one,
+    # and `actor` mode logs NaN (not a stale value) on non-firing steps.
+    enc_gnorm_critic = float("nan")
+    enc_gnorm_actor = float("nan")
+
+    for global_step in range(1, cfg.algo.total_timesteps + 1):
+        # ---- act --------------------------------------------------------------
+        if global_step <= cfg.algo.learning_starts:
+            action = env.action_space.sample()
+        else:
+            if finetune:
+                obs_t = encode_single(obs)
+            else:
+                obs_t = torch.as_tensor(
+                    obs, dtype=torch.float32, device=device
+                ).unsqueeze(0)
+            with torch.no_grad():
+                action_t, _, _ = actor.get_action(obs_t)
+            action = action_t.squeeze(0).cpu().numpy()
+
+        next_obs, reward, terminated, truncated, info = env.step(action)
+
+        # bootstrap mask uses `terminated` only: on truncation (time limit)
+        # the value of next_obs is still real and should be bootstrapped.
+        rb.add(obs, next_obs, action, reward, terminated)
+
+        if terminated or truncated:
+            ep = info.get("episode")
+            if ep is not None:
+                print(
+                    f"  step {global_step:>8,}  episodic_return={float(ep['r']):8.1f}"
+                )
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "charts/episodic_return": float(ep["r"]),
+                            "charts/episodic_length": int(ep["l"]),
+                        },
+                        step=global_step,
+                    )
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+
+        if global_step <= cfg.algo.learning_starts:
+            continue
+
+        # ---- sample + featurize -----------------------------------------------
+        b_obs, b_next_obs, b_actions, b_rewards, b_terms = rb.sample(
+            cfg.algo.batch_size
+        )
+
+        route_critic = finetune and routing in ("critic", "both")
+        route_actor = finetune and routing in ("actor", "both")
+
+        if finetune:
+            feats = encode(b_obs, grad=route_critic)
+            # No target encoder: live encoder under no_grad (DrQ-v2 convention).
+            next_feats = encode(b_next_obs, grad=False)
+        else:
+            feats, next_feats = b_obs, b_next_obs
+
+        # ---- critic update ------------------------------------------------------
+        with torch.no_grad():
+            next_actions, next_log_pi, _ = actor.get_action(next_feats)
+            qf1_next = qf1_target(next_feats, next_actions)
+            qf2_next = qf2_target(next_feats, next_actions)
+            min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
+            next_q_value = b_rewards + (
+                1 - b_terms
+            ) * cfg.algo.gamma * min_qf_next.view(-1)
+
+        qf1_a_values = qf1(feats, b_actions).view(-1)
+        qf2_a_values = qf2(feats, b_actions).view(-1)
+        qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+        qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+        qf_loss = qf1_loss + qf2_loss
+
+        enc_step_now = route_critic or (encoder_trains and aux_name != "none")
+        enc_gnorm_critic = float("nan")
+        enc_gnorm_actor = float("nan")
+        if enc_step_now:
+            enc_optimizer.zero_grad(set_to_none=True)
+        q_optimizer.zero_grad()
+        qf_loss.backward()
+        q_optimizer.step()
+
+        aux_value = None
+        if encoder_trains and aux_name != "none":
+            aux = ft.aux_weight * aux_loss_fn()
+            aux.backward()
+            aux_value = aux.item()
+        if enc_step_now:
+            enc_gnorm_critic = float(
+                torch.nn.utils.clip_grad_norm_(
+                    embedding_net.parameters(), max_norm=ft.grad_clip
+                )
+            )
+            enc_optimizer.step()
+
+        # ---- actor (+ alpha) update, delayed ------------------------------------
+        if global_step % cfg.algo.policy_frequency == 0:
+            for _ in range(cfg.algo.policy_frequency):
+                if finetune:
+                    if route_actor:
+                        # Re-encode with grad each inner iteration: the
+                        # encoder may have just been updated, and the critic
+                        # phase's graph is already consumed.
+                        feats_pi = encode(b_obs, grad=True)
+                    else:
+                        # Reuse critic-phase features (detached). If the
+                        # encoder stepped this iteration these are stale by
+                        # exactly one enc_optimizer update -- negligible at
+                        # encoder_lr, and it saves a full encoder forward.
+                        feats_pi = feats.detach()
+                else:
+                    feats_pi = feats
+
+                pi, log_pi, _ = actor.get_action(feats_pi)
+                # FULL actor-loss gradient: encoder grads (when route_actor)
+                # flow through BOTH the policy input and the Q evaluation.
+                # TODO(SB3-mirror): to replicate SB3's share=True variant
+                # (policy-input path only), evaluate the Qs on
+                # feats_pi.detach() instead of feats_pi.
+                qf1_pi = qf1(feats_pi, pi)
+                qf2_pi = qf2(feats_pi, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                actor_loss = (alpha * log_pi - min_qf_pi).mean()
+
+                if route_actor:
+                    enc_optimizer.zero_grad(set_to_none=True)
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
+                if route_actor:
+                    enc_gnorm_actor = float(
+                        torch.nn.utils.clip_grad_norm_(
+                            embedding_net.parameters(), max_norm=ft.grad_clip
+                        )
+                    )
+                    enc_optimizer.step()
+                # Note: actor_loss.backward() also deposits gradients on
+                # qf1/qf2 params; q_optimizer.zero_grad() clears them before
+                # the next critic update (same ordering CleanRL relies on).
+
+                if cfg.algo.autotune_alpha:
+                    with torch.no_grad():
+                        _, log_pi_a, _ = actor.get_action(
+                            feats_pi.detach() if feats_pi.requires_grad else feats_pi
+                        )
+                    alpha_loss = (-log_alpha.exp() * (log_pi_a + target_entropy)).mean()
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.exp().item()
+
+        # ---- polyak target update -----------------------------------------------
+        if global_step % cfg.algo.target_network_frequency == 0:
+            tau = cfg.algo.tau
+            for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                target_param.data.copy_(
+                    tau * param.data + (1 - tau) * target_param.data
+                )
+            for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                target_param.data.copy_(
+                    tau * param.data + (1 - tau) * target_param.data
+                )
+
+        # ---- logging --------------------------------------------------------------
+        if global_step % cfg.algo.log_frequency == 0:
+            sps = int(global_step / (time.time() - t0))
+            print(
+                f"  step {global_step:>8,}  qf_loss={qf_loss.item():8.3f}"
+                f"  q1={qf1_a_values.mean().item():7.2f}"
+                f"  actor_loss={actor_loss.item():8.3f}"
+                f"  alpha={alpha:.3f}  SPS={sps}"
+                + (
+                    f"  enc_gnorm(c/a)={enc_gnorm_critic:.2f}/{enc_gnorm_actor:.2f}"
+                    if encoder_trains
+                    else ""
+                )
+            )
+            if use_wandb:
+                log = {
+                    "train/qf1_loss": qf1_loss.item(),
+                    "train/qf2_loss": qf2_loss.item(),
+                    "train/qf_loss": qf_loss.item() / 2.0,
+                    "train/qf1_values": qf1_a_values.mean().item(),
+                    "train/qf2_values": qf2_a_values.mean().item(),
+                    "train/target_q_mean": next_q_value.mean().item(),
+                    "train/actor_loss": actor_loss.item(),
+                    "train/alpha": alpha,
+                    "train/entropy": -log_pi.mean().item(),
+                    "charts/SPS": sps,
+                }
+                if cfg.algo.autotune_alpha:
+                    log["train/alpha_loss"] = alpha_loss.item()
+                if encoder_trains:
+                    log["train/encoder_grad_norm_critic"] = enc_gnorm_critic
+                    log["train/encoder_grad_norm_actor"] = enc_gnorm_actor
+                    log["train/encoder_drift_l2"] = encoder_drift()
+                    if aux_value is not None:
+                        log["train/aux_loss"] = aux_value
+                wandb.log(log, step=global_step)
+
+        # ---- periodic evaluation ----------------------------------------------------
+        if global_step % cfg.algo.eval_frequency == 0:
+            stats = evaluate(
+                actor,
+                eval_env,
+                cfg.algo.n_episodes_test,
+                device,
+                encode_fn=encode_single if finetune else None,
+            )
+            print(
+                f"  step {global_step:>8,}  EVAL return={stats['return_mean']:.1f}"
+                f"±{stats['return_std']:.1f}"
+            )
+            if use_wandb:
+                wandb.log(
+                    {
+                        "eval/mean_reward": stats["return_mean"],
+                        "eval/std_reward": stats["return_std"],
+                    },
+                    step=global_step,
+                )
+            if stats["return_mean"] > best_eval_return:
+                best_eval_return = stats["return_mean"]
+                if cfg.save.enabled:
+                    torch.save(
+                        actor.state_dict(), os.path.join(save_dir, "best_actor.pt")
+                    )
+                    if encoder_trains:
+                        torch.save(
+                            embedding_net.state_dict(),
+                            os.path.join(save_dir, "best_encoder.pt"),
+                        )
+
+    # ── Final save ────────────────────────────────────────────────────────────
+    if cfg.save.enabled:
+        ckpt = {
+            "actor": actor.state_dict(),
+            "qf1": qf1.state_dict(),
+            "qf2": qf2.state_dict(),
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        if encoder_trains:
+            ckpt["encoder"] = embedding_net.state_dict()
+        torch.save(ckpt, os.path.join(save_dir, "final_checkpoint.pt"))
+        print(f"\nSaved to: {save_dir}")
+    print(f"Best eval return: {best_eval_return:.1f}")
+
+    env.close()
+    eval_env.close()
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

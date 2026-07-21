@@ -1,0 +1,48 @@
+defaults:
+  - env: dmc_cheetah
+  - algo: sac_sb3
+  - embedding: resnet18
+  - _self_
+
+seed: 1
+device: cuda                # set to cpu if no GPU
+
+# state     Vanilla SAC on Pendulum-v1 -- confirms SAC itself learns, no vision.
+# pixels    SAC on cfg.env using SB3's default CNN (NatureCNN), trained from
+#           scratch -- confirms the pixel plumbing works, and is the "CNN
+#           trained from scratch" baseline vs the pvr* modes.
+# pvr       Frozen cfg.embedding, SLOW: encoder lives inside the SB3 policy,
+#           re-run on every gradient step even though it never changes.
+# pvr_fast  Frozen cfg.embedding, FAST: encoder lives outside the policy
+#           (FrozenPVRVecWrapper), encoded once per env step -- the config
+#           you'll actually use to benchmark PVRs against each other.
+# pvr_ft    Same as pvr, but the encoder finetunes jointly (freeze=False).
+mode: pvr_fast
+
+no_save: false               # skip all checkpointing (final/best/periodic);
+                              # eval reward is still logged either way
+
+model_dir: null              # if set, embedding checkpoints are looked up here
+                              # first (matched by filename minus extension, e.g.
+                              # resnet18.pth) -- crashes if set but no matching
+                              # file is found. Useful when checkpoints live on a
+                              # different filesystem than the code (e.g. scratch
+                              # vs projappl on the cluster).
+
+wandb:
+  enabled: false
+  project: pvr-sac
+  entity: majoinen-karri     # your wandb username or team
+  run_name: null              # auto-generated if null
+
+perf:
+  tf32: true             # Hopper/GH200 reduced-precision matmul/conv
+  cudnn_benchmark: true  # let cuDNN autotune conv algorithms per input shape
+  amp_bf16: true          # bf16 autocast for frozen-encoder inference (mode=pvr_fast)
+
+hydra:
+  run:
+    dir: outputs/sac/${env.id}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/sac_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${embedding.name}_seed${seed}

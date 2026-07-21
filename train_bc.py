@@ -102,6 +102,7 @@ def main(cfg: DictConfig) -> None:
             name=cfg.wandb.run_name,
             mode=cfg.wandb.get('mode', 'online'),
             config=OmegaConf.to_container(cfg, resolve=True),
+            save_code=True,
         )
         print(f"wandb run: {wandb.run.url}")
 

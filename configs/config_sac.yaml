@@ -1,48 +1,47 @@
 defaults:
-  - env: dmc_cheetah
-  - algo: sac_sb3
-  - embedding: resnet18
+  - env: dmc_cheetah_pixels
+  - algo: sac_cleanrl
+  - embedding: resnet50
   - _self_
 
+
+finetune:
+  enabled: false          # false -> frozen fast path (wrapper, features in buffer)
+  encoder_grads: critic   # none | critic | actor | both  (none = slow-frozen mode)
+  encoder_lr: 1.0e-5      # separate encoder LR, well below q_lr/policy_lr
+  grad_clip: 10.0         # clip norm on encoder gradients before each step
+  aux_loss: none          # none | l2sp  (l2sp = anchor to pretrained weights)
+  aux_weight: 1.0
+
+# Reminder for finetune runs: pixels go in the buffer, so override
+#   env.image_size=112 (or 84)  and/or  algo.buffer_size
+# to keep obs+next_obs memory sane (printed at startup). The frozen fast
+# path keeps rendering at 224 as before.
+
+
 seed: 1
-device: cuda                # set to cpu if no GPU
+device: cuda             # set to cpu if no GPU
 
-# state     Vanilla SAC on Pendulum-v1 -- confirms SAC itself learns, no vision.
-# pixels    SAC on cfg.env using SB3's default CNN (NatureCNN), trained from
-#           scratch -- confirms the pixel plumbing works, and is the "CNN
-#           trained from scratch" baseline vs the pvr* modes.
-# pvr       Frozen cfg.embedding, SLOW: encoder lives inside the SB3 policy,
-#           re-run on every gradient step even though it never changes.
-# pvr_fast  Frozen cfg.embedding, FAST: encoder lives outside the policy
-#           (FrozenPVRVecWrapper), encoded once per env step -- the config
-#           you'll actually use to benchmark PVRs against each other.
-# pvr_ft    Same as pvr, but the encoder finetunes jointly (freeze=False).
-mode: pvr_fast
-
-no_save: false               # skip all checkpointing (final/best/periodic);
-                              # eval reward is still logged either way
-
-model_dir: null              # if set, embedding checkpoints are looked up here
-                              # first (matched by filename minus extension, e.g.
-                              # resnet18.pth) -- crashes if set but no matching
-                              # file is found. Useful when checkpoints live on a
-                              # different filesystem than the code (e.g. scratch
-                              # vs projappl on the cluster).
+save:
+  enabled: true          # best_actor.pt on new best eval + final_checkpoint.pt
 
 wandb:
   enabled: false
-  project: pvr-sac
-  entity: majoinen-karri     # your wandb username or team
-  run_name: null              # auto-generated if null
+  project: pvr_torch
+  entity: majoinen-karri
+  run_name: null         # auto-generated if null
 
 perf:
   tf32: true             # Hopper/GH200 reduced-precision matmul/conv
-  cudnn_benchmark: true  # let cuDNN autotune conv algorithms per input shape
-  amp_bf16: true          # bf16 autocast for frozen-encoder inference (mode=pvr_fast)
+  cudnn_benchmark: true
+  amp_bf16: true         # bf16 autocast for frozen-encoder inference
+  compile_encoder: false # torch.compile the frozen encoder (try once stable)
 
 hydra:
+  job:
+    chdir: true
   run:
-    dir: outputs/sac/${env.id}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: outputs/sac/${env.name}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
   sweep:
     dir: outputs/sac_multirun/${now:%Y-%m-%d_%H-%M-%S}
     subdir: ${hydra.job.num}_${embedding.name}_seed${seed}
