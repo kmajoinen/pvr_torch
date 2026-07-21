@@ -680,11 +680,17 @@ class EmbeddingNet(nn.Module):
         observation = self._normalize(observation)        # mean/std normalisation
         observation = observation.reshape(-1, *self.in_shape)
 
-        if self.embedding.training:
-            out = self._forward(observation)
-        else:
-            with torch.no_grad():
-                out = self._forward(observation)
+        # Gradient tracking is entirely the caller's responsibility (ambient
+        # torch.no_grad()/enable_grad() context + requires_grad on this
+        # module's params) -- this used to branch on self.embedding.training
+        # instead, which broke callers that keep the encoder in eval() (for
+        # BatchNorm-stats safety) while still finetuning it via requires_grad
+        # alone: an inner torch.no_grad() here always beat their outer
+        # enable_grad(), silently cutting the graph. When the encoder really
+        # is frozen (requires_grad=False on every param, non-grad-requiring
+        # input), autograd already builds no backward graph on its own --
+        # forcing no_grad() explicitly was redundant for that case anyway.
+        out = self._forward(observation)
         return out.reshape(-1, self.out_size)
 
     def forward(self, observation):
