@@ -52,6 +52,7 @@ def _make_gym(env_id: str, image_size: int):
     transform pipeline resizes to the encoder's input size regardless of
     native render size.
     """
+    import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
     from gymnasium.wrappers import AddRenderObservation
 
     env = gym.make(env_id, render_mode="rgb_array")
@@ -59,6 +60,10 @@ def _make_gym(env_id: str, image_size: int):
 
 
 def _make_state(env_id: str, image_size: int):
+    if "dm_control" in env_id:
+        import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
+    elif "Adroit" in env_id or "FrankaKitchen" in env_id:
+        import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
     # FlattenObservation: dm_control/FrankaKitchen/etc emit Dict observations
     # (separate proprioceptive components) natively -- ReplayBuffer needs a
     # flat obs_shape, and a Dict space has no .shape at all. Box-observation
