@@ -1,5 +1,9 @@
 name: dmc_cheetah
 builder: dmc
 id: dm_control/cheetah-run-v0
-image_size: 224   # rendered natively at encoder resolution; use 84 for mode=pixels
+image_size: 224   # native dm_control render resolution, matches the encoder's
+                  # own input size 1:1 (EmbeddingNet resizes to 224 regardless
+                  # of this value). Lower it (e.g. 112) only to shrink the
+                  # replay buffer for finetune runs -- see finetune buffer
+                  # memory note in configs/config_sac.yaml.
 n_envs: 1         # >1 uses SubprocVecEnv (dm_control physics is CPU-bound)

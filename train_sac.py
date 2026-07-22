@@ -98,7 +98,7 @@ import torch.optim as optim
 import gymnasium as gym
 from omegaconf import DictConfig, OmegaConf
 
-from src.sac_utils import Actor, ReplayBuffer, SoftQNetwork, evaluate, make_env
+from src.sac_utils import Actor, ReplayBuffer, SoftQNetwork, _success_fn_for, evaluate, make_env
 
 
 # ------------------------------------------------------------------------------
@@ -539,18 +539,27 @@ def main(cfg: DictConfig) -> None:
                 cfg.algo.n_episodes_test,
                 device,
                 encode_fn=encode_single if finetune else None,
+                success_fn=_success_fn_for(cfg.env.id),
             )
             print(
                 f"  step {global_step:>8,}  EVAL return={stats['return_mean']:.1f}"
                 f"±{stats['return_std']:.1f}"
+                + (
+                    f"  success={stats['success_rate']:.2%}"
+                    if "success_rate" in stats
+                    else ""
+                )
             )
             if use_wandb:
+                log = {
+                    "eval/mean_reward": stats["return_mean"],
+                    "eval/std_reward": stats["return_std"],
+                    "global_step": global_step,
+                }
+                if "success_rate" in stats:
+                    log["eval/success_rate"] = stats["success_rate"]
                 wandb.log(
-                    {
-                        "eval/mean_reward": stats["return_mean"],
-                        "eval/std_reward": stats["return_std"],
-                        "global_step": global_step,
-                    },
+                    log,
                     step=global_step,
                 )
             if stats["return_mean"] > best_eval_return:

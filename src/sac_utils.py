@@ -220,14 +220,49 @@ class Actor(nn.Module):
 # ------------------------------------------------------------------------------
 
 
-def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None) -> dict:
+def _success_fn_for(env_id: str):
+    """Per-episode success extractor for envs with a meaningful task-
+    completion signal in info, or None for envs without one (return is the
+    only universal metric). Dispatches on env_id substring, same convention
+    as _make_dmc/_make_state/gym_wrappers.py.
+
+    Takes the list of info dicts collected across one episode's steps,
+    returns a single 0..1 success value for that episode.
+    """
+    if "Adroit" in env_id:
+        # info["success"] is a per-step boolean (D4RL convention) -- treat
+        # the episode as successful if it was ever True at any point, not
+        # just at the final step (matches train_bc.py::evaluate()'s
+        # max(ep_success, ...) convention for the same envs).
+        return lambda infos: float(any(i.get("success", False) for i in infos))
+    if "FrankaKitchen" in env_id:
+        # No boolean success field at all -- FrankaKitchen is a composite
+        # multi-subtask env. info carries tasks_to_complete (remaining) and
+        # episode_task_completions (done so far), both lists. Total subtask
+        # count = remaining + done, read at the first step (before anything
+        # completes); fraction complete = done at the last step / total.
+        def _franka_success(infos):
+            total = len(infos[0]["tasks_to_complete"]) + len(infos[0]["episode_task_completions"])
+            if total == 0:
+                return 0.0
+            return len(infos[-1]["episode_task_completions"]) / total
+
+        return _franka_success
+    return None
+
+
+def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None, success_fn=None) -> dict:
     """encode_fn: obs -> feature tensor (finetune path, where env emits
-    pixels); None when the env already emits features/state vectors."""
+    pixels); None when the env already emits features/state vectors.
+    success_fn: see _success_fn_for(); None means no success-rate tracking
+    (that key is omitted from the returned dict entirely)."""
     actor.eval()
     returns = []
+    successes = [] if success_fn is not None else None
     for _ in range(n_episodes):
         obs, _ = env.reset()
         ep_return, done = 0.0, False
+        ep_infos = [] if success_fn is not None else None
         while not done:
             if encode_fn is not None:
                 obs_t = encode_fn(obs)
@@ -237,12 +272,19 @@ def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None) -> dict
                 ).unsqueeze(0)
             with torch.no_grad():
                 _, _, mean_action = actor.get_action(obs_t)  # deterministic
-            obs, reward, term, trunc, _ = env.step(mean_action.squeeze(0).cpu().numpy())
+            obs, reward, term, trunc, info = env.step(mean_action.squeeze(0).cpu().numpy())
             ep_return += float(reward)
+            if ep_infos is not None:
+                ep_infos.append(info)
             done = term or trunc
         returns.append(ep_return)
+        if successes is not None:
+            successes.append(success_fn(ep_infos))
     actor.train()
-    return {
+    stats = {
         "return_mean": float(np.mean(returns)),
         "return_std": float(np.std(returns)),
     }
+    if successes is not None:
+        stats["success_rate"] = float(np.mean(successes))
+    return stats
