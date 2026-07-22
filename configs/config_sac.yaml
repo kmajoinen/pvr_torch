@@ -1,5 +1,5 @@
 defaults:
-  - env: dmc_cheetah_pixels
+  - env: dm_control_pixels
   - algo: sac_cleanrl
   - embedding: resnet50
   - _self_

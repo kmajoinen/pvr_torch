@@ -1,0 +1,4 @@
+name: adroit_door
+builder: gym
+id: AdroitHandDoor-v1
+image_size: 224

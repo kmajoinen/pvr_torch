@@ -1,0 +1,4 @@
+name: adroit_relocate
+builder: gym
+id: AdroitHandRelocate-v1
+image_size: 224

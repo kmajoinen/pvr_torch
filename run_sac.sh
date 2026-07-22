@@ -17,7 +17,7 @@ export WANDB_DIR=/scratch/project_2019621/pvr/xft_logs/wandb_me
 OUT_ROOT_DIR="/scratch/project_2019621/pvr/xft_logs"
 
 srun python3 train_sac.py \
-        env=dmc_cheetah_pixels \
+        env=dm_control_pixels \
         embedding=resnet18 \
         save.enabled=false \
         algo.total_timesteps=200000 \

@@ -1,0 +1,4 @@
+name: adroit_hammer
+builder: gym
+id: AdroitHandHammer-v1
+image_size: 224

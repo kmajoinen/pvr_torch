@@ -1,0 +1,4 @@
+name: franka_kitchen
+builder: gym
+id: FrankaKitchen-v1
+image_size: 224

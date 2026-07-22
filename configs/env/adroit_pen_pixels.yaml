@@ -1,0 +1,4 @@
+name: adroit_pen
+builder: gym
+id: AdroitHandPen-v1
+image_size: 224

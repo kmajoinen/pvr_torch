@@ -41,6 +41,23 @@ def _make_carracing(env_id: str, image_size: int):
     return gym.make(env_id, render_mode="rgb_array")
 
 
+def _make_gym(env_id: str, image_size: int):
+    """Generic pixel builder for envs that don't natively emit pixel
+    observations and don't support dm_control's render_kwargs convention
+    (Adroit hand envs, FrankaKitchen): render_mode="rgb_array" + swap the
+    observation for the rendered frame via AddRenderObservation. image_size
+    isn't used to control render resolution here -- unlike dm_control,
+    these envs don't expose a height/width render kwarg, so this renders at
+    whatever the env's default camera/resolution is; EmbeddingNet's own
+    transform pipeline resizes to the encoder's input size regardless of
+    native render size.
+    """
+    from gymnasium.wrappers import AddRenderObservation
+
+    env = gym.make(env_id, render_mode="rgb_array")
+    return AddRenderObservation(env, render_only=True)
+
+
 def _make_state(env_id: str, image_size: int):
     # FlattenObservation: dm_control/FrankaKitchen/etc emit Dict observations
     # (separate proprioceptive components) natively -- ReplayBuffer needs a
@@ -49,7 +66,12 @@ def _make_state(env_id: str, image_size: int):
     return gym.wrappers.FlattenObservation(gym.make(env_id))
 
 
-ENV_BUILDERS = {"dmc": _make_dmc, "carracing": _make_carracing, "state": _make_state}
+ENV_BUILDERS = {
+    "dmc": _make_dmc,
+    "carracing": _make_carracing,
+    "gym": _make_gym,
+    "state": _make_state,
+}
 
 
 def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
