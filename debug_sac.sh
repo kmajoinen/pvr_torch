@@ -18,7 +18,7 @@ export WANDB_DIR=/scratch/project_2019621/pvr/xft_logs/wandb_me
 OUT_ROOT_DIR="/scratch/project_2019621/pvr/xft_logs"
 
 srun python3 train_sac.py \
-        env=dm_control_pixels \
+       	env=franka_kitchen_pixels \
         embedding=resnet18 \
         finetune.enabled=true \
         save.enabled=false \
