@@ -659,7 +659,7 @@ class EmbeddingNet(nn.Module):
     def _forward(self, observation):
         return self._forward_fn(self.embedding, observation)
 
-    def encode(self, observation):
+    def encode(self, observation, augment: bool = False):
         """
         Same computation as forward(), but returns a (N, out_size)
         torch.Tensor on this module's device -- batch dimension always
@@ -669,13 +669,20 @@ class EmbeddingNet(nn.Module):
         tensor -- e.g. a trainable head sitting on top of this embedding
         inside another nn.Module's forward pass, like an SB3 features
         extractor).
+
+        augment: apply self.augmentation (if any) to this call only.
+        Explicit per-call, not gated on self.training -- callers that keep
+        the encoder permanently in eval() for BatchNorm-stats safety (see
+        train_sac.py) would otherwise never be able to trigger it, and
+        callers generally want augmentation on training-batch encodes only
+        (never on rollout-time action selection or eval()).
         """
         # observation.shape -> (N, C, H, W)  [channels-first, as returned by gym_wrappers]
         observation = observation.to(device=self.device)
         if not observation.is_contiguous():
             observation = observation.contiguous()
         observation = self._pre_aug(observation)          # resize, crop, → float [0, 1]
-        if self.training and self.augmentation is not None:
+        if augment and self.augmentation is not None:
             observation = self.augmentation(observation)  # augment in [0, 1] space
         observation = self._normalize(observation)        # mean/std normalisation
         observation = observation.reshape(-1, *self.in_shape)

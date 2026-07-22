@@ -1,0 +1,3 @@
+name: dmc_cheetah_state
+builder: state
+id: dm_control/cheetah-run-v0
