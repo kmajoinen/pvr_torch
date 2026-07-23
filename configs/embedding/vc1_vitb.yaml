@@ -1,0 +1,4 @@
+name: vc1_vitb
+pretrained: true
+train: false
+augmentation: null

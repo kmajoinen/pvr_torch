@@ -187,6 +187,7 @@ def main(cfg: DictConfig) -> None:
             train=encoder_trains,
             disable_cuda=(str(device) == "cpu"),
             augmentation=aug_module,
+            model_dir=cfg.model_dir,
         )
         # eval() ALWAYS, even while weights train: freeze BatchNorm running
         # stats (see module docstring). Trainability is controlled purely via

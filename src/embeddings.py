@@ -91,6 +91,12 @@ try:
 except ImportError:
     _HAS_R3M = False
 
+try:
+    from vip import load_vip
+    _HAS_VIP = True
+except ImportError:
+    _HAS_VIP = False
+
 from src.vision_models.moco import (
     moco_conv3_compressed,
     moco_conv4_compressed,
@@ -172,6 +178,14 @@ R3M_ARCHS = {
     'r3m_resnet18': 'resnet18',
     'r3m_resnet34': 'resnet34',
     'r3m_resnet50': 'resnet50',
+}
+
+# embedding_name -> (this file's matching MAE-architecture builder, VC-1's
+# own checkpoint filename). Same encoder classes as the mae_* branches --
+# VC-1 is MAE pretraining on different data, not a different architecture.
+VC1_ARCHS = {
+    'vc1_vitb': (mae_vit_base_patch16, 'vc1_vitb.pth'),
+    'vc1_vitl': (mae_vit_large_patch16, 'vc1_vitl.pth'),
 }
 
 
@@ -346,6 +360,37 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         model = mae_vit_huge_patch14()
         checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=False)
+        forward_fn = _forward_mae
+
+    # VC-1 (facebookresearch/eai-vc) -- MAE pretraining (egocentric video +
+    # ImageNet + iNav) on the exact same ViT-B/16 / ViT-L/16 architecture as
+    # the mae_* branches above, confirmed against their actual source
+    # (vc_models/models/vit/vit.py's vit_base_patch16/vit_large_patch16 and
+    # load_mae_encoder): same architecture class, same
+    # torch.load(...)['model'] checkpoint format, same CLS-token forward.
+    # Loaded directly here rather than via the vc_models package -- that
+    # package pins timm==0.6.11, which conflicts with this repo's
+    # timm==1.0.27; unnecessary anyway since the architecture is already
+    # implemented in src/vision_models/mae.py. Weights: download
+    # vc1_vitb.pth / vc1_vitl.pth from https://dl.fbaipublicfiles.com/eai-vc/
+    # and place in MODELS_DIR (or point model_dir= at them) -- not
+    # auto-downloaded, same as the mae_* checkpoints above.
+    elif embedding_name in VC1_ARCHS:
+        build_fn, ckpt_name = VC1_ARCHS[embedding_name]
+        model = build_fn()
+        checkpoint = torch.load(_ckpt(ckpt_name), map_location='cpu')
+        model.load_state_dict(checkpoint['model'], strict=False)
+        # vc_models/transforms/__init__.py's vit_transforms: same ImageNet
+        # mean/std as every other branch here, but BICUBIC resize (matching
+        # this file's own 'mae' in embedding_name special case a few lines
+        # up) -- built explicitly since 'vc1_vitb'/'vc1_vitl' don't contain
+        # the substring that default block gates on.
+        transforms = nn.Sequential(
+            T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        )
         forward_fn = _forward_mae
 
     # MOCO
@@ -525,6 +570,30 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             _ScaleTo255(),                     # -> [0, 255]; R3M normalizes internally
         )
         # forward_fn stays _forward_default: R3M's forward() takes the [0, 255] tensor directly.
+
+    # VIP
+    # Same lab/codebase lineage as R3M (built directly on R3M's code) --
+    # confirmed via their own example code (encoder_example.py): identical
+    # [0, 255]-input, no-external-normalize convention. Only one released
+    # variant (resnet50, 1024-dim), unlike R3M's resnet18/34/50 choice, so
+    # load_vip() takes no size argument.
+    elif embedding_name == 'vip_resnet50':
+        if not _HAS_VIP:
+            raise ImportError("vip requires: pip install git+https://github.com/facebookresearch/vip.git")
+        if not pretrained:
+            raise NotImplementedError("VIP has no random-init path -- load_vip() always loads its pretrained checkpoint.")
+        model = load_vip()
+        if isinstance(model, nn.DataParallel):
+            # Same wrap-and-auto-cuda behavior as load_r3m() -- see R3M branch above.
+            model = model.module
+        model = model.cpu()
+        transforms = nn.Sequential(
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),  # -> [0, 1]
+            _ScaleTo255(),                     # -> [0, 255]; VIP normalizes internally
+        )
+        # forward_fn stays _forward_default: VIP's forward() takes the [0, 255] tensor directly.
 
     # OPENCLIP
     # Checked before the 'clip' in embedding_name branch below since
