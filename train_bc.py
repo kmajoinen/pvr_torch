@@ -6,6 +6,12 @@ Supports:
   - Pixel observations (via EmbeddingNet, set cfg.embedding to a model name)
   - Minari offline RL datasets (cfg.dataset.format: minari)
   - Pickle trajectory files from save_opt_trajectories.py (cfg.dataset.format: pickle)
+  - PVR encoder finetuning (cfg.finetune.enabled), same conventions as
+    train_sac.py: encoder stays in eval() for BatchNorm safety even while
+    its weights train, trainability controlled via requires_grad, optional
+    l2sp aux loss, augmentation via cfg.embedding.augmentation.
+  - model_dir: point embedding checkpoint lookup at a different filesystem
+    location than the code (e.g. cluster scratch vs projappl).
 
 Usage:
     python train_bc.py                                     # door expert, default config
@@ -13,6 +19,8 @@ Usage:
     python train_bc.py algo.batch_size=128                 # override any param
     python train_bc.py device=cpu                          # force CPU
     python train_bc.py dataset.max_episodes=10             # quick smoke test
+    python train_bc.py embedding=resnet18 finetune.enabled=true \
+        finetune.encoder_lr=1e-5 model_dir=/scratch/.../checkpoints
 """
 
 import os
@@ -39,15 +47,18 @@ from src.models import ContinuousPolicyNet
 def evaluate(policy, env_id: str, n_episodes: int, device,
              embedding=None, train_from_pixels: bool = False) -> dict:
     from src.gym_wrappers import make_gym_env
+    from src.sac_utils import _success_fn_for
 
     env = make_gym_env(train_from_pixels=train_from_pixels, id=env_id)
     policy.eval()
+    success_fn = _success_fn_for(env_id)  # None for envs with no success signal
 
-    returns, successes = [], []
+    returns = []
+    successes = [] if success_fn is not None else None
     for _ in range(n_episodes):
         obs, _ = env.reset()
-        ep_return, ep_success = 0.0, 0.0
-        done = False
+        ep_return, done = 0.0, False
+        ep_infos = [] if success_fn is not None else None
         while not done:
             if train_from_pixels:
                 obs_t = torch.from_numpy(np.asarray(obs)).unsqueeze(0).to(device)  # uint8
@@ -56,25 +67,27 @@ def evaluate(policy, env_id: str, n_episodes: int, device,
 
             if embedding is not None:
                 with torch.no_grad():
-                    obs_t = torch.as_tensor(
-                        embedding(obs_t), device=device, dtype=torch.float32
-                    )  # (1, embed_dim)
+                    obs_t = embedding.encode(obs_t, augment=False)
             with torch.no_grad():
                 action = policy(obs_t).squeeze(0).cpu().numpy()
             obs, reward, term, trunc, info = env.step(action)
             ep_return += reward
-            ep_success = max(ep_success, float(info.get('success', 0)))
+            if ep_infos is not None:
+                ep_infos.append(info)
             done = term or trunc
         returns.append(ep_return)
-        successes.append(ep_success)
+        if successes is not None:
+            successes.append(success_fn(ep_infos))
 
     env.close()
     policy.train()
-    return {
-        'return_mean':  np.mean(returns),
-        'return_std':   np.std(returns),
-        'success_rate': np.mean(successes),
+    stats = {
+        'return_mean': np.mean(returns),
+        'return_std':  np.std(returns),
     }
+    if successes is not None:
+        stats['success_rate'] = np.mean(successes)
+    return stats
 
 
 # ------------------------------------------------------------------------------
@@ -153,15 +166,46 @@ def main(cfg: DictConfig) -> None:
     print(f"  train: {n_train:,}  val: {n_val:,}")
 
     # ── Optional embedding ────────────────────────────────────────────────────
+    finetune = bool(cfg.finetune.enabled)
+    aux_name = str(cfg.finetune.aux_loss)
+    assert aux_name in ('none', 'l2sp'), aux_name
+
     embedding = None
     obs_size = int(np.prod(dataset.obs_shape))
     emb_name = cfg.embedding.get('name', None)
     if emb_name is not None:
         from src.embeddings import EmbeddingNet
-        embedding = EmbeddingNet(emb_name, disable_cuda=(str(device) == 'cpu'))
+        from src.augmentations import make_augmentation
+
+        aug_name = cfg.embedding.get('augmentation', None)
+        aug_module = make_augmentation(aug_name) if aug_name is not None else None
+
+        embedding = EmbeddingNet(
+            emb_name,
+            train=finetune,
+            disable_cuda=(str(device) == 'cpu'),
+            augmentation=aug_module,
+            model_dir=cfg.model_dir,
+        )
+        # eval() ALWAYS, even while weights train: freeze BatchNorm running
+        # stats -- same reasoning as train_sac.py. Trainability is
+        # controlled purely via requires_grad below, never via train()-mode.
         embedding.eval()
+        for p in embedding.parameters():
+            p.requires_grad_(finetune)
         obs_size = embedding.out_size
-        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}")
+        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={finetune})")
+
+    enc_optimizer, theta0 = None, None
+    if finetune:
+        enc_optimizer = torch.optim.Adam(embedding.parameters(), lr=cfg.finetune.encoder_lr)
+        if aux_name != 'none':
+            theta0 = {n: p.detach().clone() for n, p in embedding.named_parameters()}
+
+    def aux_loss_fn():
+        if aux_name == 'l2sp':
+            return sum(((p - theta0[n]) ** 2).sum() for n, p in embedding.named_parameters())
+        raise ValueError(aux_name)
 
     # ── Policy ────────────────────────────────────────────────────────────────
     policy = ContinuousPolicyNet(
@@ -196,15 +240,26 @@ def main(cfg: DictConfig) -> None:
             obs_b = obs_b.to(device)
             act_b = act_b.to(device)
             if embedding is not None:
-                with torch.no_grad():
-                    obs_b = torch.as_tensor(
-                        embedding(obs_b), device=device, dtype=torch.float32
-                    )
+                ctx = torch.enable_grad() if finetune else torch.no_grad()
+                with ctx:
+                    obs_b = embedding.encode(obs_b, augment=True)
             pred = policy(obs_b)
             loss = F.mse_loss(pred, act_b)
+
+            aux_value = None
+            if finetune and aux_name != 'none':
+                aux = cfg.finetune.aux_weight * aux_loss_fn()
+                loss = loss + aux
+                aux_value = aux.item()
+
             optimizer.zero_grad()
+            if enc_optimizer is not None:
+                enc_optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            if enc_optimizer is not None:
+                torch.nn.utils.clip_grad_norm_(embedding.parameters(), max_norm=1.0)
+                enc_optimizer.step()
             optimizer.step()
             train_loss += loss.item()
 
@@ -226,20 +281,22 @@ def main(cfg: DictConfig) -> None:
             for obs_b, act_b in val_loader:
                 obs_b, act_b = obs_b.to(device), act_b.to(device)
                 if embedding is not None:
-                    obs_b = torch.as_tensor(
-                        embedding(obs_b), device=device, dtype=torch.float32
-                    )
+                    obs_b = embedding.encode(obs_b, augment=False)
                 val_loss += F.mse_loss(policy(obs_b), act_b).item()
         val_loss /= len(val_loader)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(policy.state_dict(), os.path.join(save_dir, 'best_policy.pt'))
+            if cfg.save.enabled:
+                torch.save(policy.state_dict(), os.path.join(save_dir, 'best_policy.pt'))
 
         lr = scheduler.get_last_lr()[0]
         if use_wandb:
-            wandb.log({'train/loss': train_loss, 'val/loss': val_loss,
-                       'train/lr': lr}, step=epoch)
+            log = {'train/loss': train_loss, 'val/loss': val_loss,
+                   'train/lr': lr, 'epoch': epoch}
+            if aux_value is not None:
+                log['train/aux_loss'] = aux_value
+            wandb.log(log, step=epoch)
 
         if epoch % cfg.algo.eval_frequency == 0 or epoch == 1:
             elapsed = time.time() - t0
@@ -257,11 +314,15 @@ def main(cfg: DictConfig) -> None:
                 )
                 print(f"         eval  return={stats['return_mean']:.1f}"
                       f"±{stats['return_std']:.1f}"
-                      f"  success={stats['success_rate']:.2%}")
+                      + (f"  success={stats['success_rate']:.2%}"
+                         if 'success_rate' in stats else ""))
                 if use_wandb:
-                    wandb.log({'eval/return_mean': stats['return_mean'],
-                               'eval/return_std':  stats['return_std'],
-                               'eval/success_rate': stats['success_rate']}, step=epoch)
+                    log = {'eval/mean_reward': stats['return_mean'],
+                           'eval/std_reward':  stats['return_std'],
+                           'epoch': epoch}
+                    if 'success_rate' in stats:
+                        log['eval/success_rate'] = stats['success_rate']
+                    wandb.log(log, step=epoch)
 
     if use_wandb:
         wandb.finish()

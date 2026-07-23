@@ -9,8 +9,31 @@ device: cuda                # set to cpu if no GPU
 hidden_size: 1024
 batch_norm: false
 
+model_dir: null              # if set, embedding checkpoints are looked up here
+                              # first (matched by filename minus extension, e.g.
+                              # resnet18.pth) -- crashes if set but no matching
+                              # file is found. Useful when checkpoints live on a
+                              # different filesystem than the code (e.g. scratch
+                              # vs projappl on the cluster).
+
+finetune:
+  enabled: false          # false -> frozen embedding (current behavior)
+  encoder_lr: 1.0e-5      # separate encoder LR, well below algo.learning_rate
+  aux_loss: none          # none | l2sp  (l2sp = anchor to pretrained weights)
+  aux_weight: 1.0
+
+save:
+  enabled: true          # best_policy.pt on new best val loss
+
 wandb:
   enabled: false
   project: pvr_torch
   entity: majoinen-karri              # your wandb username or team
   run_name: test            # auto-generated if null
+
+hydra:
+  run:
+    dir: outputs/bc/${dataset.id}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/bc_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${embedding.name}_seed${seed}

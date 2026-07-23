@@ -97,6 +97,12 @@ try:
 except ImportError:
     _HAS_VIP = False
 
+try:
+    from liv import load_liv
+    _HAS_LIV = True
+except ImportError:
+    _HAS_LIV = False
+
 from src.vision_models.moco import (
     moco_conv3_compressed,
     moco_conv4_compressed,
@@ -594,6 +600,49 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             _ScaleTo255(),                     # -> [0, 255]; VIP normalizes internally
         )
         # forward_fn stays _forward_default: VIP's forward() takes the [0, 255] tensor directly.
+
+    # LIV (Language-Image Value learning) -- wraps CLIP RN50 internally
+    # (their own bundled clip fork, loaded via clip.load("resnet50", ...)
+    # inside load_liv()), not a plain torchvision resnet despite the name.
+    # 'resnet50' is LIV's own (only) modelid, matching VIP's single-variant
+    # convention -- named liv_resnet50 here to avoid confusion with a real
+    # resnet50. Reaches into the underlying CLIP submodule (liv.model) and
+    # reuses the existing CLIP dispatch (_forward_clip, same transform as
+    # clip_rn50 below) rather than calling LIV's own forward(), which does
+    # its own resize/crop/normalize AND auto-detects [0,1] vs [0,255] input
+    # internally -- a different contract from every other branch in this
+    # file, which all expect EmbeddingNet's external transform pipeline to
+    # have already done that. Going through liv.model.encode_image()
+    # directly sidesteps the mismatch entirely.
+    elif embedding_name == 'liv_resnet50':
+        if not _HAS_LIV:
+            raise ImportError(
+                "liv requires a two-step install (not a single pip line): "
+                "pip install -e . && cd liv/models/clip && pip install -e . "
+                "-- see https://github.com/penn-pal-lab/LIV"
+            )
+        if not pretrained:
+            raise NotImplementedError("LIV has no random-init path -- load_liv() always loads its pretrained checkpoint.")
+        liv = load_liv()
+        if isinstance(liv, nn.DataParallel):
+            # Same wrap-and-auto-cuda behavior as load_r3m()/load_vip() --
+            # see R3M branch above.
+            liv = liv.module
+        model = liv.model  # the underlying CLIP RN50 submodule
+        model = model.cpu()
+        # Same transform as the clip_rn50 branch below: RN50's input
+        # resolution is a fixed 224 across all official CLIP checkpoints
+        # (including LIV's, which is trained from a CLIP RN50 init) --
+        # hardcoded rather than read from model.visual.input_resolution,
+        # since that attribute's presence on LIV's own bundled clip fork
+        # isn't verified.
+        transforms = nn.Sequential(
+            T.Resize(224, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+        )
+        forward_fn = _forward_clip
 
     # OPENCLIP
     # Checked before the 'clip' in embedding_name branch below since
