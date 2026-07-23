@@ -86,6 +86,7 @@ r3m_resnet18  r3m_resnet34  r3m_resnet50
 vip_resnet50
 liv_resnet50
 vc1_vitb  vc1_vitl
+rl3d_resnet18
 mae_base
 moco_aug
 ```
@@ -114,14 +115,18 @@ python train_sac.py embedding=resnet50 embedding.name=resnet50_l3
 **Need a local checkpoint file** (not provided in this repo, download/train
 separately and place in `models/`, or point at a different location via
 `model_dir=`): `mae_base` / `mae_large` / `mae_huge`, `vc1_vitb` / `vc1_vitl`,
-every `moco_*` name, `resnet50_l3` / `resnet50_l4` / `resnet50_places*`,
-`demy`, `maskrcnn_l3`. Expected filenames (must match exactly, in `models/`
-by default):
+`rl3d_resnet18`, every `moco_*` name, `resnet50_l3` / `resnet50_l4` /
+`resnet50_places*`, `demy`, `maskrcnn_l3`. Expected filenames (must match
+exactly, in `models/` by default):
 ```
 mae_pretrain_vit_base.pth / _large.pth / _huge.pth
 vc1_vitb.pth / vc1_vitl.pth   (from https://dl.fbaipublicfiles.com/eai-vc/ --
   loaded directly via the mae_* architecture classes, not the vc_models
   package, see src/embeddings.py's VC-1 branch for why)
+rl3d_resnet18.tar   (rename from videoae_co3d.tar -- download at
+  https://github.com/YanjieZe/rl3d/tree/main/checkpoints; architecture is
+  vendored in src/vision_models/rl3d.py, not pip-installed -- see that
+  file's docstring for why)
 moco_aug.pth.tar, moco_aug_l3.pth, moco_aug_l4.pth, moco_aug_places.pth.tar, ...
   (one file per moco_* embedding name -- see src/embeddings.py's MOCO section
   for the exact filename each name expects)

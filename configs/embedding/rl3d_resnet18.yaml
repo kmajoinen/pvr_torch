@@ -1,0 +1,4 @@
+name: rl3d_resnet18
+pretrained: true
+train: false
+augmentation: null

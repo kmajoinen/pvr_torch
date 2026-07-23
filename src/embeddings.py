@@ -123,6 +123,7 @@ from src.vision_models.mae import (
         mae_vit_large_patch16,
         mae_vit_huge_patch14,
 )
+from src.vision_models.rl3d import rl3d_resnet18_backbone
 
 
 def init(module, weight_init, bias_init, gain=1):
@@ -643,6 +644,54 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
         )
         forward_fn = _forward_clip
+
+    # RL3D (YanjieZe/rl3d) -- CO3D-pretrained 2D backbone, vendored (see
+    # src/vision_models/rl3d.py -- no pip package exists for this repo).
+    # No auto-download: their own loader requires an already-existing
+    # local checkpoint path and raises FileNotFoundError otherwise, same
+    # as this repo's other manual-checkpoint embeddings (mae_*, moco_*).
+    # Download videoae_co3d.tar from
+    # https://github.com/YanjieZe/rl3d/tree/main/checkpoints, place at
+    # MODELS_DIR/rl3d_resnet18.tar (or point model_dir= at a renamed copy).
+    elif embedding_name == 'rl3d_resnet18':
+        model = rl3d_resnet18_backbone()
+        checkpoint = torch.load(_ckpt('rl3d_resnet18.tar'), map_location='cpu')
+        # checkpoint['encoder_3d'] covers the FULL Encoder3D (this 2D
+        # backbone under 'feature_extraction.*' keys, plus the 3D
+        # ConvTranspose3d decoder head under 'conv3d_1.*'/'conv3d_2.*' --
+        # dropped entirely here, see rl3d.py). 'module.' prefix: their own
+        # loader does encoder_3d.load_state_dict(...) on a freshly built
+        # nn.DataParallel(Encoder3D()) with strict=True (the default) --
+        # DataParallel always prefixes its wrapped submodule's keys with
+        # 'module.', so for that strict load to succeed at all, the
+        # checkpoint's keys must already be 'module.'-prefixed. Strip both
+        # so the remaining keys match this bare nn.Sequential's own naming.
+        prefix = 'module.feature_extraction.'
+        state_dict = {
+            k[len(prefix):]: v for k, v in checkpoint['encoder_3d'].items()
+            if k.startswith(prefix)
+        }
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if len(missing) == len(list(model.state_dict())):
+            raise RuntimeError(
+                f"Loaded rl3d_resnet18.tar but zero parameters matched -- "
+                "wrong checkpoint file, or the prefix-stripping above no "
+                "longer matches this checkpoint's key structure."
+            )
+        if missing or unexpected:
+            print(f"[embeddings] Warning: loading rl3d_resnet18.tar -- "
+                  f"missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}, "
+                  f"unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        # Verified against their src/augmentations.py and src/train.py:
+        # both use 84x84 frames and plain /255 scaling, no ImageNet
+        # mean/std normalize -- an RL-frame convention, not the 224px
+        # internet-image convention every other PVR branch here follows.
+        transforms = nn.Sequential(
+            T.Resize((84, 84)),
+            T.ConvertImageDtype(torch.float),
+        )
+        # forward_fn stays _forward_default: the vendored backbone is a
+        # plain nn.Sequential, model(x) is already the right call.
 
     # OPENCLIP
     # Checked before the 'clip' in embedding_name branch below since
