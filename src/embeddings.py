@@ -57,7 +57,13 @@ def _load_custom_state_dict(model, path, embedding_name):
     nothing matched, since that means the file is very likely the wrong
     architecture or format for embedding_name, not just a minor difference.
     """
-    state_dict = torch.load(path, map_location='cpu')
+    # weights_only=False: PyTorch 2.6+ defaults torch.load to a restricted
+    # unpickler that rejects anything beyond plain tensors -- research
+    # checkpoints routinely bundle non-tensor metadata (training args,
+    # optimizer state) and fail to load at all otherwise. Fine here: paths
+    # are either this repo's own MODELS_DIR or a user-provided model_dir,
+    # not arbitrary untrusted input.
+    state_dict = torch.load(path, map_location='cpu', weights_only=False)
     if isinstance(state_dict, dict) and 'state_dict' in state_dict:
         state_dict = state_dict['state_dict']
     elif isinstance(state_dict, dict) and 'model' in state_dict:
@@ -355,17 +361,17 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     # MAE
     elif embedding_name == 'mae_base':
         model = mae_vit_base_patch16()
-        checkpoint = torch.load(_ckpt('mae_pretrain_vit_base.pth'), map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_base.pth'), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=False)
         forward_fn = _forward_mae
     elif embedding_name == 'mae_large':
         model = mae_vit_large_patch16()
-        checkpoint = torch.load(_ckpt('mae_pretrain_vit_large.pth'), map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_large.pth'), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=False)
         forward_fn = _forward_mae
     elif embedding_name == 'mae_huge':
         model = mae_vit_huge_patch14()
-        checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu')
+        checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=False)
         forward_fn = _forward_mae
 
@@ -385,7 +391,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     elif embedding_name in VC1_ARCHS:
         build_fn, ckpt_name = VC1_ARCHS[embedding_name]
         model = build_fn()
-        checkpoint = torch.load(_ckpt(ckpt_name), map_location='cpu')
+        checkpoint = torch.load(_ckpt(ckpt_name), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=False)
         # vc_models/transforms/__init__.py's vit_transforms: same ImageNet
         # mean/std as every other branch here, but BICUBIC resize (matching
@@ -655,7 +661,7 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     # MODELS_DIR/rl3d_resnet18.tar (or point model_dir= at a renamed copy).
     elif embedding_name == 'rl3d_resnet18':
         model = rl3d_resnet18_backbone()
-        checkpoint = torch.load(_ckpt('rl3d_resnet18.tar'), map_location='cpu')
+        checkpoint = torch.load(_ckpt('rl3d_resnet18.tar'), map_location='cpu', weights_only=False)
         # checkpoint['encoder_3d'] covers the FULL Encoder3D (this 2D
         # backbone under 'feature_extraction.*' keys, plus the 3D
         # ConvTranspose3d decoder head under 'conv3d_1.*'/'conv3d_2.*' --
