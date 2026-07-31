@@ -87,6 +87,8 @@ vip_resnet50
 liv_resnet50
 vc1_vitb  vc1_vitl
 rl3d_resnet18
+mvp_vits_mae_hoi  mvp_vits_mae_in  mvp_vits_sup_in
+mvp_vitb_mae_egosoup  mvp_vitl256_mae_egosoup
 mae_base
 moco_aug
 ```
@@ -109,6 +111,7 @@ python train_sac.py embedding=resnet50 embedding.name=resnet50_l3
 - `r3m_*` — via `load_r3m(...)`, downloads from Google Drive (`gdown`) to R3M's own cache dir on first use. **No outbound internet on compute nodes** on most clusters — run once on the login node first to warm the cache, or the job will fail trying to download mid-run.
 - `vip_resnet50` — via `load_vip(...)`, same lab/codebase as R3M, same download-cache behavior and caveat.
 - `liv_resnet50` — via `load_liv(...)`, own cache dir/download on first use. Needs a two-step install (`pip install` the repo, then a nested `cd liv/models/clip && pip install -e .`) — not in `requirements.txt`, see the comment there.
+- `mvp_*` (5 variants) — via `mvp.load(...)`, own cache dir/download on first use (Berkeley Box-hosted). Genuinely pip-installable with no version conflicts, unlike VC-1.
 - `random` — freshly initialized, no weights at all.
 - `none` — no embedding, raw state passed straight through.
 

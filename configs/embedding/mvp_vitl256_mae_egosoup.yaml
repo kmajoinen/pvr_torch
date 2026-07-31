@@ -1,0 +1,4 @@
+name: mvp_vitl256_mae_egosoup
+pretrained: true
+train: false
+augmentation: null

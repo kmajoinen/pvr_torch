@@ -1,0 +1,4 @@
+name: mvp_vits_sup_in
+pretrained: true
+train: false
+augmentation: null

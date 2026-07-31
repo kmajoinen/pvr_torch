@@ -1,0 +1,4 @@
+name: mvp_vits_mae_hoi
+pretrained: true
+train: false
+augmentation: null

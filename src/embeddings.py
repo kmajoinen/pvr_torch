@@ -109,6 +109,12 @@ try:
 except ImportError:
     _HAS_LIV = False
 
+try:
+    import mvp
+    _HAS_MVP = True
+except ImportError:
+    _HAS_MVP = False
+
 from src.vision_models.moco import (
     moco_conv3_compressed,
     moco_conv4_compressed,
@@ -199,6 +205,21 @@ R3M_ARCHS = {
 VC1_ARCHS = {
     'vc1_vitb': (mae_vit_base_patch16, 'vc1_vitb.pth'),
     'vc1_vitl': (mae_vit_large_patch16, 'vc1_vitl.pth'),
+}
+
+# embedding_name -> mvp.load()'s own name string. Five released variants:
+# hoi/in/egosoup = pretraining data (hand-object-interaction video /
+# ImageNet / mixed egocentric video), mae/sup = pretraining objective
+# (masked-autoencoding vs plain supervised classification -- vits-sup-in
+# is NOT MAE-pretrained, unlike every other branch in this file). "256" in
+# the name means mvp's own load() uses img_size=256 instead of 224 --
+# preserved in the transform below via MVP_IMG_SIZE.
+MVP_ARCHS = {
+    'mvp_vits_mae_hoi': 'vits-mae-hoi',
+    'mvp_vits_mae_in': 'vits-mae-in',
+    'mvp_vits_sup_in': 'vits-sup-in',
+    'mvp_vitb_mae_egosoup': 'vitb-mae-egosoup',
+    'mvp_vitl256_mae_egosoup': 'vitl-256-mae-egosoup',
 }
 
 
@@ -698,6 +719,38 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         )
         # forward_fn stays _forward_default: the vendored backbone is a
         # plain nn.Sequential, model(x) is already the right call.
+
+    # MVP (ir413/mvp) -- MAE-ViT lineage like VC-1, but genuinely
+    # pip-installable (`pip install git+https://github.com/ir413/mvp`)
+    # with no version-pin conflict (their setup.py requires bare `timm`,
+    # unpinned) -- unlike VC-1, no reason to bypass their package here.
+    # mvp.load() auto-downloads via its own cache_url() helper (Berkeley
+    # Box-hosted), same auto-download category as R3M/VIP/LIV, not the
+    # manual-checkpoint category MAE/VC-1/RL3D are in.
+    elif embedding_name in MVP_ARCHS:
+        if not _HAS_MVP:
+            raise ImportError("mvp requires: pip install git+https://github.com/ir413/mvp")
+        if not pretrained:
+            raise NotImplementedError("MVP has no random-init path -- mvp.load() always loads its pretrained checkpoint.")
+        model = mvp.load(MVP_ARCHS[embedding_name])
+        # Verified against their own source (mvp/backbones/model_zoo.py,
+        # vit.py): load() returns a bare model, no DataParallel wrapping or
+        # .cuda() call anywhere in it -- unlike R3M/VIP/LIV, nothing to
+        # unwrap or move back to CPU here.
+        img_size = 256 if '256' in embedding_name else 224
+        # Verified against mvp/bc/dataset.py: standard ImageNet mean/std,
+        # /255 scaling -- same convention as every other MAE-family branch
+        # in this file.
+        transforms = nn.Sequential(
+            T.Resize(img_size),
+            T.CenterCrop(img_size),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        )
+        # forward_fn stays _forward_default: MVP's own forward() already
+        # extracts and normalizes the CLS token internally (verified in
+        # vit.py -- forward_norm(extract_feat(x))), so model(x) alone
+        # returns the final embedding, no _forward_mae-style wrapper needed.
 
     # OPENCLIP
     # Checked before the 'clip' in embedding_name branch below since
