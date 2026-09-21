@@ -2,3 +2,7 @@ name: random
 pretrained: false
 train: false
 augmentation: null
+frame_stack: 1   # DrQ-v2-style option: stack N consecutive frames into the
+                 # channel axis before the encoder. Only applies to this
+                 # embedding -- pretrained PVR backbones have a fixed
+                 # 3-channel first layer and can't accept a wider input.

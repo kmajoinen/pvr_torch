@@ -309,7 +309,13 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     )
     forward_fn = _forward_default
 
-    assert in_channels == 3, 'Current models accept 3-channel inputs only.'
+    # random is trained from scratch alongside the policy and has no
+    # pretrained-weights first layer to be compatible with -- it's the
+    # only branch that can accept a frame_stack-widened input (in_channels
+    # a multiple of 3, not just 3). Every other branch below is a
+    # pretrained backbone with a fixed 3-channel first layer.
+    assert in_channels == 3 or embedding_name == 'random', \
+        'Current models accept 3-channel inputs only.'
 
     # FIXED 5-LAYER CONV
     if embedding_name == 'random':
@@ -328,6 +334,15 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
             nn.ELU(),
             init_(nn.Conv2d(32, 32, kernel_size=(3,3), stride=2, padding=1)),
             nn.ELU(),
+        )
+        # No ImageNet normalize here (unlike the shared default block
+        # above): random has no pretrained-normalization convention to
+        # match, and Normalize's 3-element mean/std would shape-mismatch
+        # against a frame_stack-widened, non-3-channel input anyway.
+        transforms = nn.Sequential(
+            T.Resize(256),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),
         )
 
     # Make FC layers to be Identity

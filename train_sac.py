@@ -54,7 +54,10 @@ Two encoder regimes, selected by cfg.finetune.enabled:
       gradients at all.
 
 Design notes:
-  - Actor and critics each apply their own LayerNorm to input features.
+  - Actor and critics each apply their own LayerNorm to input features --
+    only when the input IS encoder features (embedding set). Raw state
+    vectors skip it: per-sample LN on a ~17-dim state aliases states that
+    differ by uniform shift/scale and destroys magnitude information.
   - Bootstrapping is masked on `terminated` only, so truncation-only envs
     (dm_control, 1000-step episodes) bootstrap through the time limit.
   - No target encoder: target-Q features come from the live encoder under
@@ -98,8 +101,14 @@ import torch.optim as optim
 import gymnasium as gym
 from omegaconf import DictConfig, OmegaConf
 
-from src.sac_utils import Actor, ReplayBuffer, SoftQNetwork, _success_fn_for, evaluate, make_env
-
+from src.sac_utils import (
+    Actor,
+    ReplayBuffer,
+    SoftQNetwork,
+    _success_fn_for,
+    evaluate,
+    make_env,
+)
 
 # ------------------------------------------------------------------------------
 # Main
@@ -181,8 +190,10 @@ def main(cfg: DictConfig) -> None:
             aug_module = make_augmentation(aug_name)
             print(f"Augmentation: {aug_name}  (applied to training-batch encodes only)")
 
+        frame_stack = cfg.embedding.get("frame_stack", 1)
         embedding_net = EmbeddingNet(
             emb_name,
+            in_channels=3 * frame_stack if emb_name == "random" else 3,
             pretrained=True,
             train=encoder_trains,
             disable_cuda=(str(device) == "cpu"),
@@ -261,25 +272,33 @@ def main(cfg: DictConfig) -> None:
 
     # ── Networks / optimizers ─────────────────────────────────────────────────
     hidden = list(cfg.algo.net_arch)
-    actor = Actor(feat_dim, action_dim, hidden, env.action_space).to(device)
-    qf1 = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
-    qf2 = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
-    qf1_target = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
-    qf2_target = SoftQNetwork(feat_dim, action_dim, hidden).to(device)
+    # Input LayerNorm only when obs are encoder features; raw state vectors
+    # go in unnormalized (matches SB3's MlpPolicy -- see SoftQNetwork docs).
+    obs_norm = emb_name is not None
+    actor = Actor(feat_dim, action_dim, hidden, env.action_space, obs_norm).to(device)
+    qf1 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
+    qf2 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
+    qf1_target = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
+    qf2_target = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
     q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=cfg.algo.q_lr
+        list(qf1.parameters()) + list(qf2.parameters()),
+        lr=cfg.algo.q_lr, betas=tuple(cfg.algo.q_betas),
     )
-    actor_optimizer = optim.Adam(actor.parameters(), lr=cfg.algo.policy_lr)
+    actor_optimizer = optim.Adam(
+        actor.parameters(), lr=cfg.algo.policy_lr, betas=tuple(cfg.algo.policy_betas)
+    )
 
     enc_optimizer, theta0 = None, None
     if encoder_trains:
         # Separate, much lower LR: at the head LRs a resnet18's weight sums
         # drift ~3% in 50 gradient steps (measured) -- far too fast for a
         # pretrained representation you want to adapt, not destroy.
-        enc_optimizer = optim.Adam(embedding_net.parameters(), lr=ft.encoder_lr)
+        enc_optimizer = optim.Adam(
+            embedding_net.parameters(), lr=ft.encoder_lr, betas=tuple(ft.encoder_betas)
+        )
         theta0 = {n: p.detach().clone() for n, p in embedding_net.named_parameters()}
 
     def aux_loss_fn() -> torch.Tensor:
@@ -306,7 +325,9 @@ def main(cfg: DictConfig) -> None:
         target_entropy = -float(action_dim)
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=cfg.algo.q_lr)
+        a_optimizer = optim.Adam(
+            [log_alpha], lr=cfg.algo.alpha_lr, betas=tuple(cfg.algo.alpha_betas)
+        )
     else:
         alpha = cfg.algo.alpha
 

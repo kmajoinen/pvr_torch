@@ -9,6 +9,7 @@ finetune:
   enabled: false          # false -> frozen fast path (wrapper, features in buffer)
   encoder_grads: critic   # none | critic | actor | both  (none = slow-frozen mode)
   encoder_lr: 1.0e-5      # separate encoder LR, well below q_lr/policy_lr
+  encoder_betas: [0.9, 0.999]  # Adam (beta1, beta2) for the encoder optimizer
   grad_clip: 10.0         # clip norm on encoder gradients before each step
   aux_loss: none          # none | l2sp  (l2sp = anchor to pretrained weights)
   aux_weight: 1.0

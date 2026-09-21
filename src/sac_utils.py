@@ -79,13 +79,47 @@ ENV_BUILDERS = {
 }
 
 
+class _StackToChannels(gym.ObservationWrapper):
+    """
+    gymnasium.wrappers.FrameStackObservation stacks along a NEW leading
+    axis -- (num_stack, H, W, C), verified against Farama's docs -- not
+    concatenated into the channel axis. Every pixel builder in this file
+    (and FrozenEncoderWrapper/the raw-pixel buffer path) expects a plain
+    (H, W, C) frame, so this merges the stack axis into the channel axis
+    right after stacking: (N, H, W, C) -> (H, W, N*C). Everything
+    downstream then sees a wider-than-usual but otherwise ordinary frame.
+    """
+
+    def __init__(self, env, num_stack: int):
+        super().__init__(env)
+        n, h, w, c = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(h, w, n * c), dtype=env.observation_space.dtype
+        )
+
+    def observation(self, obs):
+        n, h, w, c = obs.shape
+        return np.asarray(obs).transpose(1, 2, 0, 3).reshape(h, w, n * c)
+
+
 def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     """
     wrap_encoder=True  -> frozen fast path: env emits feature vectors.
     wrap_encoder=False -> finetune path: env emits raw uint8 HWC pixels;
                           encoding happens inside the training loop.
+
+    frame_stack (cfg.embedding.get("frame_stack", 1)): stacks N consecutive
+    frames into the channel axis before anything else sees them. Only
+    meaningful for embeddings trained from scratch alongside the policy
+    (embedding=random) -- pretrained PVR backbones have a fixed 3-channel
+    first layer and can't accept a wider input at all, so this is never
+    applied for any other embedding regardless of what's set here.
     """
     env = ENV_BUILDERS[cfg.env.builder](cfg.env.id, cfg.env.get("image_size", 84))
+    frame_stack = cfg.embedding.get("frame_stack", 1) if cfg.env.builder != "state" else 1
+    if frame_stack > 1 and cfg.embedding.get("name") == "random":
+        env = gym.wrappers.FrameStackObservation(env, frame_stack)
+        env = _StackToChannels(env, frame_stack)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     if embedding_net is not None and wrap_encoder:
         env = FrozenEncoderWrapper(env, embedding_net, amp_bf16=cfg.perf.amp_bf16)
@@ -98,6 +132,23 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
 
 
 class ReplayBuffer:
+    """
+    Stores obs once, not obs+next_obs separately -- next_obs is derived at
+    sample time as the following slot in the same circular array (same
+    scheme as SB3's ReplayBuffer(optimize_memory_usage=True), verified
+    against their actual sampling logic). Halves memory for pixel
+    observations, where next_obs is the same data as the following
+    transition's obs for every non-episode-boundary transition anyway.
+
+    Never samples index `pos` itself -- its "next" slot is either not
+    written yet (buffer not full) or belongs to whatever just overwrote it
+    (buffer full), not a valid successor. At true episode boundaries the
+    "next_obs" this derives is technically the start of a different
+    episode, not a real successor state -- same accepted imprecision as
+    SB3's implementation, harmless since terminated transitions never
+    bootstrap through next_obs in the loss (masked by 1 - terminated).
+    """
+
     def __init__(
         self,
         capacity: int,
@@ -112,21 +163,23 @@ class ReplayBuffer:
         # buffer_size/image_size combination announces itself instead of
         # dying inside np.zeros.
         itemsize = np.dtype(obs_dtype).itemsize
-        gb = 2 * capacity * int(np.prod(obs_shape)) * itemsize / 1e9
+        gb = capacity * int(np.prod(obs_shape)) * itemsize / 1e9
         print(
             f"Replay buffer: {capacity:,} x {obs_shape} {np.dtype(obs_dtype).name}"
-            f"  ({gb:.1f} GB for obs+next_obs)"
+            f"  ({gb:.1f} GB for obs; next_obs derived, not stored separately)"
         )
         self.obs = np.zeros((capacity, *obs_shape), dtype=obs_dtype)
-        self.next_obs = np.zeros((capacity, *obs_shape), dtype=obs_dtype)
         self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.rewards = np.zeros(capacity, dtype=np.float32)
         self.terminations = np.zeros(capacity, dtype=np.float32)
         self.pos, self.full = 0, False
 
     def add(self, obs, next_obs, action, reward, terminated):
+        # next_obs isn't stored -- the following add() call's obs becomes
+        # this transition's next_obs automatically once written to
+        # self.pos+1. Still taken as a parameter to keep this a drop-in
+        # call-site replacement (the caller always has both handy).
         self.obs[self.pos] = obs
-        self.next_obs[self.pos] = next_obs
         self.actions[self.pos] = action
         self.rewards[self.pos] = reward
         self.terminations[self.pos] = float(terminated)
@@ -137,14 +190,20 @@ class ReplayBuffer:
         return self.capacity if self.full else self.pos
 
     def sample(self, batch_size: int):
-        idx = np.random.randint(0, len(self), size=batch_size)
+        if self.full:
+            # Offset uniformly in [1, capacity) from pos, so idx is never
+            # pos itself and idx+1 is always a genuinely-written slot.
+            idx = (self.pos + np.random.randint(1, self.capacity, size=batch_size)) % self.capacity
+        else:
+            idx = np.random.randint(0, self.pos, size=batch_size)
+        next_idx = (idx + 1) % self.capacity
         to = lambda x: torch.as_tensor(x, device=self.device)
         # TODO(augmentation): per-sample random shift/crop (PIE-G / DrQ style)
-        # goes here, applied to to(self.obs[idx]) / to(self.next_obs[idx])
+        # goes here, applied to to(self.obs[idx]) / to(self.obs[next_idx])
         # before returning -- only meaningful when the buffer stores pixels.
         return (
             to(self.obs[idx]),
-            to(self.next_obs[idx]),
+            to(self.obs[next_idx]),
             to(self.actions[idx]),
             to(self.rewards[idx]),
             to(self.terminations[idx]),
@@ -157,9 +216,13 @@ class ReplayBuffer:
 
 
 class SoftQNetwork(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden: list):
+    def __init__(self, obs_dim: int, action_dim: int, hidden: list, obs_norm: bool = True):
         super().__init__()
-        self.obs_norm = nn.LayerNorm(obs_dim)
+        # Input LayerNorm is for high-dim PVR features only. On a low-dim
+        # state vector, per-sample normalization aliases states (LN(x) is
+        # invariant to x -> a*x + b*1) and couples every dim through noisy
+        # 17-sample statistics -- pass obs_norm=False there.
+        self.obs_norm = nn.LayerNorm(obs_dim) if obs_norm else nn.Identity()
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden[0])
         self.fc2 = nn.Linear(hidden[0], hidden[1])
         self.fc3 = nn.Linear(hidden[1], 1)
@@ -172,9 +235,10 @@ class SoftQNetwork(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden: list, action_space):
+    def __init__(self, obs_dim: int, action_dim: int, hidden: list, action_space, obs_norm: bool = True):
         super().__init__()
-        self.obs_norm = nn.LayerNorm(obs_dim)
+        # See SoftQNetwork: LayerNorm for PVR features, Identity for state.
+        self.obs_norm = nn.LayerNorm(obs_dim) if obs_norm else nn.Identity()
         self.fc1 = nn.Linear(obs_dim, hidden[0])
         self.fc2 = nn.Linear(hidden[0], hidden[1])
         self.fc_mean = nn.Linear(hidden[1], action_dim)
