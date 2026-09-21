@@ -1,25 +1,24 @@
 #!/bin/bash
 #SBATCH --job-name=sac_debug
-#SBATCH --account=project_2019621
-#SBATCH --partition=gputest
-#SBATCH --gres=gpu:gh200:1
-#SBATCH --time=00:14:30
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=72
 #SBATCH --mem=32G
-#SBATCH --output=/scratch/project_2019621/pvr/xft_logs/outs/%j/o.out
-#SBATCH --error=/scratch/project_2019621/pvr/xft_logs/outs/%j/e.err
+#SBATCH --gpus=1
+# #SBATCH --partition=gpu-h200-71g-ia-ellis,gpu-h100-80g,gpu-h100-80g
+#SBATCH --partition=gpu-debug
+#SBATCH --time=00:15:00
+#SBATCH --cpus-per-task=8
+#SBATCH --error=./out_debug/deb_%A/e.err
+#SBATCH --output=./out_debug/deb_%A/o.out
 
-module load python-pytorch
-source pvr_env/bin/activate
+
+module load mamba
+source activate pvr_env_cu126/
 
 export MUJOCO_GL=egl
-export WANDB_DIR=/scratch/project_2019621/pvr/xft_logs/wandb_me
-OUT_ROOT_DIR="/scratch/project_2019621/pvr/xft_logs"
+
 
 srun python3 train_sac.py \
-       	env=franka_kitchen_pixels \
-        embedding=resnet18 \
+       	env=dm_control_pixels \
+	embedding=resnet18 \
         finetune.enabled=true \
         save.enabled=false \
         algo.total_timesteps=5000 \
@@ -27,4 +26,3 @@ srun python3 train_sac.py \
         algo.learning_starts=200 \
         algo.eval_frequency=500 \
         algo.log_frequency=250 \
-        hydra.run.dir="$OUT_ROOT_DIR/outputs_me/sac/\${env.id}/\${embedding.name}/\${now:%Y-%m-%d_%H-%M-%S}"

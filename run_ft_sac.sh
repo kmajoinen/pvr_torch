@@ -1,29 +1,28 @@
 #!/bin/bash
-#SBATCH --job-name=r3m18_ft
-#SBATCH --account=project_2019621
-#SBATCH --partition=gpumedium
-#SBATCH --gres=gpu:gh200:1
-#SBATCH --time=12:00:00
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=72
-#SBATCH --output=/scratch/project_2019621/pvr/xft_logs/outs/%j/o.out
-#SBATCH --error=/scratch/project_2019621/pvr/xft_logs/outs/%j/e.err
+#SBATCH --job-name=run_rn18ft
+#SBATCH --mem=40G
+#SBATCH --gpus=1
+#SBATCH --partition=gpu-h200-71g-ia-ellis,gpu-h200-141g-ellis,gpu-h100-80g
+#SBATCH --time=06:00:00
+#SBATCH --cpus-per-task=12
+#SBATCH --error=./outs/rn18_%A/e.err
+#SBATCH --output=./outs/rn18_%A/o.out
 
-module load python-pytorch
-source pvr_env/bin/activate
+
+# module --ignore-cache load mamba
+module load mamba
+source activate pvr_env/
 
 export MUJOCO_GL=egl
-export WANDB_DIR=/scratch/project_2019621/pvr/xft_logs/wandb_me
-OUT_ROOT_DIR="/scratch/project_2019621/pvr/xft_logs"
+#MODEL_DIR="$WRKDIR/models/"
 
 srun python3 train_sac.py \
-        env=dmc_cheetah_pixels \
-        embedding=r3m_resnet18 \
+        env=dm_control_pixels \
+        embedding=resnet18 \
         save.enabled=false \
         algo.total_timesteps=200000 \
         wandb.enabled=true \
         wandb.project=pvr-sac \
         finetune.enabled=true \
 	finetune.encoder_grads=critic \
-	finetune.aux_loss=none \
-        hydra.run.dir="$OUT_ROOT_DIR/outputs_me/sac/\${env.id}/\${embedding.name}/\${now:%Y-%m-%d_%H-%M-%S}"
+	finetune.aux_loss=none
