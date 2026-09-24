@@ -23,6 +23,12 @@ finetune:
 seed: 1
 device: cuda             # set to cpu if no GPU
 
+obs_norm: null           # null -> auto (LayerNorm iff embedding set). Override
+                          # to true/false to force actor/critic input LayerNorm
+                          # on or off regardless of mode -- e.g. obs_norm=false
+                          # on a pixel/PVR run, to test whether the July
+                          # LayerNorm fix helps or hurts there too.
+
 model_dir: null          # if set, embedding checkpoints are looked up here
                           # first (matched by filename minus extension, e.g.
                           # resnet18.pth) -- crashes if set but no matching

@@ -274,7 +274,11 @@ def main(cfg: DictConfig) -> None:
     hidden = list(cfg.algo.net_arch)
     # Input LayerNorm only when obs are encoder features; raw state vectors
     # go in unnormalized (matches SB3's MlpPolicy -- see SoftQNetwork docs).
-    obs_norm = emb_name is not None
+    # cfg.obs_norm overrides the auto default (null) -- set obs_norm=false
+    # on a pixel/PVR run to ablate whether LayerNorm helps there too.
+    obs_norm = cfg.get("obs_norm", None)
+    if obs_norm is None:
+        obs_norm = emb_name is not None
     actor = Actor(feat_dim, action_dim, hidden, env.action_space, obs_norm).to(device)
     assert isinstance(actor.obs_norm, torch.nn.Identity if emb_name is None else torch.nn.LayerNorm), f"obs_norm wiring wrong for emb_name={emb_name}"
     qf1 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)

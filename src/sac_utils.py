@@ -45,18 +45,23 @@ def _make_gym(env_id: str, image_size: int):
     """Generic pixel builder for envs that don't natively emit pixel
     observations and don't support dm_control's render_kwargs convention
     (Adroit hand envs, FrankaKitchen): render_mode="rgb_array" + swap the
-    observation for the rendered frame via AddRenderObservation. image_size
-    isn't used to control render resolution here -- unlike dm_control,
-    these envs don't expose a height/width render kwarg, so this renders at
-    whatever the env's default camera/resolution is; EmbeddingNet's own
-    transform pipeline resizes to the encoder's input size regardless of
-    native render size.
+    observation for the rendered frame via AddRenderObservation, then
+    resize down to image_size. Unlike dm_control, these envs don't expose
+    a height/width render kwarg, so rendering itself always happens at the
+    env's native camera resolution (480x480 for Adroit) -- ResizeObservation
+    shrinks the frame post-render, before it reaches the replay buffer.
+    Without this, finetune mode (raw pixels in the buffer) stores every
+    frame at native resolution regardless of image_size, which is both
+    wasted memory (EmbeddingNet resizes to the encoder's input size
+    anyway) and, at buffer_size=1_000_000, enough to OOM (480x480x3 x 1M
+    = 691 GB).
     """
     import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
-    from gymnasium.wrappers import AddRenderObservation
+    from gymnasium.wrappers import AddRenderObservation, ResizeObservation
 
     env = gym.make(env_id, render_mode="rgb_array")
-    return AddRenderObservation(env, render_only=True)
+    env = AddRenderObservation(env, render_only=True)
+    return ResizeObservation(env, (image_size, image_size))
 
 
 def _make_state(env_id: str, image_size: int):
