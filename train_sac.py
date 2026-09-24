@@ -276,6 +276,7 @@ def main(cfg: DictConfig) -> None:
     # go in unnormalized (matches SB3's MlpPolicy -- see SoftQNetwork docs).
     obs_norm = emb_name is not None
     actor = Actor(feat_dim, action_dim, hidden, env.action_space, obs_norm).to(device)
+    assert isinstance(actor.obs_norm, torch.nn.Identity if emb_name is None else torch.nn.LayerNorm), f"obs_norm wiring wrong for emb_name={emb_name}"
     qf1 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
     qf2 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
     qf1_target = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
