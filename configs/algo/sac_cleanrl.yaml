@@ -13,6 +13,11 @@ policy_betas: [0.9, 0.999]    # Adam (beta1, beta2) for the actor optimizer
 q_betas: [0.9, 0.999]         # Adam (beta1, beta2) for the critic optimizer
 alpha_betas: [0.9, 0.999]     # Adam (beta1, beta2) for the temperature optimizer.
                                # Some implementations use beta1=0.5 here.
+grad_clip: 10.0                # grad-norm clip on qf1+qf2 (critic step) and actor
+                               # separately -- unlike finetune.grad_clip (encoder
+                               # only), this applies in every mode (state/frozen/
+                               # finetune), since the critic itself was previously
+                               # never clipped at all.
 policy_frequency: 2           # actor updated every N critic updates (then N times)
 target_network_frequency: 1
 alpha: 0.2                    # entropy coefficient (ignored if autotune_alpha)

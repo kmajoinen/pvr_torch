@@ -437,6 +437,12 @@ def main(cfg: DictConfig) -> None:
             enc_optimizer.zero_grad(set_to_none=True)
         q_optimizer.zero_grad()
         qf_loss.backward()
+        q_gnorm = float(
+            torch.nn.utils.clip_grad_norm_(
+                list(qf1.parameters()) + list(qf2.parameters()),
+                max_norm=cfg.algo.grad_clip,
+            )
+        )
         q_optimizer.step()
 
         aux_value = None
@@ -485,6 +491,11 @@ def main(cfg: DictConfig) -> None:
                     enc_optimizer.zero_grad(set_to_none=True)
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
+                actor_gnorm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        actor.parameters(), max_norm=cfg.algo.grad_clip
+                    )
+                )
                 actor_optimizer.step()
                 if route_actor:
                     enc_gnorm_actor = float(
@@ -528,6 +539,7 @@ def main(cfg: DictConfig) -> None:
                 f"  q1={qf1_a_values.mean().item():7.2f}"
                 f"  actor_loss={actor_loss.item():8.3f}"
                 f"  alpha={alpha:.3f}  SPS={sps}"
+                f"  gnorm(q/actor)={q_gnorm:.2f}/{actor_gnorm:.2f}"
                 + (
                     f"  enc_gnorm(c/a)={enc_gnorm_critic:.2f}/{enc_gnorm_actor:.2f}"
                     if encoder_trains
@@ -545,6 +557,8 @@ def main(cfg: DictConfig) -> None:
                     "train/actor_loss": actor_loss.item(),
                     "train/alpha": alpha,
                     "train/entropy": -log_pi.mean().item(),
+                    "train/q_grad_norm": q_gnorm,
+                    "train/actor_grad_norm": actor_gnorm,
                     "charts/SPS": sps,
                     "global_step": global_step,
                 }
