@@ -1,4 +1,3 @@
 name: vc1_vitl
 pretrained: true
 train: false
-augmentation: null

@@ -1,4 +1,3 @@
 name: resnet34
 pretrained: true
 train: false
-augmentation: null

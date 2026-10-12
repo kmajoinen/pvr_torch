@@ -2,22 +2,29 @@ defaults:
   - env: dm_control_pixels
   - algo: sac_cleanrl
   - embedding: resnet50
+  - augmentation: none     # configs/augmentation/*.yaml
   - _self_
 
+config_version: 2          # 2: finetune.* replaced by encoder.* + buffer_obs
 
-finetune:
-  enabled: false          # false -> frozen fast path (wrapper, features in buffer)
-  encoder_grads: critic   # none | critic | actor | both  (none = slow-frozen mode)
-  encoder_lr: 1.0e-5      # separate encoder LR, well below q_lr/policy_lr
-  encoder_betas: [0.9, 0.999]  # Adam (beta1, beta2) for the encoder optimizer
-  grad_clip: 10.0         # clip norm on encoder gradients before each step
-  aux_loss: none          # none | l2sp  (l2sp = anchor to pretrained weights)
-  aux_weight: 1.0
+# The encoder trains (gets an optimizer) iff grads != none or aux is non-empty.
+encoder:
+  grads: none              # none | critic | actor | both -- which RL losses
+                           #   backprop into the encoder
+  lr: 1.0e-5               # separate encoder LR, well below q_lr/policy_lr
+  betas: [0.9, 0.999]      # Adam (beta1, beta2) for the encoder optimizer
+  grad_clip: 10.0          # clip norm on encoder gradients before each step
+  aux: []                  # aux losses (src/losses.py), e.g.
+                           #   'encoder.aux=[{name:l2sp,weight:1.0}]'
 
-# Reminder for finetune runs: pixels go in the buffer, so override
-#   env.image_size=112 (or 84)  and/or  algo.buffer_size
-# to keep obs+next_obs memory sane (printed at startup). The frozen fast
-# path keeps rendering at 224 as before.
+buffer_obs: auto           # auto | features | pixels
+                           #   auto     pixels if the encoder trains or augmentation
+                           #            is on, else features (encoded once per env step)
+                           #   pixels   always; with a frozen encoder and no
+                           #            augmentation this is "slow-frozen"
+                           #   features error if pixels are needed
+# Pixels in the buffer cost buffer_size * H * W * 3 bytes (printed at
+# startup) -- shrink env.image_size (e.g. 112 or 84) and/or algo.buffer_size.
 
 
 seed: 1

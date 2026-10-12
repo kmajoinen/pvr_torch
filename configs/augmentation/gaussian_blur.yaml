@@ -1,0 +1,7 @@
+# Per-sample Gaussian blur (kornia), sigma drawn uniformly from the range.
+name: gaussian_blur
+stage: rl
+params:
+  kernel_size: 5
+  sigma: [0.1, 2.0]
+  p: 1.0

@@ -19,7 +19,7 @@ export MUJOCO_GL=egl
 srun python3 train_sac.py \
        	env=dm_control_pixels \
 	embedding=resnet18 \
-        finetune.enabled=true \
+        encoder.grads=critic \
         save.enabled=false \
         algo.total_timesteps=5000 \
         algo.buffer_size=1000 \

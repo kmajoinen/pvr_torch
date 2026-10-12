@@ -1,0 +1,6 @@
+# Per-sample horizontal flip (kornia). Mirrors the image but not the action
+# space, so only use it where left/right symmetry doesn't matter to the task.
+name: horizontal_flip
+stage: rl
+params:
+  p: 0.5

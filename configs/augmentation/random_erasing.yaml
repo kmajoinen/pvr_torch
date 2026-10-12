@@ -1,0 +1,9 @@
+# Per-sample random erasing / cutout (kornia): erased rectangles are set to
+# `value`.
+name: random_erasing
+stage: rl
+params:
+  scale: [0.02, 0.33]
+  ratio: [0.3, 3.3]
+  value: 0.0
+  p: 0.5

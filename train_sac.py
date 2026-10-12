@@ -8,24 +8,33 @@ against reference results -- the tanh-Gaussian log-prob correction, twin-Q
 target, and automatic entropy tuning are kept verbatim. Nothing from CleanRL
 needs to be installed; this file is self-contained.
 
-Two encoder regimes, selected by cfg.finetune.enabled:
+Three independent settings decide what happens to the encoder
+(validated up front by src/encoder_config.py):
 
-  FROZEN-FAST (finetune.enabled=false, the standard PVR-eval protocol)
+  encoder.grads     which RL losses backprop into the encoder (below)
+  encoder.aux       auxiliary encoder losses (src/losses.py)
+  augmentation      configs/augmentation/*.yaml; applied to replay-batch
+                    encodes only, never to rollouts or evaluation
+
+The encoder trains iff grads != none or aux is non-empty. What the replay
+buffer stores follows from these (buffer_obs=auto):
+
+  FEATURES (frozen encoder, no augmentation -- the standard PVR-eval protocol)
       The frozen encoder lives in an env wrapper (FrozenEncoderWrapper): each
       frame is encoded exactly once at env-step time, the replay buffer
       stores feature vectors, and gradient updates never touch the encoder.
 
-  FINETUNE (finetune.enabled=true)
-      Pixels are stored in the replay buffer and the encoder sits inside the
-      gradient path, re-encoding each sampled minibatch -- necessarily slower
-      (that cost is the definition of finetuning, not a defect). Gradient
-      routing into the encoder is one visible enum:
+  PIXELS (encoder trains, or augmentation is on)
+      Pixels are stored in the replay buffer and every sampled minibatch is
+      re-encoded -- necessarily slower (that cost is the definition of
+      finetuning, not a defect). buffer_obs=pixels forces this path with a
+      frozen encoder and no augmentation ("slow-frozen"): the same features
+      as the fast path, useful as a control. Gradient routing into the
+      encoder is one visible enum:
 
-        finetune.encoder_grads:
-          none    Encoder weights never update. This is the SLOW-FROZEN mode:
-                  protocol-compatible with in-policy frozen extraction, and
-                  the structural prerequisite for per-sample augmentation
-                  (PIE-G / DrQ-style), which the fast path cannot express.
+        encoder.grads:
+          none    No RL gradient reaches the encoder (it may still train on
+                  encoder.aux).
           critic  DrQ-v2 recipe: critic loss trains the encoder, actor takes
                   detached features. The literature's default choice.
           actor   Actor loss trains the encoder (both gradient paths of the
@@ -41,17 +50,16 @@ Two encoder regimes, selected by cfg.finetune.enabled:
                   re-encoding), not as one summed-gradient step -- summing
                   would require evaluating the actor loss against
                   pre-critic-update Q networks, changing SAC's ordering.
-                  Same for aux_loss, which always rides the critic-phase
+                  Same for encoder.aux, which always rides the critic-phase
                   cadence regardless of routing (so actor+l2sp alternates
                   pure-aux and pure-actor steps). With Adam these dynamics
                   differ from a combined step; compare routings via
                   train/encoder_drift_l2, which is routing-agnostic.
 
-      Independently of routing, an auxiliary objective can train the encoder
-      (finetune.aux_loss): 'l2sp' anchors weights to their pretrained values
+      Independently of routing, auxiliary losses can train the encoder
+      (encoder.aux): 'l2sp' anchors weights to their pretrained values
       (||theta - theta_0||^2, Xuhong et al. 2018) -- adapt while penalizing
-      drift. aux_loss with encoder_grads=none = adaptation without RL
-      gradients at all.
+      drift. aux with grads=none = adaptation without RL gradients at all.
 
 Design notes:
   - Actor and critics each apply their own LayerNorm to input features --
@@ -67,20 +75,19 @@ Design notes:
     is a known silent-corruption source (and the failure mode behind this
     project's original resnet50 NaN). Frozen BN statistics, trainable BN
     affine params -- the standard finetuning choice.
-  - Finetune buffer memory: uint8 pixels cost 2 * buffer_size * H * W * 3
-    bytes (obs + next_obs). At the frozen path's native 224 render that is
-    ~30 GB per 100k -- override env.image_size (e.g. 112 or 84) or shrink
-    algo.buffer_size for finetune runs; EmbeddingNet's transforms resize
-    internally either way. The script prints the estimate at startup.
+  - Pixel buffer memory: uint8 pixels cost buffer_size * H * W * 3 bytes
+    (next_obs is derived from the following slot, not stored). At 224px
+    that is ~15 GB per 100k -- override env.image_size (e.g. 112 or 84) or
+    shrink algo.buffer_size; EmbeddingNet's transforms resize internally
+    either way. The script prints the estimate at startup.
 
 Usage:
     python train_sac.py                                  # frozen fast path
-    python train_sac.py finetune.enabled=true finetune.encoder_grads=critic \
-        env.image_size=112 embedding=resnet18
-    python train_sac.py finetune.enabled=true finetune.encoder_grads=none \
-        env.image_size=112                                      # slow-frozen protocol
-    python train_sac.py finetune.enabled=true finetune.aux_loss=l2sp \
-        finetune.encoder_grads=none env.image_size=112          # aux-only adaptation
+    python train_sac.py encoder.grads=critic env.image_size=112 embedding=resnet18
+    python train_sac.py augmentation=random_shift env.image_size=112   # frozen + DrQ shift
+    python train_sac.py buffer_obs=pixels env.image_size=112           # slow-frozen control
+    python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' \
+        env.image_size=112                                      # aux-only adaptation
     python train_sac.py env=pendulum embedding=none      # state-based sanity check
 """
 
@@ -101,6 +108,12 @@ import torch.optim as optim
 import gymnasium as gym
 from omegaconf import DictConfig, OmegaConf
 
+from src.encoder_config import (
+    encoder_settings,
+    resolve_buffer_obs,
+    warn_unused_encoder_overrides,
+)
+from src.losses import AuxBatch, build_aux_losses, total_aux_loss
 from src.sac_utils import (
     Actor,
     ReplayBuffer,
@@ -130,25 +143,17 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    # ── Finetune configuration ────────────────────────────────────────────────
-    if "finetune" not in cfg:
-        raise KeyError(
-            "cfg.finetune missing -- add a `finetune:` block to "
-            "configs/config_sac.yaml "
-            "(top level, alongside seed/device/save/wandb/perf)."
-        )
-    ft = cfg.finetune
-    finetune = bool(ft.enabled)
-    routing = str(ft.encoder_grads) if finetune else "none"
-    aux_name = str(ft.aux_loss) if finetune else "none"
-    assert routing in ("none", "critic", "actor", "both"), routing
-    assert aux_name in ("none", "l2sp"), aux_name
-    encoder_trains = finetune and (routing != "none" or aux_name != "none")
-    if finetune:
+    # ── Encoder / augmentation / buffer settings ──────────────────────────────
+    # Validated before anything expensive is built (src/encoder_config.py).
+    enc = encoder_settings(cfg, valid_grads=("none", "critic", "actor", "both"))
+    pixels_in_buffer, buffer_reason = resolve_buffer_obs(cfg, enc)
+    warn_unused_encoder_overrides(enc)
+    routing = enc.grads
+    encoder_trains = enc.trains
+    if encoder_trains:
         print(
-            f"Finetune: encoder_grads={routing}  aux_loss={aux_name}"
-            f"  encoder_lr={ft.encoder_lr}"
-            f"{'  (slow-frozen: pixels in buffer, encoder never updates)' if not encoder_trains else ''}"
+            f"Encoder trains: grads={routing}  aux={enc.aux_names}"
+            f"  lr={cfg.encoder.lr}"
         )
 
     # ── Weights & Biases ──────────────────────────────────────────────────────
@@ -157,13 +162,15 @@ def main(cfg: DictConfig) -> None:
         import wandb
 
         emb_tag = cfg.embedding.get("name") or "state"
-        ft_tag = (
-            f"_ft-{routing}" + (f"-{aux_name}" if aux_name != "none" else "")
-            if finetune
-            else ""
-        )
+        tags = ""
+        if encoder_trains:
+            tags += "_ft-" + "-".join([routing] + enc.aux_names)
+        if enc.aug_name is not None:
+            tags += f"_aug-{enc.aug_name}"
+        if pixels_in_buffer and not encoder_trains and enc.aug_name is None:
+            tags += "_slowfrozen"
         run_name = (
-            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{ft_tag}_s{cfg.seed}"
+            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{tags}_s{cfg.seed}"
         )
         wandb.init(
             project=cfg.wandb.project,
@@ -177,18 +184,22 @@ def main(cfg: DictConfig) -> None:
 
     # ── Encoder ───────────────────────────────────────────────────────────────
     emb_name = cfg.embedding.get("name", None)
-    assert not (finetune and emb_name is None), "finetune.enabled requires an embedding"
     embedding_net = None
+    aug_module = None
     if emb_name is not None:
+        from src.augmentations import build_augmentation
         from src.embeddings import EmbeddingNet
 
-        aug_name = cfg.embedding.get("augmentation", None)
-        aug_module = None
-        if aug_name is not None:
-            from src.augmentations import make_augmentation
-
-            aug_module = make_augmentation(aug_name)
-            print(f"Augmentation: {aug_name}  (applied to training-batch encodes only)")
+        # Only ever non-None on the pixel path (resolve_buffer_obs guarantees
+        # augmentation => pixels), so this banner means it really runs.
+        aug_module = build_augmentation(cfg.augmentation)
+        if aug_module is not None:
+            aug_module = aug_module.to(device)
+            print(
+                f"Augmentation: {enc.aug_name}  stage={enc.aug_stage}"
+                f"  params={dict(cfg.augmentation.get('params') or {})}"
+                "  (replay-batch encodes only; rollouts/eval stay clean)"
+            )
 
         frame_stack = cfg.embedding.get("frame_stack", 1)
         embedding_net = EmbeddingNet(
@@ -197,7 +208,6 @@ def main(cfg: DictConfig) -> None:
             pretrained=True,
             train=encoder_trains,
             disable_cuda=(str(device) == "cpu"),
-            augmentation=aug_module,
             model_dir=cfg.model_dir,
         )
         # eval() ALWAYS, even while weights train: freeze BatchNorm running
@@ -212,16 +222,16 @@ def main(cfg: DictConfig) -> None:
         )
 
     # ── Envs ──────────────────────────────────────────────────────────────────
-    # Frozen fast path: env wrapper encodes, buffer stores features.
-    # Finetune path: env emits pixels, encoding happens in the loop.
-    wrap = not finetune
+    # Features path: env wrapper encodes, buffer stores features.
+    # Pixels path: env emits pixels, encoding happens in the loop.
+    wrap = not pixels_in_buffer
     env = make_env(cfg, embedding_net, wrap_encoder=wrap)
     eval_env = make_env(cfg, embedding_net, wrap_encoder=wrap)
     assert isinstance(env.action_space, gym.spaces.Box), "continuous actions only"
     env.action_space.seed(cfg.seed)
 
     action_dim = int(np.prod(env.action_space.shape))
-    if finetune:
+    if pixels_in_buffer:
         obs_shape = env.observation_space.shape  # (H, W, C) uint8
         feat_dim = int(embedding_net.out_size)
         buffer_dtype = np.uint8
@@ -230,19 +240,21 @@ def main(cfg: DictConfig) -> None:
         feat_dim = int(np.prod(obs_shape))
         buffer_dtype = np.float32
 
-    # ── Encoding helper (finetune path) ───────────────────────────────────────
+    # ── Encoding helper (pixels path) ─────────────────────────────────────────
     amp_on = cfg.perf.amp_bf16 and device.type == "cuda"
     _grad_contract_checked = False
 
     def encode(obs_batch, grad: bool, augment: bool = False) -> torch.Tensor:
         """(B, H, W, C) uint8 (tensor or ndarray) -> (B, feat_dim) float32.
         Same layout/dtype contract as FrozenEncoderWrapper: uint8 CHW into
-        EmbeddingNet.encode, which handles resize/normalization internally.
+        EmbeddingNet, which handles resize/normalization internally.
 
         augment: pass True only for training-batch encodes (sampled from
         the replay buffer) -- never for rollout-time action selection or
         eval(), where you want the encoder's clean view of the real
-        observation. No-op unless cfg.embedding.augmentation is set."""
+        observation. No-op when no augmentation is configured. Applied
+        between EmbeddingNet.preprocess and encode_preprocessed, i.e. at the
+        encoder's input resolution."""
         nonlocal _grad_contract_checked
         x = (
             torch.as_tensor(np.ascontiguousarray(obs_batch))
@@ -252,7 +264,10 @@ def main(cfg: DictConfig) -> None:
         x = x.to(device).permute(0, 3, 1, 2)
         ctx = torch.enable_grad() if grad else torch.no_grad()
         with ctx, torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
-            feats = embedding_net.encode(x, augment=augment)
+            x = embedding_net.preprocess(x)
+            if augment and aug_module is not None:
+                x = aug_module(x)
+            feats = embedding_net.encode_preprocessed(x)
         if grad and not _grad_contract_checked:
             # TODO(EmbeddingNet contract): if this trips, EmbeddingNet.encode
             # breaks the graph internally (no_grad/inference_mode, a numpy
@@ -296,31 +311,32 @@ def main(cfg: DictConfig) -> None:
         actor.parameters(), lr=cfg.algo.policy_lr, betas=tuple(cfg.algo.policy_betas)
     )
 
-    enc_optimizer, theta0 = None, None
+    enc_optimizer, theta0, enc_params, aux_terms = None, None, [], []
     if encoder_trains:
+        aux_terms = build_aux_losses(enc.aux_specs, embedding_net)
+        for t in aux_terms:
+            t.loss.to(device)
+        # Learnable heads owned by aux losses train alongside the encoder.
+        enc_params = list(embedding_net.parameters()) + [
+            p for t in aux_terms for p in t.loss.parameters()
+        ]
         # Separate, much lower LR: at the head LRs a resnet18's weight sums
         # drift ~3% in 50 gradient steps (measured) -- far too fast for a
         # pretrained representation you want to adapt, not destroy.
         enc_optimizer = optim.Adam(
-            embedding_net.parameters(), lr=ft.encoder_lr, betas=tuple(ft.encoder_betas)
+            enc_params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
         )
-        theta0 = {n: p.detach().clone() for n, p in embedding_net.named_parameters()}
-
-    def aux_loss_fn() -> torch.Tensor:
-        if aux_name == "l2sp":
-            return sum(
-                ((p - theta0[n]) ** 2).sum()
-                for n, p in embedding_net.named_parameters()
-            )
-        # TODO(aux): add reconstruction / temporal-contrastive objectives here
-        # as new aux_name branches; they receive the encoder via closure.
-        raise ValueError(aux_name)
+        # Kept on CPU: only read for the drift metric at log time, and a GPU
+        # copy would double the encoder's memory (l2sp keeps its own anchor).
+        theta0 = {
+            n: p.detach().cpu().clone() for n, p in embedding_net.named_parameters()
+        }
 
     def encoder_drift() -> float:
         with torch.no_grad():
             return float(
                 sum(
-                    ((p - theta0[n]) ** 2).sum()
+                    ((p.detach().cpu() - theta0[n]) ** 2).sum()
                     for n, p in embedding_net.named_parameters()
                 ).sqrt()
             )
@@ -336,6 +352,7 @@ def main(cfg: DictConfig) -> None:
     else:
         alpha = cfg.algo.alpha
 
+    print(f"\nBuffer stores: {buffer_reason}")
     rb = ReplayBuffer(
         cfg.algo.buffer_size, obs_shape, action_dim, device, obs_dtype=buffer_dtype
     )
@@ -361,7 +378,7 @@ def main(cfg: DictConfig) -> None:
         if global_step <= cfg.algo.learning_starts:
             action = env.action_space.sample()
         else:
-            if finetune:
+            if pixels_in_buffer:
                 obs_t = encode_single(obs)
             else:
                 obs_t = torch.as_tensor(
@@ -404,10 +421,10 @@ def main(cfg: DictConfig) -> None:
             cfg.algo.batch_size
         )
 
-        route_critic = finetune and routing in ("critic", "both")
-        route_actor = finetune and routing in ("actor", "both")
+        route_critic = routing in ("critic", "both")
+        route_actor = routing in ("actor", "both")
 
-        if finetune:
+        if pixels_in_buffer:
             feats = encode(b_obs, grad=route_critic, augment=True)
             # No target encoder: live encoder under no_grad (DrQ-v2 convention).
             next_feats = encode(b_next_obs, grad=False, augment=True)
@@ -430,7 +447,7 @@ def main(cfg: DictConfig) -> None:
         qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
         qf_loss = qf1_loss + qf2_loss
 
-        enc_step_now = route_critic or (encoder_trains and aux_name != "none")
+        enc_step_now = route_critic or bool(aux_terms)
         enc_gnorm_critic = float("nan")
         enc_gnorm_actor = float("nan")
         if enc_step_now:
@@ -445,15 +462,16 @@ def main(cfg: DictConfig) -> None:
         )
         q_optimizer.step()
 
-        aux_value = None
-        if encoder_trains and aux_name != "none":
-            aux = ft.aux_weight * aux_loss_fn()
-            aux.backward()
-            aux_value = aux.item()
+        aux_total, aux_values = None, {}
+        if aux_terms:
+            aux_total, aux_values = total_aux_loss(
+                aux_terms, AuxBatch(encoder=embedding_net)
+            )
+            aux_total.backward()
         if enc_step_now:
             enc_gnorm_critic = float(
                 torch.nn.utils.clip_grad_norm_(
-                    embedding_net.parameters(), max_norm=ft.grad_clip
+                    enc_params, max_norm=cfg.encoder.grad_clip
                 )
             )
             enc_optimizer.step()
@@ -461,7 +479,7 @@ def main(cfg: DictConfig) -> None:
         # ---- actor (+ alpha) update, delayed ------------------------------------
         if global_step % cfg.algo.policy_frequency == 0:
             for _ in range(cfg.algo.policy_frequency):
-                if finetune:
+                if pixels_in_buffer:
                     if route_actor:
                         # Re-encode with grad each inner iteration: the
                         # encoder may have just been updated, and the critic
@@ -500,7 +518,7 @@ def main(cfg: DictConfig) -> None:
                 if route_actor:
                     enc_gnorm_actor = float(
                         torch.nn.utils.clip_grad_norm_(
-                            embedding_net.parameters(), max_norm=ft.grad_clip
+                            enc_params, max_norm=cfg.encoder.grad_clip
                         )
                     )
                     enc_optimizer.step()
@@ -568,8 +586,10 @@ def main(cfg: DictConfig) -> None:
                     log["train/encoder_grad_norm_critic"] = enc_gnorm_critic
                     log["train/encoder_grad_norm_actor"] = enc_gnorm_actor
                     log["train/encoder_drift_l2"] = encoder_drift()
-                    if aux_value is not None:
-                        log["train/aux_loss"] = aux_value
+                    if aux_total is not None:
+                        log["train/aux_loss"] = aux_total.item()
+                        for name, value in aux_values.items():
+                            log[f"train/aux/{name}"] = value
                 wandb.log(log, step=global_step)
 
         # ---- periodic evaluation ----------------------------------------------------
@@ -579,7 +599,7 @@ def main(cfg: DictConfig) -> None:
                 eval_env,
                 cfg.algo.n_episodes_test,
                 device,
-                encode_fn=encode_single if finetune else None,
+                encode_fn=encode_single if pixels_in_buffer else None,
                 success_fn=_success_fn_for(cfg.env.id),
             )
             print(

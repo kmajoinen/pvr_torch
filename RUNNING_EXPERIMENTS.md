@@ -1,20 +1,21 @@
 # Running experiments
 
 Practical reference for launching training runs: which script, which envs,
-which embeddings (and where their weights come from), and how finetuning
-works. This complements `README.md` rather than replacing it.
+which embeddings (and where their weights come from), and how encoder
+training and augmentation work. This complements `README.md` rather than replacing it.
 
 ## Which script
 
 - **`train_sac.py`** — primary script. Explicit CleanRL-style training loop.
   Supports frozen-fast PVR, slow-frozen PVR, PVR finetune (with gradient
-  routing), and state-only baselines. Config: `configs/config_sac.yaml`.
+  routing), aux losses, augmentation, and state-only baselines. Config:
+  `configs/config_sac.yaml`.
 - **`train_sac_sb3.py`** — kept for posterity, Stable-Baselines3-backed.
   Supports state / CNN-from-scratch (SB3's NatureCNN) / frozen PVR (fast and
-  slow) / PVR finetune (actor-only gradient routing, no `encoder_grads`
-  choice). Config: `configs/config_sac_sb3.yaml`. Use this specifically if
-  you need SB3's `CnnPolicy` baseline or don't care about gradient-routing
-  control.
+  slow) / PVR finetune (actor-only gradient routing, no `encoder.grads`
+  choice). No augmentation or aux losses. Config:
+  `configs/config_sac_sb3.yaml`. Use this specifically if you need SB3's
+  `CnnPolicy` baseline or don't care about gradient-routing control.
 
 Everything below is about `train_sac.py` unless stated otherwise.
 
@@ -157,68 +158,96 @@ Only checkpoint-file-based embeddings honor `model_dir` — `resnet18/34/50`
 (plain, non-`_l3`/`_l4`/`_places` versions), `clip_*`, `openclip_*`, and
 `r3m_*` never consult it; they always use their own package's loader/cache.
 
-## Finetuning
+## Encoder training and augmentation
 
-Controlled by the `finetune:` block in `config_sac.yaml`:
+Three independent settings, shared by `train_sac.py` and `train_bc.py` and
+validated before anything is loaded (`src/encoder_config.py`):
+
 ```yaml
-finetune:
-  enabled: false          # false -> frozen-fast path (FrozenEncoderWrapper,
-                           #   features precomputed once per env step)
-  encoder_grads: critic   # none | critic | actor | both
-  encoder_lr: 1.0e-5       # separate optimizer/LR from the policy/critic
-  grad_clip: 10.0
-  aux_loss: none           # none | l2sp
-  aux_weight: 1.0
+encoder:
+  grads: none        # which task losses backprop into the encoder
+                     #   SAC: none | critic | actor | both    BC: none | policy
+  lr: 1.0e-5         # separate optimizer/LR from the policy/critic
+  betas: [0.9, 0.999]
+  grad_clip: 10.0    # SAC default; BC defaults to 1.0
+  aux: []            # auxiliary losses, e.g. [{name: l2sp, weight: 1.0}]
+augmentation: none   # Hydra group: configs/augmentation/*.yaml
+buffer_obs: auto     # SAC only: auto | features | pixels
 ```
 
-- **`enabled: false`** — the fast path. Encoder runs once per env step
-  outside the training loop; replay buffer stores feature vectors, not
-  pixels. This is what you want for a pure frozen-PVR comparison.
-- **`enabled: true, encoder_grads: none, aux_loss: none`** — "slow-frozen":
-  pixels go in the buffer and get re-encoded every gradient step under
-  `no_grad`, but nothing trains. Slower than the fast path for the same
-  result; only useful as a structural stepping stone toward finetuning or
-  augmentation experiments (which need pixels in the buffer).
-- **`encoder_grads`** — which RL loss trains the encoder: `critic` (DrQ-v2's
+- **The encoder trains** (gets an optimizer) iff `encoder.grads != none` or
+  `encoder.aux` is non-empty. Otherwise it's frozen.
+- **`encoder.grads`** — which RL loss trains the encoder: `critic` (DrQ-v2's
   default), `actor`, `both` (sequential Adam steps, not one combined
-  gradient — see the module docstring in `train_sac.py`), or `none`.
-- **`aux_loss: l2sp`** — independent of `encoder_grads`; anchors weights to
-  their pretrained values (`||θ - θ₀||²`). Combine with `encoder_grads=none`
-  for pure regularized adaptation with zero RL gradient into the encoder.
-- **Memory**: finetuning stores raw pixels in the replay buffer
-  (`2 × buffer_size × H × W × 3` bytes for obs + next_obs). At the frozen
-  path's native 224px render that's ~30GB per 100k transitions — override
-  `env.image_size=112` (or `84`) and/or shrink `algo.buffer_size` for
-  finetune runs. The estimate is printed at startup either way.
+  gradient — see the module docstring in `train_sac.py`), or `none`. For BC,
+  `policy` lets the BC loss backprop into the encoder.
+- **`encoder.aux`** — a list of auxiliary losses from `src/losses.py`, each
+  `{name, weight, ...params}`. `l2sp` anchors weights to their pretrained
+  values (`||θ - θ₀||²`). With `grads: none` it's pure regularized
+  adaptation with zero RL gradient into the encoder. To add your own,
+  subclass `AuxLoss` in `src/losses.py` and decorate it with
+  `@register_aux_loss("name")`; the file's docstring has the contract.
+- **`augmentation`** — picks a file from `configs/augmentation/` (`none`,
+  `random_shift`, `color_jitter`, `gaussian_blur`, `horizontal_flip`,
+  `random_erasing`, and `shift_jitter` as a pipeline example). Each has a
+  `name`, a `stage` and `params`. Only `stage: rl` is implemented so far:
+  the task loss (SAC actor/critic, BC policy loss) sees augmented
+  observations. It applies to sampled training batches only, never to
+  rollouts or evaluation. Augmentations run at the encoder's input
+  resolution (after its resize/crop) and draw parameters per sample; see
+  `src/augmentations.py` for the contract and how to add one.
+- **`buffer_obs`** (SAC) — what the replay buffer stores. `auto` stores
+  pixels if the encoder trains or augmentation is on (both need every
+  sampled batch re-encoded), and features otherwise: the fast path, where
+  the encoder runs once per env step and the buffer holds feature vectors.
+  `pixels` forces pixels; with a frozen encoder and no augmentation that's
+  "slow-frozen", the same features re-encoded every update, useful as a
+  control. `features` raises if pixels are needed. The choice and the
+  reason are printed at startup, next to the buffer's memory estimate.
+- **Memory**: pixels in the replay buffer cost `buffer_size × H × W × 3`
+  bytes (next_obs is derived from the following slot, not stored). At 224px
+  that's ~15GB per 100k transitions — override `env.image_size=112` (or
+  `84`) and/or shrink `algo.buffer_size` for pixel-buffer runs.
+- **BatchNorm**: the encoder stays in `eval()` even while it trains, so
+  BatchNorm running statistics never update (trainable BN affine params
+  only). Methods that rely on adapting BN statistics to RL frames, such as
+  PIE-G, can't be reproduced as published.
+- **Migrating from `finetune.*`** (`config_version` 1): `finetune.enabled`
+  is gone and any `finetune.*` key raises with a translation table.
+  `finetune.encoder_grads` → `encoder.grads`, `encoder_lr`/`encoder_betas`/
+  `grad_clip` → `encoder.lr`/`betas`/`grad_clip`, `aux_loss: l2sp` +
+  `aux_weight: w` → `encoder.aux: [{name: l2sp, weight: w}]`, and the old
+  slow-frozen mode → `buffer_obs=pixels`.
 
-Augmentation (currently `random_shift` only — DrQ-v2-style pad+shift, not
-literal DrQ-v1 random-crop; see `src/augmentations.py` for the full
-registry) plugs into the same finetune path — it only applies to sampled
-training batches, never to rollout/eval, and only fires when pixels are
-actually in the buffer:
-```yaml
-# configs/embedding/<name>.yaml
-augmentation: random_shift   # null by default
-```
-
-### Example finetune commands
+### Example commands
 ```bash
 # DrQ-v2-style critic-only finetuning
-python train_sac.py finetune.enabled=true finetune.encoder_grads=critic \
+python train_sac.py encoder.grads=critic env.image_size=112 embedding=resnet18
+
+# DrQ-v2-style finetuning with its random shift
+python train_sac.py encoder.grads=critic augmentation=random_shift \
     env.image_size=112 embedding=resnet18
 
-# Slow-frozen (protocol-compatible with the fast path, needed for augmentation)
-python train_sac.py finetune.enabled=true finetune.encoder_grads=none \
+# Frozen encoder + augmentation (pixels in the buffer, picked automatically)
+python train_sac.py augmentation=color_jitter env.image_size=112
+
+# Sweep augmentation and encoder independently
+python train_sac.py -m augmentation=none,random_shift embedding=r3m_resnet50,vc1_vitb \
     env.image_size=112
 
+# Slow-frozen control (protocol-compatible with the fast path)
+python train_sac.py buffer_obs=pixels env.image_size=112
+
 # Aux-only adaptation, zero RL gradient into the encoder
-python train_sac.py finetune.enabled=true finetune.aux_loss=l2sp \
-    finetune.encoder_grads=none env.image_size=112
+python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' env.image_size=112
+
+# BC with the BC loss training the encoder, plus augmentation
+python train_bc.py embedding=resnet18 encoder.grads=policy augmentation=random_shift
 ```
 
 ## Cluster job scripts
 
 `run_sac.sh` (full run) and `debug_sac.sh` (quick smoke test) are the
 current SLURM templates for `train_sac.py` — copy and adjust
-`embedding=`/`env=`/`finetune.*` overrides as needed. `sac_train.sh` /
+`embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed. `sac_train.sh` /
 `sac_debug.sh` are the equivalents for `train_sac_sb3.py`.

@@ -6,10 +6,14 @@ Supports:
   - Pixel observations (via EmbeddingNet, set cfg.embedding to a model name)
   - Minari offline RL datasets (cfg.dataset.format: minari)
   - Pickle trajectory files from save_opt_trajectories.py (cfg.dataset.format: pickle)
-  - PVR encoder finetuning (cfg.finetune.enabled), same conventions as
-    train_sac.py: encoder stays in eval() for BatchNorm safety even while
-    its weights train, trainability controlled via requires_grad, optional
-    l2sp aux loss, augmentation via cfg.embedding.augmentation.
+  - PVR encoder training, same conventions as train_sac.py (settings
+    validated by src/encoder_config.py): encoder.grads=policy lets the BC
+    loss backprop into the encoder, encoder.aux adds auxiliary losses
+    (src/losses.py). The encoder stays in eval() for BatchNorm safety even
+    while its weights train; trainability is controlled via requires_grad.
+  - Augmentation (configs/augmentation/*.yaml) on training batches only,
+    never on validation or evaluation. Every batch is re-encoded from
+    pixels, so it works whether or not the encoder trains.
   - model_dir: point embedding checkpoint lookup at a different filesystem
     location than the code (e.g. cluster scratch vs projappl).
 
@@ -19,8 +23,9 @@ Usage:
     python train_bc.py algo.batch_size=128                 # override any param
     python train_bc.py device=cpu                          # force CPU
     python train_bc.py dataset.max_episodes=10             # quick smoke test
-    python train_bc.py embedding=resnet18 finetune.enabled=true \
-        finetune.encoder_lr=1e-5 model_dir=/scratch/.../checkpoints
+    python train_bc.py embedding=resnet18 encoder.grads=policy \
+        encoder.lr=1e-5 model_dir=/scratch/.../checkpoints
+    python train_bc.py embedding=resnet18 augmentation=random_shift
 """
 
 import os
@@ -37,6 +42,8 @@ from torch.utils.data import DataLoader, random_split
 import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+from src.encoder_config import encoder_settings, warn_unused_encoder_overrides
+from src.losses import AuxBatch, build_aux_losses, total_aux_loss
 from src.models import ContinuousPolicyNet
 
 
@@ -67,7 +74,7 @@ def evaluate(policy, env_id: str, n_episodes: int, device,
 
             if embedding is not None:
                 with torch.no_grad():
-                    obs_t = embedding.encode(obs_t, augment=False)
+                    obs_t = embedding.encode(obs_t)
             with torch.no_grad():
                 action = policy(obs_t).squeeze(0).cpu().numpy()
             obs, reward, term, trunc, info = env.step(action)
@@ -103,6 +110,13 @@ def main(cfg: DictConfig) -> None:
 
     device = torch.device(cfg.device if torch.cuda.is_available() else 'cpu')
     print(f"\nDevice: {device}")
+
+    # ── Encoder / augmentation settings ───────────────────────────────────────
+    # Validated before the dataset or encoder is loaded (src/encoder_config.py).
+    enc = encoder_settings(cfg, valid_grads=('none', 'policy'))
+    warn_unused_encoder_overrides(enc)
+    encoder_trains = enc.trains
+    policy_grads = enc.grads == 'policy'
 
     # ── Weights & Biases ──────────────────────────────────────────────────────
     use_wandb = cfg.wandb.enabled
@@ -166,25 +180,25 @@ def main(cfg: DictConfig) -> None:
     print(f"  train: {n_train:,}  val: {n_val:,}")
 
     # ── Optional embedding ────────────────────────────────────────────────────
-    finetune = bool(cfg.finetune.enabled)
-    aux_name = str(cfg.finetune.aux_loss)
-    assert aux_name in ('none', 'l2sp'), aux_name
-
     embedding = None
+    aug_module = None
     obs_size = int(np.prod(dataset.obs_shape))
     emb_name = cfg.embedding.get('name', None)
     if emb_name is not None:
+        from src.augmentations import build_augmentation
         from src.embeddings import EmbeddingNet
-        from src.augmentations import make_augmentation
 
-        aug_name = cfg.embedding.get('augmentation', None)
-        aug_module = make_augmentation(aug_name) if aug_name is not None else None
+        aug_module = build_augmentation(cfg.augmentation)
+        if aug_module is not None:
+            aug_module = aug_module.to(device)
+            print(f"Augmentation: {enc.aug_name}  stage={enc.aug_stage}"
+                  f"  params={dict(cfg.augmentation.get('params') or {})}"
+                  "  (training batches only; validation/eval stay clean)")
 
         embedding = EmbeddingNet(
             emb_name,
-            train=finetune,
+            train=encoder_trains,
             disable_cuda=(str(device) == 'cpu'),
-            augmentation=aug_module,
             model_dir=cfg.model_dir,
         )
         # eval() ALWAYS, even while weights train: freeze BatchNorm running
@@ -192,20 +206,23 @@ def main(cfg: DictConfig) -> None:
         # controlled purely via requires_grad below, never via train()-mode.
         embedding.eval()
         for p in embedding.parameters():
-            p.requires_grad_(finetune)
+            p.requires_grad_(encoder_trains)
         obs_size = embedding.out_size
-        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={finetune})")
+        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={encoder_trains})")
 
-    enc_optimizer, theta0 = None, None
-    if finetune:
-        enc_optimizer = torch.optim.Adam(embedding.parameters(), lr=cfg.finetune.encoder_lr)
-        if aux_name != 'none':
-            theta0 = {n: p.detach().clone() for n, p in embedding.named_parameters()}
-
-    def aux_loss_fn():
-        if aux_name == 'l2sp':
-            return sum(((p - theta0[n]) ** 2).sum() for n, p in embedding.named_parameters())
-        raise ValueError(aux_name)
+    enc_optimizer, enc_params, aux_terms = None, [], []
+    if encoder_trains:
+        aux_terms = build_aux_losses(enc.aux_specs, embedding)
+        for t in aux_terms:
+            t.loss.to(device)
+        # Learnable heads owned by aux losses train alongside the encoder.
+        enc_params = list(embedding.parameters()) + [
+            p for t in aux_terms for p in t.loss.parameters()
+        ]
+        enc_optimizer = torch.optim.Adam(
+            enc_params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
+        )
+        print(f"Encoder trains: grads={enc.grads}  aux={enc.aux_names}  lr={cfg.encoder.lr}")
 
     # ── Policy ────────────────────────────────────────────────────────────────
     policy = ContinuousPolicyNet(
@@ -240,17 +257,21 @@ def main(cfg: DictConfig) -> None:
             obs_b = obs_b.to(device)
             act_b = act_b.to(device)
             if embedding is not None:
-                ctx = torch.enable_grad() if finetune else torch.no_grad()
+                # The BC loss reaches the encoder only with grads=policy; with
+                # aux-only training the policy sees detached features.
+                ctx = torch.enable_grad() if policy_grads else torch.no_grad()
                 with ctx:
-                    obs_b = embedding.encode(obs_b, augment=True)
+                    x = embedding.preprocess(obs_b)
+                    if aug_module is not None:
+                        x = aug_module(x)
+                    obs_b = embedding.encode_preprocessed(x)
             pred = policy(obs_b)
             loss = F.mse_loss(pred, act_b)
 
-            aux_value = None
-            if finetune and aux_name != 'none':
-                aux = cfg.finetune.aux_weight * aux_loss_fn()
-                loss = loss + aux
-                aux_value = aux.item()
+            aux_total, aux_values = None, {}
+            if aux_terms:
+                aux_total, aux_values = total_aux_loss(aux_terms, AuxBatch(encoder=embedding))
+                loss = loss + aux_total
 
             optimizer.zero_grad()
             if enc_optimizer is not None:
@@ -258,7 +279,7 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             if enc_optimizer is not None:
-                torch.nn.utils.clip_grad_norm_(embedding.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(enc_params, max_norm=cfg.encoder.grad_clip)
                 enc_optimizer.step()
             optimizer.step()
             train_loss += loss.item()
@@ -281,7 +302,7 @@ def main(cfg: DictConfig) -> None:
             for obs_b, act_b in val_loader:
                 obs_b, act_b = obs_b.to(device), act_b.to(device)
                 if embedding is not None:
-                    obs_b = embedding.encode(obs_b, augment=False)
+                    obs_b = embedding.encode(obs_b)
                 val_loss += F.mse_loss(policy(obs_b), act_b).item()
         val_loss /= len(val_loader)
 
@@ -294,8 +315,10 @@ def main(cfg: DictConfig) -> None:
         if use_wandb:
             log = {'train/loss': train_loss, 'val/loss': val_loss,
                    'train/lr': lr, 'epoch': epoch}
-            if aux_value is not None:
-                log['train/aux_loss'] = aux_value
+            if aux_total is not None:
+                log['train/aux_loss'] = aux_total.item()
+                for name, value in aux_values.items():
+                    log[f'train/aux/{name}'] = value
             wandb.log(log, step=epoch)
 
         if epoch % cfg.algo.eval_frequency == 0 or epoch == 1:

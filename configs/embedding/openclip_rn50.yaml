@@ -1,4 +1,3 @@
 name: openclip_rn50
 pretrained: true
 train: false
-augmentation: null

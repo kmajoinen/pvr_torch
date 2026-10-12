@@ -1,0 +1,12 @@
+# No augmentation. Every file in this group has the same three keys:
+#   name    registered augmentation (src/augmentations.py), or null
+#   stage   where it's applied:
+#             rl    the task loss (SAC actor/critic, BC policy loss) sees
+#                   augmented observations
+#             aux   only aux losses see them        (not implemented yet)
+#             both  task loss and aux losses        (not implemented yet)
+#   params  keyword arguments for the augmentation's constructor
+# Rollouts and evaluation always see clean observations.
+name: null
+stage: rl
+params: {}

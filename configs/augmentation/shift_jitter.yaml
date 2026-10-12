@@ -1,0 +1,9 @@
+# Example pipeline: transforms run in list order, each with its own params.
+name: pipeline
+stage: rl
+params:
+  transforms:
+    - name: random_shift
+      params: {pad_frac: 0.047619}
+    - name: color_jitter
+      params: {brightness: 0.4, contrast: 0.4, saturation: 0.2, hue: 0.1}

@@ -1,0 +1,10 @@
+# Per-sample colour jitter (kornia). Needs 3-channel input, so not usable
+# with frame-stacked inputs.
+name: color_jitter
+stage: rl
+params:
+  brightness: 0.4
+  contrast: 0.4
+  saturation: 0.2
+  hue: 0.1
+  p: 1.0

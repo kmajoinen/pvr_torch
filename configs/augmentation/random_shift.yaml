@@ -1,0 +1,7 @@
+# DrQ-v2 random shift (Yarats et al., 2021). Applied at the encoder's input
+# resolution, so the pad is a fraction of the image side: 4/84 reproduces
+# DrQ-v2's pad=4 at 84px. Set params.pad instead for a fixed pixel count.
+name: random_shift
+stage: rl
+params:
+  pad_frac: 0.047619   # 4/84

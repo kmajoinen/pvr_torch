@@ -1,4 +1,3 @@
 name: mae_base
 pretrained: true
 train: false
-augmentation: null

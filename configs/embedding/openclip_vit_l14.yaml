@@ -1,4 +1,3 @@
 name: openclip_vit_l14
 pretrained: true
 train: false
-augmentation: null

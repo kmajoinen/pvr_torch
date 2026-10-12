@@ -834,16 +834,17 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
 
 class EmbeddingNet(nn.Module):
     """
-    Input shape must be (N, H, W, 3), where N is the number of frames.
+    Input shape must be (N, C, H, W), where N is the number of frames.
     The class will then take care of transforming and normalizing frames.
     The output shape will be (N, O), where O is the embedding size.
 
-    Augmentation (optional nn.Module) is applied to float [0, 1] tensors
-    after spatial transforms (resize/crop/dtype conversion) but before
-    mean/std normalisation — only when the model is in training mode.
+    encode() = encode_preprocessed(preprocess(x)). The split exists so a
+    caller can augment in between: preprocess() returns float [0, 1] frames
+    at this encoder's input resolution (after resize/crop, before mean/std
+    normalisation), which is the space src/augmentations.py operates in.
     """
     def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
-                 disable_cuda=False, augmentation=None, model_dir=None):
+                 disable_cuda=False, model_dir=None):
         super(EmbeddingNet, self).__init__()
 
         self.embedding_name = embedding_name
@@ -872,8 +873,8 @@ class EmbeddingNet(nn.Module):
                 "likely corrupted or truncated -- delete it and let it re-download."
             )
 
-        # Split transforms so augmentation runs on [0,1] floats, before normalisation.
-        # All transform pipelines end with T.Normalize; split there.
+        # Split transforms at the final T.Normalize (if any), so preprocess()
+        # returns [0, 1] floats that callers can augment before normalisation.
         t_list = list(self.transforms.children())
         if isinstance(t_list[-1], T.Normalize):
             self._pre_aug = nn.Sequential(*t_list[:-1])
@@ -881,8 +882,6 @@ class EmbeddingNet(nn.Module):
         else:
             self._pre_aug = self.transforms
             self._normalize = nn.Identity()
-
-        self.augmentation = augmentation
 
         dummy_in = torch.zeros(1, in_channels, 64, 64)
         dummy_in = self.transforms(dummy_in)
@@ -900,7 +899,7 @@ class EmbeddingNet(nn.Module):
     def _forward(self, observation):
         return self._forward_fn(self.embedding, observation)
 
-    def encode(self, observation, augment: bool = False):
+    def encode(self, observation):
         """
         Same computation as forward(), but returns a (N, out_size)
         torch.Tensor on this module's device -- batch dimension always
@@ -910,21 +909,20 @@ class EmbeddingNet(nn.Module):
         tensor -- e.g. a trainable head sitting on top of this embedding
         inside another nn.Module's forward pass, like an SB3 features
         extractor).
-
-        augment: apply self.augmentation (if any) to this call only.
-        Explicit per-call, not gated on self.training -- callers that keep
-        the encoder permanently in eval() for BatchNorm-stats safety (see
-        train_sac.py) would otherwise never be able to trigger it, and
-        callers generally want augmentation on training-batch encodes only
-        (never on rollout-time action selection or eval()).
         """
-        # observation.shape -> (N, C, H, W)  [channels-first, as returned by gym_wrappers]
+        return self.encode_preprocessed(self.preprocess(observation))
+
+    def preprocess(self, observation):
+        """(N, C, H, W) frames [channels-first, as returned by gym_wrappers]
+        -> float (N, C, h, w) in [0, 1] at this encoder's input resolution:
+        resize/crop/dtype only, no mean/std normalisation."""
         observation = observation.to(device=self.device)
         if not observation.is_contiguous():
             observation = observation.contiguous()
-        observation = self._pre_aug(observation)          # resize, crop, → float [0, 1]
-        if augment and self.augmentation is not None:
-            observation = self.augmentation(observation)  # augment in [0, 1] space
+        return self._pre_aug(observation)
+
+    def encode_preprocessed(self, observation):
+        """preprocess() output, optionally augmented -> (N, out_size)."""
         observation = self._normalize(observation)        # mean/std normalisation
         observation = observation.reshape(-1, *self.in_shape)
 
