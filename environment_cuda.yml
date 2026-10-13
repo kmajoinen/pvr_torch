@@ -20,6 +20,7 @@ dependencies:
     - --extra-index-url https://download.pytorch.org/whl/cu124
     - torch==2.12.1+cu124
     - torchvision==0.27.1+cu124
+    - kornia==0.8.3                 # per-sample GPU augmentations (src/augmentations.py)
 
     # ── Environments ───────────────────────────────────────────────────────────
     - gymnasium==1.3.0

@@ -1,0 +1,18 @@
+# Any architecture this repo can build, with weights from your own file
+# (e.g. a pretraining run). `checkpoint` is required (??? = must be set):
+#   python train_sac.py embedding=custom_checkpoint embedding.name=my_run \
+#       embedding.arch=resnet18 embedding.checkpoint=/path/to/weights.pt
+# The file holds a state_dict for the model `arch` builds (see EmbeddingNet
+# in src/embeddings.py). A relative path is resolved against the launch
+# directory.
+name: custom            # label: run directories, wandb names
+arch: resnet18          # any embedding name with a random-init path
+checkpoint: ???
+pretrained: true
+train: false
+preprocess: null        # null = arch's built-in input pipeline; see
+                        # preprocess_transforms() in src/embeddings.py
+layer: null             # stop the backbone early (layer2, or a block count
+                        # for ViTs); see src/truncation.py
+head: null              # avgpool (default with layer) | cls | linear
+head_dim: null          # linear head width (default 1024)

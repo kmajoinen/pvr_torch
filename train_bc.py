@@ -36,13 +36,13 @@ import hydra
 import numpy as np
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, random_split
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from src.encoder_config import encoder_settings, warn_unused_encoder_overrides
+from src.encoder_config import embedding_kwargs, encoder_settings, warn_unused_encoder_overrides
 from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
 from src.models import ContinuousPolicyNet
 from src.views import CollapseMonitor, encode_views
@@ -116,6 +116,7 @@ def main(cfg: DictConfig) -> None:
     # Validated before the dataset or encoder is loaded (src/encoder_config.py).
     enc = encoder_settings(cfg, valid_grads=('none', 'policy'))
     warn_unused_encoder_overrides(enc)
+    emb_kwargs = embedding_kwargs(cfg)
     encoder_trains = enc.trains
     policy_grads = enc.grads == 'policy'
 
@@ -201,15 +202,23 @@ def main(cfg: DictConfig) -> None:
             train=encoder_trains,
             disable_cuda=(str(device) == 'cpu'),
             model_dir=cfg.model_dir,
+            input_size=int(dataset.obs_shape[-1]) if train_from_pixels else None,
+            **emb_kwargs,
         )
         # eval() ALWAYS, even while weights train: freeze BatchNorm running
         # stats -- same reasoning as train_sac.py. Trainability is
         # controlled purely via requires_grad below, never via train()-mode.
         embedding.eval()
-        for p in embedding.parameters():
-            p.requires_grad_(encoder_trains)
+        trainable = enc.trainable if encoder_trains else "none"
+        embedding.set_trainable(trainable)
         obs_size = embedding.out_size
-        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={encoder_trains})")
+        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={trainable})"
+              + "".join(f"  {k}={v}" for k, v in emb_kwargs.items()))
+        head_params = sum(p.numel() for p in embedding.head.parameters())
+        if head_params:
+            print(f"Encoder head: {head_params / 1e6:.1f}M parameters")
+        if use_wandb and embedding.build_warnings:
+            wandb.config.update({"encoder_build_warnings": embedding.build_warnings})
 
     enc_optimizer, enc_params, aux_terms = None, [], []
     if encoder_trains:
@@ -345,6 +354,17 @@ def main(cfg: DictConfig) -> None:
             best_val_loss = val_loss
             if cfg.save.enabled:
                 torch.save(policy.state_dict(), os.path.join(save_dir, 'best_policy.pt'))
+                if encoder_trains:
+                    # The policy is only usable with the encoder it was
+                    # trained on. Same format as train_sac.py's best_encoder.pt.
+                    torch.save(
+                        {
+                            'encoder': embedding.state_dict(),
+                            'embedding': OmegaConf.to_container(cfg.embedding, resolve=True),
+                            'input_size': embedding.input_size,
+                        },
+                        os.path.join(save_dir, 'best_encoder.pt'),
+                    )
 
         lr = scheduler.get_last_lr()[0]
         if use_wandb:
@@ -388,7 +408,8 @@ def main(cfg: DictConfig) -> None:
     if use_wandb:
         wandb.finish()
     print(f"\nBest val loss: {best_val_loss:.4f}")
-    print(f"Model saved to: {save_dir}/best_policy.pt")
+    print(f"Model saved to: {save_dir}/best_policy.pt"
+          + (f" (with its encoder, {save_dir}/best_encoder.pt)" if encoder_trains else ""))
 
 
 if __name__ == "__main__":

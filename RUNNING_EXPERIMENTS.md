@@ -92,7 +92,88 @@ mvp_vits_mae_hoi  mvp_vits_mae_in  mvp_vits_sup_in
 mvp_vitb_mae_egosoup  mvp_vitl256_mae_egosoup
 mae_base
 moco_aug
+dinov2_vits14  dinov2_vitb14  dinov2_vitl14  dinov2_vitg14
+custom_checkpoint
 ```
+
+DINOv2 loads through `torch.hub`, which downloads the code and weights on
+first use and caches them under `$TORCH_HOME` (default `~/.cache/torch`).
+On the cluster, set `TORCH_HOME` to scratch, and load each model once from a
+login node if compute nodes have no internet.
+
+### Your own weights and input preprocessing
+
+Three optional fields on any embedding config (see `EmbeddingNet` in
+`src/embeddings.py`):
+
+- **`checkpoint`** — load weights from a file into the architecture named by
+  **`arch`** (default: the embedding name): an encoder saved by this repo
+  (`best_encoder.pt`, or `final_checkpoint.pt`, whose `encoder` entry is
+  used), including a trained head, or a bare backbone state_dict (a
+  pretraining run, or a stock torchvision one). Keys must match exactly; a
+  partial or wrong-architecture file is an error, not a warning. Supported
+  for `random`, `resnet18/34/50`, `dinov2_*` and `openclip_*`; the other
+  encoders always load their own default weights first, so they're rejected
+  at startup. Relative paths resolve against the directory
+  you launch from. `embedding=custom_checkpoint` is a ready-made template
+  that requires `checkpoint`:
+  ```bash
+  python train_sac.py embedding=custom_checkpoint embedding.name=my_run \
+      embedding.arch=resnet18 embedding.checkpoint=/path/to/weights.pt
+  ```
+- **`preprocess`** — replace the encoder's built-in input pipeline:
+  `resize` (shorter side; null = keep), `crop` (center, square; null = none),
+  `interpolation` (bilinear | bicubic | nearest), `mean`/`std` (null = no
+  normalisation). E.g. PIE-G's native-resolution input, `x/255 - 0.5`:
+  ```bash
+  python train_sac.py embedding=resnet18 env.image_size=84 \
+      '+embedding.preprocess={resize:null,crop:null,mean:[0.5,0.5,0.5],std:[1.0,1.0,1.0]}'
+  ```
+  The `+` is needed because most embedding configs don't list `preprocess`
+  (`custom_checkpoint` does). Without a resize, the encoder sees frames at
+  `env.image_size`, which the scripts pass to the encoder automatically.
+
+### Intermediate layers (truncation) and output heads
+
+Two more optional embedding fields (see `src/truncation.py`):
+
+- **`layer`** — stop the backbone early; later layers never run. `layer1`..
+  `layer4` for ResNets (torchvision, MoCo, R3M/VIP, CLIP/OpenCLIP/LIV RN50,
+  RL3D), a block count for ViTs (`6` = output of the first 6 blocks: MAE,
+  MVP, VC-1, CLIP ViT, DINOv2), or an exact module path. Outputs are raw (no
+  final norm layer).
+- **`head`** — turn that output into a vector: `avgpool` (default with
+  `layer`; spatial mean, or mean over patch tokens), `cls` (ViT CLS token),
+  `flatten` (the whole map, no parameters; the RL heads' first layers do the
+  projecting), or `linear` (PIE-G's encoder projection: flatten → trainable
+  Linear(`head_dim`, default 1024) → LayerNorm). A `linear` head needs the
+  encoder to train; with `encoder.trainable=head` it trains on a frozen
+  backbone. PIE-G's actor and critic additionally have their own
+  Linear-LayerNorm-Tanh trunks, which this SAC's networks don't.
+- **Size check**: `flatten` and `linear` scale with the map. ResNet18 layer2
+  is 128×11×11 ≈ 15.5k values at 84px but ≈ 100k at 224px, which makes a
+  `linear` head ~16M vs ~100M parameters (printed at startup). When a frozen
+  encoder's features would take more memory than the frames themselves,
+  `buffer_obs=auto` stores pixels instead and says so.
+
+```bash
+# Frozen ResNet18 layer2, average-pooled (fast path, no trainable parts)
+python train_sac.py embedding=resnet18 +embedding.layer=layer2
+
+# DINOv2 ViT-S after 6 blocks, CLS token
+python train_sac.py embedding=dinov2_vits14 +embedding.layer=6 +embedding.head=cls
+
+# PIE-G-style: layer2 at native 84px, trainable linear head on a frozen backbone
+python train_sac.py embedding=resnet18 env.image_size=84 \
+    '+embedding.preprocess={resize:null,crop:null,mean:[0.5,0.5,0.5],std:[1.0,1.0,1.0]}' \
+    +embedding.layer=layer2 +embedding.head=linear \
+    encoder.grads=critic encoder.trainable=head encoder.lr=1e-4 augmentation=random_shift
+```
+
+`encoder.lr` (default `1e-5`) also sets the head's learning rate; PIE-G
+trains its head at the actor/critic rate. PVR's compressed intermediate
+layers remain available as their own encoder names (`resnet50_l3`,
+`resnet50_l4`, `moco_*_l3`, ...).
 
 `src/embeddings.py::_get_embedding()` supports quite a few more names than
 have a dedicated yaml file (e.g. `resnet50_l3`, `resnet50_l4`,
@@ -183,9 +264,12 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   `policy` lets the BC loss backprop into the encoder.
 - **`encoder.aux`** — a list of auxiliary losses from `src/losses.py`, each
   `{name, weight, ...params}`:
-  - `l2sp` anchors weights to their pretrained values (`||θ - θ₀||²`). With
-    `grads: none` it's pure regularized adaptation with zero RL gradient
-    into the encoder.
+  - `l2sp` anchors the backbone to its pretrained values (`||θ - θ₀||²`).
+    It's a regulariser, not a training signal: its gradient is zero at the
+    pretrained weights, so it needs another loss to move the encoder. With
+    `grads: none` that has to be an aux loss that reads observations (e.g.
+    `aug_consistency`); `l2sp` alone is rejected at startup, since the run
+    would equal a frozen one.
   - `aug_consistency` (`target: clean | augmented`, default `clean`) is the
     MSE between the embeddings of the clean and augmented views; the
     `target` branch is detached. Needs an augmentation with `stage: aux` or
@@ -261,8 +345,6 @@ python train_sac.py -m augmentation=none,random_shift embedding=r3m_resnet50,vc1
 # Slow-frozen control (protocol-compatible with the fast path)
 python train_sac.py buffer_obs=pixels env.image_size=112
 
-# Aux-only adaptation, zero RL gradient into the encoder
-python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' env.image_size=112
 
 # Augmentation only through a consistency loss: actor/critic see clean
 # observations, the encoder learns invariance (anchored by l2sp)

@@ -63,7 +63,9 @@ buffer stores follows from these (buffer_obs=auto):
       Independently of routing, auxiliary losses can train the encoder
       (encoder.aux): 'l2sp' anchors weights to their pretrained values
       (||theta - theta_0||^2, Xuhong et al. 2018) -- adapt while penalizing
-      drift. aux with grads=none = adaptation without RL gradients at all.
+      drift. aux with grads=none = adaptation without RL gradients at all,
+      which needs an aux loss that reads observations (e.g. aug_consistency):
+      l2sp alone has zero gradient at the pretrained weights and is rejected.
 
 Design notes:
   - Actor and critics each apply their own LayerNorm to input features --
@@ -90,11 +92,9 @@ Usage:
     python train_sac.py encoder.grads=critic env.image_size=112 embedding=resnet18
     python train_sac.py augmentation=random_shift env.image_size=112   # frozen + DrQ shift
     python train_sac.py buffer_obs=pixels env.image_size=112           # slow-frozen control
-    python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' \
-        env.image_size=112                                      # aux-only adaptation
     python train_sac.py augmentation=random_shift augmentation.stage=aux \
         'encoder.aux=[{name:aug_consistency,weight:0.1},{name:l2sp,weight:1.0}]' \
-        env.image_size=112                                      # consistency-only augmentation
+        env.image_size=112                                      # aux-only adaptation
     python train_sac.py env=pendulum embedding=none      # state-based sanity check
 """
 
@@ -116,6 +116,7 @@ import gymnasium as gym
 from omegaconf import DictConfig, OmegaConf
 
 from src.encoder_config import (
+    embedding_kwargs,
     encoder_settings,
     resolve_buffer_obs,
     warn_unused_encoder_overrides,
@@ -156,6 +157,7 @@ def main(cfg: DictConfig) -> None:
     enc = encoder_settings(cfg, valid_grads=("none", "critic", "actor", "both"))
     pixels_in_buffer, buffer_reason = resolve_buffer_obs(cfg, enc)
     warn_unused_encoder_overrides(enc)
+    emb_kwargs = embedding_kwargs(cfg)
     routing = enc.grads
     encoder_trains = enc.trains
     if encoder_trains:
@@ -163,36 +165,6 @@ def main(cfg: DictConfig) -> None:
             f"Encoder trains: grads={routing}  aux={enc.aux_names}"
             f"  lr={cfg.encoder.lr}"
         )
-
-    # ── Weights & Biases ──────────────────────────────────────────────────────
-    use_wandb = cfg.wandb.enabled
-    if use_wandb:
-        import wandb
-
-        emb_tag = cfg.embedding.get("name") or "state"
-        # Run names are labels only; charts are keyed by the logged metric
-        # names, which stay fixed for continuity.
-        tags = ""
-        if encoder_trains:
-            tags += "_ft-" + "-".join([routing] + enc.aux_names)
-        if enc.aug_name is not None:
-            tags += f"_aug-{enc.aug_name}" + (
-                f"-{enc.aug_stage}" if enc.aug_stage != "rl" else ""
-            )
-        if pixels_in_buffer and not encoder_trains and enc.aug_name is None:
-            tags += "_slowfrozen"
-        run_name = (
-            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{tags}_s{cfg.seed}"
-        )
-        wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            name=run_name,
-            mode=cfg.wandb.get("mode", "online"),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            save_code=True,
-        )
-        print(f"wandb run: {wandb.run.url}")
 
     # ── Encoder ───────────────────────────────────────────────────────────────
     emb_name = cfg.embedding.get("name", None)
@@ -221,17 +193,84 @@ def main(cfg: DictConfig) -> None:
             train=encoder_trains,
             disable_cuda=(str(device) == "cpu"),
             model_dir=cfg.model_dir,
+            input_size=cfg.env.get("image_size"),
+            **emb_kwargs,
         )
         # eval() ALWAYS, even while weights train: freeze BatchNorm running
         # stats (see module docstring). Trainability is controlled purely via
         # requires_grad below, never via train()-mode.
         embedding_net.eval()
-        for p in embedding_net.parameters():
-            p.requires_grad_(encoder_trains)
+        trainable = enc.trainable if encoder_trains else "none"
+        embedding_net.set_trainable(trainable)
         print(
             f"\nEmbedding: {emb_name}  →  obs_size: {embedding_net.out_size}"
-            f"  (trainable={encoder_trains})"
+            f"  (trainable={trainable})"
+            + "".join(f"  {k}={v}" for k, v in emb_kwargs.items())
         )
+        head_params = sum(p.numel() for p in embedding_net.head.parameters())
+        if head_params:
+            print(f"Encoder head: {head_params / 1e6:.1f}M parameters")
+
+        # The fast path stores features; when a wide output (e.g. head=flatten
+        # on an early layer) makes each feature vector bigger than the frame
+        # it came from, pixels are the cheaper thing to store.
+        frame_side = cfg.env.get("image_size")
+        if (not pixels_in_buffer and str(cfg.get("buffer_obs", "auto")) == "auto"
+                and frame_side):
+            frame_bytes = 3 * frame_stack * frame_side ** 2
+            feat_bytes = 4 * embedding_net.out_size
+            if feat_bytes > frame_bytes:
+                pixels_in_buffer = True
+                buffer_reason = (
+                    f"pixels (auto: a {embedding_net.out_size}-dim float32 feature "
+                    f"takes {feat_bytes / frame_bytes:.1f}x the memory of a "
+                    f"{frame_side}px frame; every update re-encodes the batch)"
+                )
+
+    # ── Weights & Biases ──────────────────────────────────────────────────────
+    # After the encoder: the buffer decision can still change there (the
+    # memory guard above), and the run name and logged config should
+    # describe the run that actually happens.
+    use_wandb = cfg.wandb.enabled
+    if use_wandb:
+        import wandb
+
+        emb_tag = cfg.embedding.get("name") or "state"
+        layer = cfg.embedding.get("layer")
+        if layer is not None:
+            emb_tag += f"-L{layer}" if isinstance(layer, int) else f"-{layer}"
+        if cfg.embedding.get("head") is not None:
+            emb_tag += f"-{cfg.embedding.head}"
+        # Run names are labels only; charts are keyed by the logged metric
+        # names, which stay fixed for continuity.
+        tags = ""
+        if encoder_trains:
+            tags += "_ft-" + "-".join([routing] + enc.aux_names)
+        if enc.aug_name is not None:
+            tags += f"_aug-{enc.aug_name}" + (
+                f"-{enc.aug_stage}" if enc.aug_stage != "rl" else ""
+            )
+        if pixels_in_buffer and not encoder_trains and enc.aug_name is None:
+            tags += "_slowfrozen"
+        run_name = (
+            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{tags}_s{cfg.seed}"
+        )
+        wandb_config = OmegaConf.to_container(cfg, resolve=True)
+        wandb_config["buffer_obs_resolved"] = "pixels" if pixels_in_buffer else "features"
+        wandb_config["buffer_obs_reason"] = buffer_reason
+        if embedding_net is not None and embedding_net.build_warnings:
+            # Printed during construction, before wandb started; log them so
+            # a reloaded encoder built differently is visible in the run too.
+            wandb_config["encoder_build_warnings"] = embedding_net.build_warnings
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.entity,
+            name=run_name,
+            mode=cfg.wandb.get("mode", "online"),
+            config=wandb_config,
+            save_code=True,
+        )
+        print(f"wandb run: {wandb.run.url}")
 
     # ── Envs ──────────────────────────────────────────────────────────────────
     # Features path: env wrapper encodes, buffer stores features.
@@ -348,8 +387,11 @@ def main(cfg: DictConfig) -> None:
         )
         # Kept on CPU: only read for the drift metric at log time, and a GPU
         # copy would double the encoder's memory (l2sp keeps its own anchor).
+        # Backbone only: a trainable head's drift from its random init would
+        # dominate the metric and make it incomparable across routings.
         theta0 = {
-            n: p.detach().cpu().clone() for n, p in embedding_net.named_parameters()
+            n: p.detach().cpu().clone()
+            for n, p in embedding_net.embedding.named_parameters()
         }
     aux_grad_clean, aux_grad_aug = aux_grad_views(aux_terms)
 
@@ -358,7 +400,7 @@ def main(cfg: DictConfig) -> None:
             return float(
                 sum(
                     ((p.detach().cpu() - theta0[n]) ** 2).sum()
-                    for n, p in embedding_net.named_parameters()
+                    for n, p in embedding_net.embedding.named_parameters()
                 ).sqrt()
             )
 
@@ -688,8 +730,15 @@ def main(cfg: DictConfig) -> None:
                         actor.state_dict(), os.path.join(save_dir, "best_actor.pt")
                     )
                     if encoder_trains:
+                        # With the embedding config, so a reload with a
+                        # different layer/head/preprocess is flagged
+                        # (EmbeddingNet._load_checkpoint).
                         torch.save(
-                            embedding_net.state_dict(),
+                            {
+                                "encoder": embedding_net.state_dict(),
+                                "embedding": OmegaConf.to_container(cfg.embedding, resolve=True),
+                                "input_size": embedding_net.input_size,
+                            },
                             os.path.join(save_dir, "best_encoder.pt"),
                         )
 
@@ -703,6 +752,7 @@ def main(cfg: DictConfig) -> None:
         }
         if encoder_trains:
             ckpt["encoder"] = embedding_net.state_dict()
+            ckpt["input_size"] = embedding_net.input_size
         torch.save(ckpt, os.path.join(save_dir, "final_checkpoint.pt"))
         print(f"\nSaved to: {save_dir}")
     print(f"Best eval return: {best_eval_return:.1f}")

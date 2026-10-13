@@ -45,35 +45,87 @@ def _resolve_model_dir_override(embedding_name, model_dir):
     return matches[0]
 
 
-def _load_custom_state_dict(model, path, embedding_name):
-    """
-    Loads a model_dir-provided checkpoint into an architecture built with
-    weights=None (torchvision resnets, which otherwise have no local-file
-    loading path at all -- they only ever auto-download). Unwraps the
-    common 'state_dict'/'model' wrapper-dict conventions used elsewhere in
-    this file (see the MAE branches below), then loads with strict=False
-    since a custom checkpoint's exact key names aren't guaranteed to match
-    torchvision's. Warns on partial mismatches; crashes if literally
-    nothing matched, since that means the file is very likely the wrong
-    architecture or format for embedding_name, not just a minor difference.
-    """
+def _read_state_dict(path):
+    return _read_checkpoint(path)[0]
+
+
+def _read_checkpoint(path):
+    """torch.load a checkpoint and unwrap the usual wrapper dicts: 'encoder'
+    (this repo's saved encoders), 'state_dict', 'model'. Returns
+    (state_dict, build record): the record holds the embedding config the
+    encoder was built with ('embedding' entry, or 'config'.embedding in a
+    final_checkpoint.pt) and the frame size it encoded ('input_size'); both
+    None for files that don't record them."""
     # weights_only=False: PyTorch 2.6+ defaults torch.load to a restricted
     # unpickler that rejects anything beyond plain tensors -- research
     # checkpoints routinely bundle non-tensor metadata (training args,
     # optimizer state) and fail to load at all otherwise. Fine here: paths
-    # are either this repo's own MODELS_DIR or a user-provided model_dir,
-    # not arbitrary untrusted input.
-    state_dict = torch.load(path, map_location='cpu', weights_only=False)
-    if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-        state_dict = state_dict['state_dict']
-    elif isinstance(state_dict, dict) and 'model' in state_dict:
-        state_dict = state_dict['model']
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if len(missing) == len(list(model.state_dict())):
+    # are either this repo's own MODELS_DIR or a user-provided file, not
+    # arbitrary untrusted input.
+    raw = torch.load(path, map_location='cpu', weights_only=False)
+    record = {'embedding': None, 'input_size': None}
+    if isinstance(raw, dict):
+        # 'actor' marks train_sac.py's final_checkpoint.pt. A bare 'config'
+        # entry doesn't: {"model": weights, "config": ...} is a common layout
+        # for other checkpoints too, whose config isn't this repo's.
+        is_sac_run = 'actor' in raw
+        if is_sac_run and 'encoder' not in raw:
+            raise ValueError(
+                f"{path!r} is a training run's checkpoint without encoder weights: "
+                "that run's encoder was frozen, so there was nothing to save. Use "
+                "the encoder that run was configured with instead."
+            )
+        if isinstance(raw.get('embedding'), dict):
+            record['embedding'] = raw['embedding']
+        elif is_sac_run and isinstance(raw.get('config'), dict) \
+                and isinstance(raw['config'].get('embedding'), dict):
+            record['embedding'] = raw['config']['embedding']
+        if isinstance(raw.get('input_size'), int):
+            record['input_size'] = raw['input_size']
+    state_dict = raw
+    for key in ('encoder', 'state_dict', 'model'):
+        if isinstance(state_dict, dict) and isinstance(state_dict.get(key), dict):
+            state_dict = state_dict[key]
+            break
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"{path!r} doesn't contain a state_dict (got {type(state_dict).__name__})")
+    return state_dict, record
+
+
+def _load_custom_state_dict(model, source, embedding_name, strict=False):
+    """
+    Loads a model_dir-provided checkpoint into an architecture built with
+    weights=None (torchvision resnets, which otherwise have no local-file
+    loading path at all -- they only ever auto-download). `source` is a
+    path (unwrapped by _read_state_dict) or an already-loaded state_dict.
+    Loads with strict=False since a custom checkpoint's exact key names
+    aren't guaranteed to match torchvision's. Warns on partial mismatches;
+    crashes if literally nothing matched, since that means the file is very
+    likely the wrong architecture or format for embedding_name, not just a
+    minor difference.
+
+    strict=True (an explicit cfg.embedding.checkpoint) crashes on any
+    missing or unexpected key instead of warning: that file is meant to be
+    exactly the model being built, so a partial load is an error.
+    """
+    path = source if isinstance(source, str) else 'checkpoint'
+    state_dict = _read_state_dict(source) if isinstance(source, str) else source
+    # Compared before loading: BatchNorm fills in a missing
+    # num_batches_tracked buffer by itself, so "every key missing" never
+    # shows up in load_state_dict's report for a model with BatchNorm.
+    if not set(state_dict) & set(model.state_dict()):
         raise RuntimeError(
             f"Loaded {path!r} for {embedding_name!r} but zero parameters matched "
             f"the expected architecture -- this checkpoint is very likely the "
             f"wrong architecture or format for {embedding_name!r}."
+        )
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing = [k for k in missing if not k.endswith('num_batches_tracked')]
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"{path!r} doesn't match the {embedding_name!r} model exactly -- "
+            f"missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}, "
+            f"unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}"
         )
     if missing or unexpected:
         print(f"[embeddings] Warning: loading {path!r} for {embedding_name!r} -- "
@@ -162,8 +214,18 @@ def _forward_clip(model, x):
 
 
 def _forward_mae(model, x):
-    out, *_ = model.forward_encoder(x, mask_ratio=0.0)
-    return out[:, 0, :]
+    # MAE's own forward_encoder(x, mask_ratio=0.0) still runs random_masking,
+    # which keeps every patch but shuffles them with fresh noise on each call.
+    # The CLS output doesn't care (attention is order-invariant), but a
+    # truncated layer's tokens would arrive in a new random order every pass
+    # (breaking a flatten/linear head) and every encode would consume RNG.
+    # Same computation, patches kept in order:
+    x = model.patch_embed(x) + model.pos_embed[:, 1:, :]
+    cls = (model.cls_token + model.pos_embed[:, :1, :]).expand(x.shape[0], -1, -1)
+    x = torch.cat((cls, x), dim=1)
+    for blk in model.blocks:
+        x = blk(x)
+    return model.norm(x)[:, 0]
 
 
 def _forward_maskrcnn(model, x):
@@ -198,6 +260,20 @@ R3M_ARCHS = {
     'r3m_resnet34': 'resnet34',
     'r3m_resnet50': 'resnet50',
 }
+
+# torch.hub entrypoints of facebookresearch/dinov2 (ViT-S/B/L/g, 14px
+# patches). forward() returns the final-layer CLS token: 384 / 768 / 1024 /
+# 1536 dims.
+DINOV2_ARCHS = ('dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14')
+
+# Architectures cfg.embedding.checkpoint can load into: their branches build
+# the model without touching any default weights when pretrained=False. The
+# others (R3M, VIP, LIV, MVP, MAE, VC-1, MoCo, places, RL3D, demy, OpenAI
+# CLIP) always load or download their own weights first.
+CHECKPOINT_ARCHS = frozenset(
+    ('random', 'resnet18', 'resnet34', 'resnet50')
+    + DINOV2_ARCHS + tuple(OPENCLIP_CONFIGS)
+)
 
 # embedding_name -> (this file's matching MAE-architecture builder, VC-1's
 # own checkpoint filename). Same encoder classes as the mae_* branches --
@@ -806,6 +882,30 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         )
         forward_fn = _forward_clip
 
+    # DINOv2 (Oquab et al., 2023) via torch.hub, which fetches the repo code
+    # and weights on first use and caches both under $TORCH_HOME (default
+    # ~/.cache/torch). On a cluster, point TORCH_HOME at scratch, and load
+    # once from a login node if compute nodes have no internet. The repo is
+    # pinned to ':main': without a branch, torch.hub asks GitHub for the
+    # default branch on every load, with no timeout -- on a compute node
+    # that silently drops outbound traffic, each build would hang.
+    # Transforms follow DINOv2's own evaluation preprocessing (bicubic
+    # resize to 256, center crop 224, ImageNet mean/std); input sizes must be
+    # a multiple of the 14px patch, so a `preprocess` override has to keep that.
+    elif embedding_name in DINOV2_ARCHS:
+        override = _resolve_model_dir_override(embedding_name, model_dir)
+        model = torch.hub.load('facebookresearch/dinov2:main', embedding_name,
+                               pretrained=pretrained and override is None,
+                               trust_repo=True)
+        if override is not None:
+            _load_custom_state_dict(model, override, embedding_name)
+        transforms = nn.Sequential(
+            T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        )
+
     # TRUE STATE (BASELINE)
     # Unreachable via EmbeddingNet (it short-circuits before calling
     # _get_embedding for 'true_state') -- kept 3-tuple for consistency in
@@ -872,6 +972,72 @@ def _split_transforms(transforms: nn.Sequential):
     return nn.Sequential(*steps[:cut]), (nn.Sequential(*post) if post else nn.Identity())
 
 
+PREPROCESS_KEYS = ("resize", "crop", "interpolation", "mean", "std")
+
+
+def _canonical_preprocess(spec):
+    """A preprocess spec in one canonical form, so equivalent pipelines
+    compare equal however they were written (missing vs null keys, ints vs
+    floats, the default interpolation spelled out or not)."""
+    if spec is None:
+        return None
+    spec = dict(spec)
+    out = {k: spec.get(k) for k in PREPROCESS_KEYS}
+    if out["resize"] is not None:
+        out["resize"] = int(out["resize"])
+        out["interpolation"] = str(out["interpolation"] or "bilinear").lower()
+    if out["crop"] is not None:
+        out["crop"] = int(out["crop"])
+    for k in ("mean", "std"):
+        if out[k] is not None:
+            out[k] = [float(v) for v in out[k]]
+    return out
+
+
+def preprocess_transforms(spec) -> nn.Sequential:
+    """Build an encoder input pipeline from a config spec, replacing the
+    encoder's built-in one (cfg.embedding.preprocess):
+
+        resize         resize the shorter side to this size (null: keep the
+                       input size)
+        crop           center crop to this square size (null: no crop)
+        interpolation  for resize: bilinear (default) | bicubic | nearest
+        mean, std      per-channel normalisation after scaling to [0, 1]
+                       (both null: none)
+
+    e.g. PIE-G feeds 84px frames as x/255 - 0.5:
+        {resize: null, crop: null, mean: [0.5, 0.5, 0.5], std: [1, 1, 1]}
+
+    Resizing happens on the uint8 frame, before conversion to float, like
+    every built-in pipeline here. The result splits cleanly for augmentation
+    (_split_transforms).
+    """
+    spec = dict(spec)
+    unknown = sorted(set(spec) - set(PREPROCESS_KEYS))
+    if unknown:
+        raise ValueError(f"unknown preprocess keys {unknown}; expected a subset of {list(PREPROCESS_KEYS)}")
+    steps = []
+    if spec.get("resize") is not None:
+        mode = str(spec.get("interpolation") or "bilinear").upper()
+        if mode not in T.InterpolationMode.__members__:
+            raise ValueError(f"preprocess.interpolation={spec['interpolation']!r}; "
+                             "expected bilinear, bicubic or nearest")
+        steps.append(T.Resize(int(spec["resize"]), interpolation=T.InterpolationMode[mode]))
+    elif spec.get("interpolation") is not None:
+        raise ValueError("preprocess.interpolation has no effect without preprocess.resize")
+    if spec.get("crop") is not None:
+        steps.append(T.CenterCrop(int(spec["crop"])))
+    steps.append(T.ConvertImageDtype(torch.float))
+    mean, std = spec.get("mean"), spec.get("std")
+    if (mean is None) != (std is None):
+        raise ValueError("preprocess needs both mean and std, or neither")
+    if mean is not None:
+        if len(mean) != len(std):
+            raise ValueError(f"preprocess mean and std lengths differ: {list(mean)} vs {list(std)}")
+        steps.append(T.Normalize([float(m) for m in mean], [float(s) for s in std]))
+    return nn.Sequential(*steps)
+
+
 class EmbeddingNet(nn.Module):
     """
     Input shape must be (N, C, H, W), where N is the number of frames.
@@ -882,9 +1048,32 @@ class EmbeddingNet(nn.Module):
     caller can augment in between: preprocess() returns float [0, 1] frames
     at this encoder's input resolution (after resize/crop, before mean/std
     normalisation), which is the space src/augmentations.py operates in.
+
+    Optional fields (cfg.embedding.arch / checkpoint / preprocess):
+      arch        which architecture to build; defaults to embedding_name,
+                  which then only labels the run (e.g. name: my_run,
+                  arch: resnet18).
+      checkpoint  load these weights instead of arch's default ones: an
+                  encoder saved by this repo (best_encoder.pt, or
+                  final_checkpoint.pt's 'encoder'; backbone + head), or a
+                  bare backbone state_dict (e.g. a pretraining run). Only
+                  for archs in CHECKPOINT_ARCHS. model_dir doesn't apply.
+      preprocess  replace arch's built-in input pipeline; see
+                  preprocess_transforms().
+
+      layer       stop the backbone at this module; see src/truncation.py.
+      head        turn its output into a vector: avgpool (default with
+                  `layer`), cls, flatten, or linear (trainable); head_dim
+                  sizes a linear head.
+
+    input_size: side length of the frames that will be encoded. Only matters
+    when the pipeline doesn't resize (a `preprocess` without resize/crop),
+    where the output size can depend on the input size; it's measured once
+    here with a dummy frame of this size (default 64).
     """
     def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
-                 disable_cuda=False, model_dir=None):
+                 disable_cuda=False, model_dir=None, arch=None, checkpoint=None,
+                 preprocess=None, input_size=None, layer=None, head=None, head_dim=None):
         super(EmbeddingNet, self).__init__()
 
         self.embedding_name = embedding_name
@@ -893,12 +1082,59 @@ class EmbeddingNet(nn.Module):
             return
 
         self.in_channels = in_channels
-        self.embedding, self.transforms, self._forward_fn = \
-            _get_embedding(embedding_name, in_channels, pretrained, train, model_dir=model_dir)
+        self.arch = arch or embedding_name
+        self.checkpoint = checkpoint
+        if checkpoint is not None and self.arch not in CHECKPOINT_ARCHS:
+            raise ValueError(
+                f"embedding.checkpoint can't be loaded into arch={self.arch!r}: its "
+                "builder always loads or downloads its own default weights first. "
+                f"Supported: {sorted(CHECKPOINT_ARCHS)}"
+            )
+        # With a checkpoint: build without default weights (no download); the
+        # file is loaded below, once the head exists.
+        self.embedding, self.transforms, self._forward_fn = _get_embedding(
+            self.arch, in_channels, pretrained and checkpoint is None, train,
+            model_dir=None if checkpoint is not None else model_dir,
+        )
+        if preprocess is not None:
+            self.transforms = preprocess_transforms(preprocess)
+        self.layer = None
+        if layer is not None:
+            from src.truncation import truncate
+            self._forward_fn, self.layer = truncate(self.embedding, self._forward_fn, layer)
+            head = head or "avgpool"
+        # How this encoder was built, beyond its weights; compared against a
+        # loaded checkpoint's record of the same (_load_checkpoint).
+        from src.truncation import DEFAULT_HEAD_DIM
+        self.build_spec = {
+            "arch": self.arch, "layer": layer, "head": head,
+            "head_dim": (head_dim or DEFAULT_HEAD_DIM) if head == "linear" else None,
+            "preprocess": _canonical_preprocess(preprocess),
+        }
+        # Differences from a loaded checkpoint's build record; empty if none.
+        # Kept so the training scripts can log them, not just print them.
+        self.build_warnings = []
+
+        self._pre_aug, self._normalize = _split_transforms(self.transforms)
+
+        from src.truncation import make_head
+        self.input_size = input_size or 64
+        # A batch of 2, so make_head can tell a (T, N, D) token layout apart
+        # from (N, T, D).
+        dummy_in = torch.zeros(2, in_channels, self.input_size, self.input_size)
+        dummy_in = self.transforms(dummy_in)
+        self.in_shape = dummy_in.shape[1:]
+        with torch.no_grad():
+            dummy_raw = self._forward(dummy_in)
+            self.head = make_head(head, dummy_raw, batch=2, head_dim=head_dim)
+            self.out_size = int(np.prod(self.head(dummy_raw).shape[1:]))
+
+        if checkpoint is not None:
+            self._load_checkpoint(checkpoint)
 
         bad = [
             name for name, tensor in
-            list(self.embedding.named_parameters()) + list(self.embedding.named_buffers())
+            list(self.named_parameters()) + list(self.named_buffers())
             # OpenCLIP's text-tower causal attn_mask is a non-persistent,
             # runtime-constructed buffer deliberately filled with -inf
             # (never loaded from a checkpoint, and unused here since we
@@ -913,19 +1149,12 @@ class EmbeddingNet(nn.Module):
                 "likely corrupted or truncated -- delete it and let it re-download."
             )
 
-        self._pre_aug, self._normalize = _split_transforms(self.transforms)
-
-        dummy_in = torch.zeros(1, in_channels, 64, 64)
-        dummy_in = self.transforms(dummy_in)
-        self.in_shape = dummy_in.shape[1:]
-        dummy_out = self._forward(dummy_in)
-        self.out_size = np.prod(dummy_out.shape)
-
         if torch.cuda.is_available() and not disable_cuda:
             self.device = torch.device('cuda')
         else:
             self.device = torch.device('cpu')
         self.embedding = self.embedding.to(device=self.device)
+        self.head = self.head.to(device=self.device)
         self.training = self.embedding.training
 
     def _forward(self, observation):
@@ -956,7 +1185,10 @@ class EmbeddingNet(nn.Module):
     def encode_preprocessed(self, observation):
         """preprocess() output, optionally augmented -> (N, out_size)."""
         observation = self._normalize(observation)        # mean/std normalisation or [0, 255] rescale
-        observation = observation.reshape(-1, *self.in_shape)
+        # Fold any extra leading dims into the batch. Taken from the input,
+        # not in_shape, so frames at a size other than the one measured in
+        # __init__ still pass when the pipeline doesn't resize.
+        observation = observation.reshape(-1, *observation.shape[-3:])
 
         # Gradient tracking is entirely the caller's responsibility (ambient
         # torch.no_grad()/enable_grad() context + requires_grad on this
@@ -968,8 +1200,96 @@ class EmbeddingNet(nn.Module):
         # is frozen (requires_grad=False on every param, non-grad-requiring
         # input), autograd already builds no backward graph on its own --
         # forcing no_grad() explicitly was redundant for that case anyway.
-        out = self._forward(observation)
-        return out.reshape(-1, self.out_size)
+        out = self.head(self._forward(observation))
+        if out.shape[1] != self.out_size:
+            # A plain reshape(-1, out_size) could silently fold features into
+            # the batch dimension here instead of failing.
+            raise RuntimeError(
+                f"{self.embedding_name!r} produced {out.shape[1]} features per frame for "
+                f"{tuple(observation.shape[-2:])} input, but {self.out_size} were measured "
+                f"at input_size={self.input_size}. Without a resize in the pipeline the "
+                "output size depends on the frame size: pass input_size=<frame side>."
+            )
+        return out
+
+    def _load_checkpoint(self, path):
+        """Two formats:
+          - saved by this repo (EmbeddingNet.state_dict(), e.g. best_encoder.pt,
+            or final_checkpoint.pt's 'encoder'): keys embedding.* and head.*.
+            Loaded whole, so a trained head comes back too. A file without
+            head weights loads the backbone and leaves the head fresh; a file
+            whose head doesn't fit the configured one is an error.
+          - a bare backbone state_dict (a pretraining run, torchvision): loaded
+            into the backbone. Keys of modules this repo replaces with
+            Identity (a torchvision ResNet's fc.*) are dropped first.
+
+        Files saved by the training scripts also record the embedding config
+        they were built with. A layer, head or preprocess that differs from
+        the current one gives a different representation from the same
+        weights, without any key mismatch (an avgpool head has no weights; a
+        preprocess change never touches them), so that's warned about.
+        """
+        sd, record = _read_checkpoint(path)
+        if record['embedding'] is not None:
+            self._warn_on_build_differences(path, record)
+        if any(k.startswith('embedding.') for k in sd):
+            missing, unexpected = self.load_state_dict(sd, strict=False)
+            missing = [k for k in missing if not k.endswith('num_batches_tracked')]
+            file_has_head = any(k.startswith('head.') for k in sd)
+            bad_missing = [k for k in missing if not k.startswith('head.') or file_has_head]
+            if unexpected or bad_missing:
+                raise RuntimeError(
+                    f"{path!r} doesn't match this {self.embedding_name!r} encoder -- "
+                    f"missing keys: {bad_missing[:5]}{'...' if len(bad_missing) > 5 else ''}, "
+                    f"unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''} "
+                    "(a head mismatch means embedding.head/head_dim differ from the saved run)"
+                )
+            if missing:
+                print(f"[embeddings] {path!r} has no head weights; the head starts fresh.")
+            return
+        dropped = [n for n, m in self.embedding.named_modules() if n and isinstance(m, nn.Identity)]
+        sd = {k: v for k, v in sd.items() if not any(k.startswith(d + '.') for d in dropped)}
+        _load_custom_state_dict(self.embedding, sd, self.embedding_name, strict=True)
+
+    def _warn_on_build_differences(self, path, record):
+        from src.truncation import DEFAULT_HEAD_DIM
+        meta = record['embedding']
+        layer = meta.get('layer')
+        head = meta.get('head') or ('avgpool' if layer is not None else None)
+        saved = {
+            'arch': meta.get('arch') or meta.get('name'),
+            'layer': layer,
+            'head': head,
+            'head_dim': (meta.get('head_dim') or DEFAULT_HEAD_DIM) if head == 'linear' else None,
+            'preprocess': _canonical_preprocess(meta.get('preprocess')),
+        }
+        diffs = [f"{k}: saved {saved[k]!r}, now {self.build_spec[k]!r}"
+                 for k in saved if saved[k] != self.build_spec[k]]
+        # Without a resize, the frame size is part of what the encoder sees
+        # (a linear/flatten head would fail on it anyway; avgpool and cls
+        # would silently run at a different resolution).
+        pre = self.build_spec['preprocess']
+        if (pre is not None and pre['resize'] is None and record['input_size'] is not None
+                and record['input_size'] != self.input_size):
+            diffs.append(f"frame size (the pipeline doesn't resize): saved "
+                         f"{record['input_size']}, now {self.input_size}")
+        self.build_warnings = diffs
+        if diffs:
+            print(f"[embeddings] Warning: {path!r} was built differently from this "
+                  f"encoder, so its weights give a different representation here -- "
+                  + "; ".join(diffs))
+
+    def set_trainable(self, mode: str) -> None:
+        """Which parameters get requires_grad: 'none', 'all' (backbone and
+        head), or 'head' (a linear head on a frozen backbone, as in PIE-G).
+        Separate from train()/eval(): the training scripts keep the encoder
+        in eval() so BatchNorm statistics stay frozen either way."""
+        if mode not in ("none", "all", "head"):
+            raise ValueError(f"trainable mode {mode!r}; expected none, all or head")
+        for p in self.embedding.parameters():
+            p.requires_grad_(mode == "all")
+        for p in self.head.parameters():
+            p.requires_grad_(mode != "none")
 
     def forward(self, observation):
         if self.embedding_name == 'true_state':

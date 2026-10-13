@@ -19,6 +19,7 @@ The three independent axes:
 The encoder trains (gets an optimizer) iff grads != none or aux is non-empty.
 """
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -45,6 +46,7 @@ class EncoderSettings:
     grads: str
     aux_specs: List[dict]
     trains: bool
+    trainable: str          # 'all' | 'head' (encoder.trainable); see EmbeddingNet.set_trainable
     aug_name: Optional[str]
     aug_stage: str
     task_aug: bool          # the task loss sees augmented observations
@@ -100,6 +102,23 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     task_aug = aug_name is not None and aug_stage in ("rl", "both")
 
     trains = grads != "none" or bool(aux_specs)
+
+    trainable = str(enc.get("trainable", "all"))
+    if trainable not in ("all", "head"):
+        raise ValueError(f"encoder.trainable={trainable!r}; expected all or head")
+    emb_head = cfg.embedding.get("head") if has_embedding else None
+    if emb_head == "linear" and not trains:
+        raise ValueError(
+            "embedding.head=linear is trainable, but the encoder is frozen "
+            "(encoder.grads=none, encoder.aux empty), so it would stay a random "
+            "projection. Set encoder.grads (e.g. critic) or encoder.aux."
+        )
+    if trainable == "head" and emb_head != "linear":
+        raise ValueError(
+            f"encoder.trainable=head trains only the head, but embedding.head={emb_head} "
+            "has no parameters. Use embedding.head=linear, or encoder.trainable=all."
+        )
+
     if not has_embedding:
         used = [k for k, on in (("encoder.grads", grads != "none"),
                                 ("encoder.aux", bool(aux_specs)),
@@ -110,10 +129,95 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
                 "these only apply to pixel observations through an embedding."
             )
 
+    # Without RL gradients, only aux losses move the encoder. One that reads
+    # no observations (l2sp) only pulls weights back toward where they start,
+    # so its gradient is zero throughout and the run equals a frozen one.
+    # Keyed off needs_*, so a custom loss that reads observations counts.
+    if trains and grads == "none" and not (aux_needs_clean or aux_needs_aug):
+        raise ValueError(
+            f"encoder.aux={[s['name'] for s in aux_specs]} with encoder.grads=none: no aux "
+            "loss reads observations, so nothing moves the encoder (l2sp's gradient is "
+            "zero at the pretrained weights) and the run equals a frozen one. Set "
+            "encoder.grads, or add an aux loss that reads observations (e.g. aug_consistency)."
+        )
+
     return EncoderSettings(
-        has_embedding, grads, aux_specs, trains, aug_name, aug_stage,
+        has_embedding, grads, aux_specs, trains, trainable, aug_name, aug_stage,
         task_aug, aux_needs_clean, aux_needs_aug,
     )
+
+
+def embedding_kwargs(cfg) -> dict:
+    """The optional encoder fields in cfg.embedding (arch, checkpoint,
+    preprocess; see EmbeddingNet), validated and ready to pass to
+    EmbeddingNet. Call before the encoder loads, so a missing checkpoint or a
+    bad preprocess spec fails in seconds.
+
+    A relative checkpoint path is resolved against the directory the run was
+    launched from, not Hydra's run directory (train_sac.py runs with
+    hydra.job.chdir=true)."""
+    from omegaconf import OmegaConf
+
+    emb = cfg.embedding
+    if emb.get("name") is None:
+        return {}
+    # .get() returns None for a `???` value instead of raising, which would
+    # silently fall back to the architecture's default weights. (`k in emb`
+    # is False for `???` too, hence keys().)
+    missing = [k for k in ("arch", "checkpoint", "preprocess", "layer", "head", "head_dim")
+               if k in emb.keys() and OmegaConf.is_missing(emb, k)]
+    if missing:
+        raise ValueError(
+            f"embedding.{missing[0]} must be set for embedding={emb.name} "
+            f"(e.g. embedding.{missing[0]}=...)"
+        )
+    kwargs = {}
+    if emb.get("arch") is not None:
+        kwargs["arch"] = str(emb.arch)
+    if emb.get("checkpoint") is not None:
+        from hydra.utils import to_absolute_path
+        from src.embeddings import CHECKPOINT_ARCHS
+        arch = str(emb.get("arch") or emb.name)
+        if arch not in CHECKPOINT_ARCHS:
+            raise ValueError(
+                f"embedding.checkpoint can't be loaded into arch={arch!r}: its builder "
+                "always loads or downloads its own default weights first. "
+                f"Supported: {sorted(CHECKPOINT_ARCHS)}"
+            )
+        path = to_absolute_path(str(emb.checkpoint))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"embedding.checkpoint={emb.checkpoint!r}: no file at {path}")
+        kwargs["checkpoint"] = path
+    if emb.get("preprocess") is not None:
+        from src.embeddings import preprocess_transforms
+        spec = _plain(emb.preprocess)
+        preprocess_transforms(spec)   # raises on a bad spec
+        kwargs["preprocess"] = spec
+
+    # Truncation and head (src/truncation.py). Which module a layer name
+    # resolves to, and whether the head fits that layer's output, can only
+    # be checked once the encoder is built; types and names are checked here.
+    from src.truncation import HEADS
+    layer = emb.get("layer")
+    if layer is not None:
+        if isinstance(layer, bool) or not isinstance(layer, (int, str)) or \
+                (isinstance(layer, int) and layer < 1) or layer == "":
+            raise ValueError(f"embedding.layer={layer!r}: expected a stage name (layer2), "
+                             "a block count >= 1, or a module path")
+        kwargs["layer"] = layer
+    head = emb.get("head")
+    if head is not None:
+        if head not in HEADS:
+            raise ValueError(f"embedding.head={head!r}; expected one of {HEADS}")
+        kwargs["head"] = str(head)
+    head_dim = emb.get("head_dim")
+    if head_dim is not None:
+        if head != "linear":
+            raise ValueError("embedding.head_dim only applies to embedding.head=linear")
+        if isinstance(head_dim, bool) or not isinstance(head_dim, int) or head_dim < 1:
+            raise ValueError(f"embedding.head_dim={head_dim!r}: expected a positive integer")
+        kwargs["head_dim"] = head_dim
+    return kwargs
 
 
 def resolve_buffer_obs(cfg, s: EncoderSettings) -> Tuple[bool, str]:
@@ -165,7 +269,8 @@ def warn_unused_encoder_overrides(s: EncoderSettings) -> None:
     except Exception:
         return
     unused = [o for o in overrides
-              if o.lstrip("+~").split("=")[0] in ("encoder.lr", "encoder.betas", "encoder.grad_clip")]
+              if o.lstrip("+~").split("=")[0] in ("encoder.lr", "encoder.betas",
+                                                  "encoder.grad_clip", "encoder.trainable")]
     if unused:
         print(f"WARNING: {unused} have no effect: the encoder is frozen "
               "(encoder.grads=none and encoder.aux is empty).")

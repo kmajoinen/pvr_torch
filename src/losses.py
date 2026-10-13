@@ -121,19 +121,27 @@ def available_aux_losses():
 # Built-in losses
 # ------------------------------------------------------------------------------
 
+def _backbone(encoder: nn.Module) -> nn.Module:
+    """EmbeddingNet's pretrained backbone (.embedding), without a trainable
+    head; any other module as-is."""
+    return getattr(encoder, "embedding", encoder)
+
+
 @register_aux_loss("l2sp")
 class L2SP(AuxLoss):
-    """||theta - theta_0||^2 over all encoder parameters (Xuhong et al., 2018):
-    adapt the encoder while penalising drift from its pretrained weights."""
+    """||theta - theta_0||^2 over the backbone's parameters (Xuhong et al.,
+    2018): adapt the encoder while penalising drift from its pretrained
+    weights. A trainable head (embedding.head=linear) is excluded: it starts
+    from a random init, which L2-SP has no reason to anchor to."""
 
     def __init__(self, encoder: nn.Module):
         super().__init__(encoder)
-        self._anchor = {n: p.detach().clone() for n, p in encoder.named_parameters()}
+        self._anchor = {n: p.detach().clone() for n, p in _backbone(encoder).named_parameters()}
 
     def forward(self, batch: AuxBatch) -> torch.Tensor:
         return sum(
             ((p - self._anchor[n]) ** 2).sum()
-            for n, p in batch.encoder.named_parameters()
+            for n, p in _backbone(batch.encoder).named_parameters()
         )
 
 

@@ -1,0 +1,3 @@
+name: dinov2_vitl14
+pretrained: true
+train: false
