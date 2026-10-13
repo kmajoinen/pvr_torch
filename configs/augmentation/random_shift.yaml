@@ -1,7 +1,13 @@
 # DrQ-v2 random shift (Yarats et al., 2021). Applied at the encoder's input
-# resolution, so the pad is a fraction of the image side: 4/84 reproduces
-# DrQ-v2's pad=4 at 84px. Set params.pad instead for a fixed pixel count.
+# resolution, so by default the pad is a fraction of the image side.
+# Set at most one of the two:
+#   pad_frac   fraction of the side; null with pad also null = 4/84, which
+#              reproduces DrQ-v2's pad=4 at 84px
+#   pad        fixed pixel count regardless of resolution
+# Both keys stay listed (as null) so either can be overridden directly, e.g.
+# augmentation.params.pad=4 -- Hydra rejects overrides of unlisted keys.
 name: random_shift
 stage: rl
 params:
-  pad_frac: 0.047619   # 4/84
+  pad_frac: null
+  pad: null

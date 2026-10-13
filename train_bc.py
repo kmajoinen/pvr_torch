@@ -43,8 +43,9 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from src.encoder_config import encoder_settings, warn_unused_encoder_overrides
-from src.losses import AuxBatch, build_aux_losses, total_aux_loss
+from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
 from src.models import ContinuousPolicyNet
+from src.views import CollapseMonitor, encode_views
 
 
 # ------------------------------------------------------------------------------
@@ -223,6 +224,7 @@ def main(cfg: DictConfig) -> None:
             enc_params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
         )
         print(f"Encoder trains: grads={enc.grads}  aux={enc.aux_names}  lr={cfg.encoder.lr}")
+    aux_grad_clean, aux_grad_aug = aux_grad_views(aux_terms)
 
     # ── Policy ────────────────────────────────────────────────────────────────
     policy = ContinuousPolicyNet(
@@ -238,6 +240,27 @@ def main(cfg: DictConfig) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.algo.max_epochs
     )
+
+    # ── Encoding helpers (embedding only) ─────────────────────────────────────
+    def featurize(x, grad):
+        ctx = torch.enable_grad() if grad else torch.no_grad()
+        with ctx:
+            return embedding.encode_preprocessed(x)
+
+    def _augment(x):
+        with torch.no_grad():
+            return aug_module(x)
+
+    augment = _augment if aug_module is not None else None
+    collapse = CollapseMonitor()   # training encoders only
+
+    if augment is not None:
+        # One real dataset frame through preprocess -> augmentation now, so an
+        # input contract violation (value range, channel count, non-square
+        # frame) fails before training starts. This is also where the
+        # one-time range check runs.
+        with torch.no_grad():
+            augment(embedding.preprocess(torch.as_tensor(train_ds[0][0])[None]))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     n_batches = len(train_loader)
@@ -256,21 +279,31 @@ def main(cfg: DictConfig) -> None:
         for i, (obs_b, act_b) in enumerate(train_loader):
             obs_b = obs_b.to(device)
             act_b = act_b.to(device)
+            views = None
             if embedding is not None:
-                # The BC loss reaches the encoder only with grads=policy; with
-                # aux-only training the policy sees detached features.
-                ctx = torch.enable_grad() if policy_grads else torch.no_grad()
-                with ctx:
-                    x = embedding.preprocess(obs_b)
-                    if aug_module is not None:
-                        x = aug_module(x)
-                    obs_b = embedding.encode_preprocessed(x)
+                # One augmentation draw per batch, routed by augmentation.stage
+                # (src/views.py). The BC loss reaches the encoder only with
+                # grads=policy; otherwise the policy sees detached features.
+                with torch.no_grad():
+                    x_clean = embedding.preprocess(obs_b)
+                views = encode_views(
+                    featurize, embedding, x_clean, augment,
+                    task_aug=enc.task_aug,
+                    task_grad=policy_grads,
+                    aux_needs_clean=enc.aux_needs_clean,
+                    aux_needs_aug=enc.aux_needs_aug,
+                    aux_grad_clean=aux_grad_clean,
+                    aux_grad_aug=aux_grad_aug,
+                )
+                obs_b = views.feats_task
+                if encoder_trains and collapse.initial is None:
+                    collapse.update(obs_b, where="first batch")
             pred = policy(obs_b)
             loss = F.mse_loss(pred, act_b)
 
             aux_total, aux_values = None, {}
             if aux_terms:
-                aux_total, aux_values = total_aux_loss(aux_terms, AuxBatch(encoder=embedding))
+                aux_total, aux_values = total_aux_loss(aux_terms, views.aux)
                 loss = loss + aux_total
 
             optimizer.zero_grad()
@@ -294,6 +327,8 @@ def main(cfg: DictConfig) -> None:
 
         train_loss /= n_batches
         scheduler.step()
+        if encoder_trains:
+            collapse.update(obs_b, where=f"epoch {epoch}")
 
         # Validate
         policy.eval()
@@ -319,6 +354,9 @@ def main(cfg: DictConfig) -> None:
                 log['train/aux_loss'] = aux_total.item()
                 for name, value in aux_values.items():
                     log[f'train/aux/{name}'] = value
+            if encoder_trains:
+                log['train/embedding_std'] = collapse.current
+                log['train/embedding_std_ratio'] = collapse.ratio
             wandb.log(log, step=epoch)
 
         if epoch % cfg.algo.eval_frequency == 0 or epoch == 1:

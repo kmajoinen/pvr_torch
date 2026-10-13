@@ -182,20 +182,43 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   gradient — see the module docstring in `train_sac.py`), or `none`. For BC,
   `policy` lets the BC loss backprop into the encoder.
 - **`encoder.aux`** — a list of auxiliary losses from `src/losses.py`, each
-  `{name, weight, ...params}`. `l2sp` anchors weights to their pretrained
-  values (`||θ - θ₀||²`). With `grads: none` it's pure regularized
-  adaptation with zero RL gradient into the encoder. To add your own,
-  subclass `AuxLoss` in `src/losses.py` and decorate it with
-  `@register_aux_loss("name")`; the file's docstring has the contract.
+  `{name, weight, ...params}`:
+  - `l2sp` anchors weights to their pretrained values (`||θ - θ₀||²`). With
+    `grads: none` it's pure regularized adaptation with zero RL gradient
+    into the encoder.
+  - `aug_consistency` (`target: clean | augmented`, default `clean`) is the
+    MSE between the embeddings of the clean and augmented views; the
+    `target` branch is detached. Needs an augmentation with `stage: aux` or
+    `both`. On its own it has a degenerate optimum (every input mapped to
+    the same embedding), so pair it with `l2sp` or `grads != none`.
+
+  To add your own, subclass `AuxLoss` in `src/losses.py` and decorate it
+  with `@register_aux_loss("name")`; the file's docstring has the contract.
 - **`augmentation`** — picks a file from `configs/augmentation/` (`none`,
   `random_shift`, `color_jitter`, `gaussian_blur`, `horizontal_flip`,
   `random_erasing`, and `shift_jitter` as a pipeline example). Each has a
-  `name`, a `stage` and `params`. Only `stage: rl` is implemented so far:
-  the task loss (SAC actor/critic, BC policy loss) sees augmented
-  observations. It applies to sampled training batches only, never to
+  `name`, a `stage` and `params`. `stage` decides who sees the augmented
+  view (`src/views.py`):
+
+  | stage | task loss (SAC actor/critic, BC policy loss) | aux losses |
+  |---|---|---|
+  | `rl` | augmented | clean |
+  | `aux` | clean | clean + augmented |
+  | `both` | augmented | clean + augmented |
+
+  `aux` and `both` need an aux loss that reads the augmented view (e.g.
+  `aug_consistency`); contradictory combinations raise at startup. The
+  augmentation is drawn once per update and shared by SAC's critic and
+  actor phases, and an update costs at most one encoder pass more than the
+  task loss alone. It applies to sampled training batches only, never to
   rollouts or evaluation. Augmentations run at the encoder's input
   resolution (after its resize/crop) and draw parameters per sample; see
   `src/augmentations.py` for the contract and how to add one.
+- **Collapse monitor** — whenever the encoder trains, the per-dimension std
+  of its raw output (before the heads' LayerNorm) is logged as
+  `train/embedding_std` and `train/embedding_std_ratio` (relative to the
+  first update; also printed as `emb_std_ratio`), with a one-time warning
+  if it drops below 10%.
 - **`buffer_obs`** (SAC) — what the replay buffer stores. `auto` stores
   pixels if the encoder trains or augmentation is on (both need every
   sampled batch re-encoded), and features otherwise: the fast path, where
@@ -240,6 +263,16 @@ python train_sac.py buffer_obs=pixels env.image_size=112
 
 # Aux-only adaptation, zero RL gradient into the encoder
 python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' env.image_size=112
+
+# Augmentation only through a consistency loss: actor/critic see clean
+# observations, the encoder learns invariance (anchored by l2sp)
+python train_sac.py augmentation=random_shift augmentation.stage=aux \
+    'encoder.aux=[{name:aug_consistency,weight:0.1},{name:l2sp,weight:1.0}]' \
+    env.image_size=112
+
+# DrQ-style augmented RL plus the consistency loss, critic+actor gradients
+python train_sac.py augmentation=random_shift augmentation.stage=both encoder.grads=both \
+    'encoder.aux=[{name:aug_consistency,weight:0.1}]' env.image_size=112
 
 # BC with the BC loss training the encoder, plus augmentation
 python train_bc.py embedding=resnet18 encoder.grads=policy augmentation=random_shift

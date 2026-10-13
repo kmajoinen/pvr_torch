@@ -5,10 +5,20 @@ Contract -- every registered augmentation, built-in or added later:
   input    float tensor (N, C, H, W), values in [0, 1]
   output   same shape, dtype, device and value range
   random   parameters drawn independently per sample, never one draw shared
-           by the whole batch
-  RNG      torch's global RNG, so runs are reproducible via torch.manual_seed
-           (the training scripts seed it from cfg.seed). Kornia has no
-           torch.Generator support, so per-module generators aren't offered.
+           by the whole batch. One known exception: kornia's ColorJitter
+           draws its brightness/contrast/saturation/hue factors per sample
+           but the order it applies them in once per batch.
+  RNG      torch's global RNGs, so runs are reproducible via torch.manual_seed
+           (the training scripts seed it from cfg.seed; it seeds CPU and CUDA
+           alike). Kornia has no torch.Generator support, so per-module
+           generators aren't offered.
+
+The input contract is enforced by make_augmentation(): dtype and shape on
+every call, value range on the first call only (see _CheckInput). The range
+check exists because some encoders' own preprocessing produces 0-255 input
+(R3M, VIP) or ImageNet-normalised input (CLIP, timm); EmbeddingNet.preprocess()
+must stop before either step, or colour transforms clamp the frame to [0, 1]
+and erasing fills with the wrong value, without any error.
 
 Nothing in this file knows about encoders, replay buffers or training loops.
 Where an augmentation is applied -- which batches, which losses -- is the
@@ -23,9 +33,13 @@ size.
 
 Two kinds of entries:
   - kornia-backed: standard transforms (colour jitter, blur, flip, erasing).
-    Kornia draws parameters per sample on whatever device the batch is on.
+    Kornia draws parameters per sample, on the CPU with the global CPU RNG,
+    and copies them to the batch's device. (Calling .to(device) directly on
+    a kornia module would move its sampling to that device; .to() on a
+    parent module, including the wrappers below, does not.)
   - bespoke: implemented in this file, for transforms kornia lacks or that
-    are worth owning. DrQ-v2's random shift is the first.
+    are worth owning. DrQ-v2's random shift is the first. It draws on the
+    batch's device.
 
 Adding an augmentation:
     @register_augmentation("my_aug")
@@ -38,15 +52,21 @@ Adding an augmentation:
     stage: rl
     params: {strength: 0.1}
 
+  Registration happens when the decorator runs, i.e. when its module is
+  imported. Put new entries in this file, or make sure the module that
+  defines them is imported before build_augmentation() is called; otherwise
+  the name is reported as unknown.
+
 Usage:
     build_augmentation(cfg.augmentation)              # from a config node
     make_augmentation("random_shift", pad_frac=0.05)  # programmatic
     make_augmentation("pipeline", transforms=[
-        {"name": "random_shift"},
+        "random_shift",                               # bare name: default params
         {"name": "color_jitter", "params": {"brightness": 0.2}},
     ])
 """
 
+import numbers
 from typing import Callable, Dict, Optional
 
 import torch
@@ -59,13 +79,14 @@ import torch.nn.functional as F
 # ------------------------------------------------------------------------------
 
 _REGISTRY: Dict[str, Callable[..., nn.Module]] = {}
+_RESERVED = ("pipeline", "none")
 
 
 def register_augmentation(name: str):
     """Decorator: register a class or factory function under `name`. Its
     keyword arguments are the `params:` accepted from config."""
     def decorator(factory):
-        if name in _REGISTRY or name in ("pipeline", "none"):
+        if name in _REGISTRY or name in _RESERVED:
             raise ValueError(f"augmentation name {name!r} is already taken")
         _REGISTRY[name] = factory
         return factory
@@ -73,7 +94,7 @@ def register_augmentation(name: str):
 
 
 def available_augmentations():
-    return sorted(_REGISTRY) + ["pipeline"]
+    return sorted(_REGISTRY) + list(_RESERVED)
 
 
 # ------------------------------------------------------------------------------
@@ -89,45 +110,66 @@ class RandomShiftsAug(nn.Module):
     The pad is set as a fraction of the image side (pad_frac) rather than in
     pixels, because this runs at the encoder's input resolution, which
     differs between encoders: a fixed pad=4 would be a ~1.8% shift at 224px
-    but ~4.8% at 84px. The default 4/84 reproduces DrQ-v2's pad=4 at 84px.
-    Pass `pad` instead to fix the pixel count regardless of resolution.
+    but ~4.8% at 84px. The default pad_frac=4/84 reproduces DrQ-v2's pad=4 at
+    84px. Pass `pad` instead to fix the pixel count regardless of resolution;
+    passing both is an error.
+
+    The sampling grid is built in at least fp32 whatever the input dtype. In
+    bf16 the representable spacing near +-1 (2^-7) is about one pixel at
+    224px, which would turn the integer shift into a sub-pixel resample.
     """
 
-    def __init__(self, pad_frac: float = 4 / 84, pad: Optional[int] = None):
+    def __init__(self, pad_frac: Optional[float] = None, pad: Optional[int] = None):
         super().__init__()
-        if pad is not None and pad < 0:
-            raise ValueError(f"pad must be >= 0, got {pad}")
-        if pad_frac < 0:
+        if pad is not None and pad_frac is not None:
+            raise ValueError(
+                f"random_shift takes pad_frac or pad, not both (got pad_frac="
+                f"{pad_frac}, pad={pad}). From config, set the other to null."
+            )
+        if pad is not None:
+            if (isinstance(pad, bool) or not isinstance(pad, numbers.Real)
+                    or not float(pad).is_integer() or pad < 0):
+                raise ValueError(
+                    f"pad must be a non-negative whole number of pixels, got {pad!r}"
+                )
+            pad = int(pad)
+        elif pad_frac is None:
+            pad_frac = 4 / 84
+        if pad_frac is not None and pad_frac < 0:
             raise ValueError(f"pad_frac must be >= 0, got {pad_frac}")
         self.pad_frac = pad_frac
         self.pad = pad
 
     def forward(self, x):
-        n, c, h, w = x.size()
-        assert h == w, f"random_shift needs square input, got {h}x{w}"
+        n, c, h, w = x.shape
+        if h != w:
+            raise ValueError(f"random_shift needs square input, got {h}x{w}")
         pad = self.pad if self.pad is not None else round(self.pad_frac * h)
         if pad == 0:
             return x
-        x = F.pad(x, (pad,) * 4, 'replicate')
-        eps = 1.0 / (h + 2 * pad)
+        in_dtype = x.dtype
+        dtype = torch.promote_types(in_dtype, torch.float32)
+        size = h + 2 * pad
+        x = F.pad(x.to(dtype), (pad,) * 4, 'replicate')
+        eps = 1.0 / size
         arange = torch.linspace(-1.0 + eps,
                                 1.0 - eps,
-                                h + 2 * pad,
+                                size,
                                 device=x.device,
-                                dtype=x.dtype)[:h]
+                                dtype=dtype)[:h]
         arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
         base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
-        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
 
         shift = torch.randint(0,
                               2 * pad + 1,
                               size=(n, 1, 1, 2),
                               device=x.device,
-                              dtype=x.dtype)
-        shift *= 2.0 / (h + 2 * pad)
+                              dtype=dtype)
+        shift *= 2.0 / size
 
-        grid = base_grid + shift
-        return F.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
+        grid = base_grid.unsqueeze(0) + shift  # broadcasts to (n, h, h, 2)
+        out = F.grid_sample(x, grid, padding_mode='zeros', align_corners=False)
+        return out.to(in_dtype)
 
 
 # ------------------------------------------------------------------------------
@@ -143,8 +185,9 @@ def _kornia():
         import kornia.augmentation as K
     except ImportError as e:
         raise ImportError(
-            "This augmentation needs kornia: pip install kornia "
-            "(it's listed in requirements.txt)."
+            "This augmentation needs kornia: pip install kornia (the version "
+            "is pinned in requirements.txt; anything older than 0.6.10 treats "
+            "gaussian_blur's sigma differently)."
         ) from e
     return K
 
@@ -182,6 +225,10 @@ def _color_jitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0):
 
 @register_augmentation("gaussian_blur")
 def _gaussian_blur(kernel_size=5, sigma=(0.1, 2.0), p=1.0):
+    # sigma is a (min, max) range sampled per sample. Kornia only treats it
+    # that way from 0.6.10; before that it was a fixed (sigma_x, sigma_y).
+    # kernel_size is in pixels, so the same setting blurs less at 224px than
+    # at 84px, and a 5-tap kernel truncates sigma=2 at 1 sigma.
     K = _kornia()
     return K.RandomGaussianBlur(kernel_size=kernel_size, sigma=tuple(sigma), p=p)
 
@@ -202,14 +249,23 @@ def _random_erasing(scale=(0.02, 0.33), ratio=(0.3, 3.3), value=0.0, p=0.5):
 # Builders
 # ------------------------------------------------------------------------------
 
+# How far outside [0, 1] the first batch may stray before it's rejected. Bicubic
+# resizing overshoots (up to ~0.42 on a worst-case 0/1 checkerboard, far less
+# on real frames), so the tolerance is loose; it still catches 0-255 input and
+# ImageNet-normalised input, which leave [0, 1] by more than 1.
+_RANGE_TOL = 0.5
+
+
 class _CheckInput(nn.Module):
-    """Fails fast on the most likely misuse: passing a raw uint8 HWC replay
-    batch instead of a float NCHW one. Range isn't checked -- that would
-    force a GPU sync on every call."""
+    """Fails fast on the likely misuses: a raw uint8 HWC replay batch instead
+    of a float NCHW one (checked every call, free), and frames that aren't in
+    [0, 1] (checked on the first call only: reading the range back forces a
+    GPU sync)."""
 
     def __init__(self, inner: nn.Module):
         super().__init__()
         self.inner = inner
+        self._range_checked = False
 
     def forward(self, x):
         if x.ndim != 4 or not x.is_floating_point():
@@ -217,10 +273,26 @@ class _CheckInput(nn.Module):
                 "augmentations take float (N, C, H, W) input in [0, 1], got "
                 f"dtype={x.dtype} shape={tuple(x.shape)}"
             )
+        if not self._range_checked:
+            lo, hi = (v.item() for v in torch.aminmax(x.detach()))
+            if lo < -_RANGE_TOL or hi > 1 + _RANGE_TOL:
+                raise ValueError(
+                    f"augmentations take input in [0, 1], got values in "
+                    f"[{lo:.3g}, {hi:.3g}]. Max well above 1 suggests 0-255 "
+                    "input; values well below 0 suggest mean/std "
+                    "normalisation already applied. Augment before either "
+                    "step (EmbeddingNet.preprocess() should stop at "
+                    "resize/crop)."
+                )
+            self._range_checked = True
         return self.inner(x)
 
 
 def _make(name: str, params: dict) -> nn.Module:
+    if name == "none":
+        if params:
+            raise TypeError(f"augmentation 'none' takes no params, got {sorted(params)}")
+        return nn.Identity()
     if name == "pipeline":
         transforms = params.pop("transforms", None)
         if params:
@@ -239,7 +311,16 @@ def _make(name: str, params: dict) -> nn.Module:
 
 
 def _make_from_spec(spec) -> nn.Module:
-    spec = dict(spec)
+    """A pipeline entry: a bare name, or {name: ..., params: {...}}."""
+    if isinstance(spec, str):
+        return _make(spec, {})
+    try:
+        spec = dict(spec)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "pipeline entries are a name or {name: ..., params: {...}}, "
+            f"got {spec!r}"
+        ) from None
     name = spec.pop("name", None)
     params = dict(spec.pop("params", None) or {})
     if name is None or spec:
@@ -251,7 +332,8 @@ def _make_from_spec(spec) -> nn.Module:
 
 
 def make_augmentation(name: str, **params) -> nn.Module:
-    """Build a registered augmentation (or a `pipeline` of them) by name."""
+    """Build a registered augmentation (or a `pipeline` of them) by name.
+    "none" gives an identity that still enforces the input contract."""
     return _CheckInput(_make(name, dict(params)))
 
 

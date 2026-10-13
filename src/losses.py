@@ -29,17 +29,33 @@ Contract:
   - Parameters the loss owns (decoders, predictor heads) are optimised by the
     encoder's optimizer, at encoder.lr.
   - Declare what the loss reads from AuxBatch with the class attributes
-    below, so the training scripts can reject configs they can't serve
-    before anything expensive runs:
-        needs_features  = True   # batch.obs / batch.feats
+    below. The training loop fills only what some loss declared (each costs
+    an encoder pass), and configs that can't supply it are rejected before
+    anything expensive runs:
+        needs_features  = True   # batch.obs / batch.feats      (clean view)
         needs_augmented = True   # batch.obs_aug / batch.feats_aug
+    needs_augmented also requires an augmentation with stage aux or both
+    (see src/views.py).
+  - Declare which of those views the loss backpropagates through with the
+    grad_features / grad_augmented properties. They default to
+    needs_features / needs_augmented. Override them when the loss reads a
+    view only as a fixed target (aug_consistency does): that view is then
+    encoded without gradient, which saves a full set of encoder activations,
+    and it reaches the loss detached even when the task loss's encode of the
+    same view carries gradient. The training scripts pass
+    aux_grad_views(terms) to encode_views.
+  - Param names are checked against __init__'s signature at startup, before
+    the encoder loads. To check param values that early too, override the
+    check_params classmethod (aug_consistency does, for `target`).
 """
 
+import inspect
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -51,7 +67,8 @@ class AuxBatch:
     # input resolution (EmbeddingNet.preprocess output).
     obs: Optional[torch.Tensor] = None
     obs_aug: Optional[torch.Tensor] = None
-    # Encoder outputs for the above, carrying gradient when the encoder trains.
+    # Encoder outputs for the above. A view carries gradient only if some loss
+    # declared it (grad_features / grad_augmented); otherwise it is detached.
     feats: Optional[torch.Tensor] = None
     feats_aug: Optional[torch.Tensor] = None
 
@@ -62,6 +79,21 @@ class AuxLoss(nn.Module):
 
     def __init__(self, encoder: nn.Module):
         super().__init__()
+
+    @property
+    def grad_features(self) -> bool:
+        """Does this loss backpropagate through batch.feats?"""
+        return self.needs_features
+
+    @property
+    def grad_augmented(self) -> bool:
+        """Does this loss backpropagate through batch.feats_aug?"""
+        return self.needs_augmented
+
+    @classmethod
+    def check_params(cls, **params) -> None:
+        """Validate config param values without building the loss. Runs at
+        startup, before the encoder loads. Raise ValueError on a bad value."""
 
     def forward(self, batch: AuxBatch) -> torch.Tensor:
         raise NotImplementedError
@@ -105,6 +137,56 @@ class L2SP(AuxLoss):
         )
 
 
+@register_aux_loss("aug_consistency")
+class AugConsistency(AuxLoss):
+    """MSE between the embeddings of the clean and augmented views of the
+    same observations, on the raw encoder output.
+
+    target: which branch is the fixed target (detached); the other one
+    receives the gradient. 'clean' (default) pulls augmented embeddings
+    toward clean ones -- the usual invariance direction. The target branch
+    is declared gradient-free (grad_features / grad_augmented), so it is
+    encoded without building a graph.
+
+    On its own (encoder.grads=none, no other aux loss) this objective is
+    degenerate: mapping every input to the same embedding gives zero loss, so
+    that's the optimum, and nothing in it preserves information. It's
+    SimSiam without the predictor SimSiam showed is necessary. Pair it with
+    l2sp or with RL gradients (grads != none), and watch
+    train/embedding_std_ratio, which the training scripts warn on.
+    """
+    needs_features = True
+    needs_augmented = True
+
+    @classmethod
+    def check_params(cls, target: str = "clean") -> None:
+        if target not in ("clean", "augmented"):
+            raise ValueError(f"aug_consistency target must be 'clean' or 'augmented', got {target!r}")
+
+    def __init__(self, encoder: nn.Module, target: str = "clean"):
+        super().__init__(encoder)
+        self.check_params(target=target)
+        self.target = target
+
+    @property
+    def grad_features(self) -> bool:
+        return self.target == "augmented"
+
+    @property
+    def grad_augmented(self) -> bool:
+        return self.target == "clean"
+
+    def forward(self, batch: AuxBatch) -> torch.Tensor:
+        clean, aug = batch.feats, batch.feats_aug
+        # encode_views already hands the target branch over detached; detach
+        # here too so direct callers get the same semantics.
+        if self.target == "clean":
+            clean = clean.detach()
+        else:
+            aug = aug.detach()
+        return F.mse_loss(aug, clean)
+
+
 # ------------------------------------------------------------------------------
 # Config -> losses
 # ------------------------------------------------------------------------------
@@ -133,13 +215,25 @@ def _split_spec(spec) -> Tuple[str, float, dict]:
 
 
 def aux_loss_classes(specs) -> List[Type[AuxLoss]]:
-    """Validate a config list of aux specs without building anything, and
-    return the loss classes (for checking their declared needs)."""
-    names = [_split_spec(s)[0] for s in specs]
+    """Validate a config list of aux specs without building anything (names,
+    weights, duplicates, param names against __init__, param values via
+    check_params) and return the loss classes, for checking their declared
+    needs. Runs at startup, before the encoder loads."""
+    split = [_split_spec(s) for s in specs]
+    names = [name for name, _, _ in split]
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
         raise ValueError(f"aux loss listed more than once: {dupes}")
-    return [_REGISTRY[n] for n in names]
+    classes = []
+    for name, _, params in split:
+        cls = _REGISTRY[name]
+        try:
+            inspect.signature(cls.__init__).bind(None, None, **params)  # self, encoder
+        except TypeError as e:
+            raise TypeError(f"bad params for aux loss {name!r}: {e}") from None
+        cls.check_params(**params)
+        classes.append(cls)
+    return classes
 
 
 def build_aux_losses(specs, encoder: nn.Module) -> List[AuxTerm]:
@@ -151,8 +245,25 @@ def build_aux_losses(specs, encoder: nn.Module) -> List[AuxTerm]:
             loss = _REGISTRY[name](encoder, **params)
         except TypeError as e:
             raise TypeError(f"bad params for aux loss {name!r}: {e}") from e
+        # grad_* depend on params, so this is the earliest they can be checked.
+        # encode_views would otherwise raise only at the first training update.
+        if (loss.grad_features and not loss.needs_features) or \
+                (loss.grad_augmented and not loss.needs_augmented):
+            raise ValueError(
+                f"aux loss {name!r} declares gradient through a view it doesn't "
+                f"read: grad_features={loss.grad_features} with needs_features="
+                f"{loss.needs_features}, grad_augmented={loss.grad_augmented} "
+                f"with needs_augmented={loss.needs_augmented}"
+            )
         terms.append(AuxTerm(name, weight, loss))
     return terms
+
+
+def aux_grad_views(terms: List[AuxTerm]) -> Tuple[bool, bool]:
+    """(clean, augmented): does any built loss backpropagate through that
+    view? Pass to encode_views as aux_grad_clean / aux_grad_aug."""
+    return (any(t.loss.grad_features for t in terms),
+            any(t.loss.grad_augmented for t in terms))
 
 
 def total_aux_loss(terms: List[AuxTerm], batch: AuxBatch) -> Tuple[torch.Tensor, Dict[str, float]]:

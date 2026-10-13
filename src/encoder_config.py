@@ -11,7 +11,10 @@ The three independent axes:
                   (SAC: none | critic | actor | both; BC: none | policy)
   encoder.aux     list of auxiliary losses (src/losses.py)
   augmentation    which transform (configs/augmentation/), and at which
-                  stage it's applied
+                  stage it's applied (src/views.py):
+                    rl    the task loss sees augmented observations
+                    aux   only aux losses see them; the task loss sees clean
+                    both  both do
 
 The encoder trains (gets an optimizer) iff grads != none or aux is non-empty.
 """
@@ -44,6 +47,9 @@ class EncoderSettings:
     trains: bool
     aug_name: Optional[str]
     aug_stage: str
+    task_aug: bool          # the task loss sees augmented observations
+    aux_needs_clean: bool   # some aux loss reads the clean view (needs_features)
+    aux_needs_aug: bool     # some aux loss reads the augmented view
 
     @property
     def aux_names(self) -> List[str]:
@@ -67,15 +73,9 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
 
     aux_specs = list(_plain(enc.get("aux")) or [])
     aux_classes = aux_loss_classes(aux_specs)
-    # Routing of features / augmented observations into aux losses is not
-    # wired yet, so a loss that needs them would silently get None.
-    unserved = [s["name"] for s, c in zip(aux_specs, aux_classes)
-                if c.needs_features or c.needs_augmented]
-    if unserved:
-        raise NotImplementedError(
-            f"aux losses {unserved} need encoder features or augmented "
-            "observations, which the training loop doesn't pass to aux losses yet."
-        )
+    aux_needs_clean = any(c.needs_features for c in aux_classes)
+    aux_needs_aug = any(c.needs_augmented for c in aux_classes)
+    aug_readers = [s["name"] for s, c in zip(aux_specs, aux_classes) if c.needs_augmented]
 
     aug = cfg.get("augmentation") or {}
     aug_name = aug.get("name")
@@ -83,11 +83,21 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     aug_stage = str(aug.get("stage", "rl"))
     if aug_stage not in AUG_STAGES:
         raise ValueError(f"augmentation.stage={aug_stage!r}; expected one of {AUG_STAGES}")
-    if aug_name is not None and aug_stage != "rl":
-        raise NotImplementedError(
-            f"augmentation.stage={aug_stage!r} is not implemented yet; only "
-            "stage=rl (the task loss sees augmented observations) is."
+    if aug_name is None and aug_stage != "rl":
+        raise ValueError(f"augmentation.stage={aug_stage} has no effect without an augmentation")
+    if aug_name is not None and aug_stage in ("aux", "both") and not aux_needs_aug:
+        raise ValueError(
+            f"augmentation.stage={aug_stage} feeds augmented observations to aux "
+            f"losses, but none of encoder.aux={[s['name'] for s in aux_specs]} "
+            "reads them (needs_augmented). Add one, e.g. aug_consistency, or use stage=rl."
         )
+    if aug_readers and (aug_name is None or aug_stage == "rl"):
+        raise ValueError(
+            f"aux losses {aug_readers} read augmented observations, which need an "
+            "augmentation with stage=aux or both "
+            f"(got augmentation={aug_name}, stage={aug_stage})."
+        )
+    task_aug = aug_name is not None and aug_stage in ("rl", "both")
 
     trains = grads != "none" or bool(aux_specs)
     if not has_embedding:
@@ -100,7 +110,10 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
                 "these only apply to pixel observations through an embedding."
             )
 
-    return EncoderSettings(has_embedding, grads, aux_specs, trains, aug_name, aug_stage)
+    return EncoderSettings(
+        has_embedding, grads, aux_specs, trains, aug_name, aug_stage,
+        task_aug, aux_needs_clean, aux_needs_aug,
+    )
 
 
 def resolve_buffer_obs(cfg, s: EncoderSettings) -> Tuple[bool, str]:

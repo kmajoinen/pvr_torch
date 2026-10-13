@@ -832,6 +832,46 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
 # EMBEDDING CLASS
 # ==============================================================================
 
+# Steps allowed after the [0, 1] point: value rescaling only, nothing spatial.
+_POST_AUG_STEPS = (T.Normalize, _ScaleTo255)
+
+
+def _split_transforms(transforms: nn.Sequential):
+    """Split an encoder's transform pipeline where the frame is a float in
+    [0, 1] at the encoder's input resolution: after the last
+    T.ConvertImageDtype. Returns (pre_aug, post_aug); augmentation runs in
+    between (src/augmentations.py's contract).
+
+    What follows the cut is value rescaling only: mean/std T.Normalize for
+    most encoders, _ScaleTo255 for R3M/VIP, whose models expect [0, 255]
+    input. Splitting at a trailing T.Normalize alone would leave R3M/VIP's
+    preprocess() output in [0, 255], where colour transforms clamp the frame
+    to [0, 1] without any error.
+
+    A pipeline with no ConvertImageDtype (maskrcnn_l3, which works in BGR
+    [0, 255] throughout) falls back to splitting before a trailing
+    T.Normalize; its preprocess() output isn't in [0, 1], which
+    augmentation's input check rejects.
+    """
+    steps = list(transforms.children())
+    converts = [i for i, t in enumerate(steps) if isinstance(t, T.ConvertImageDtype)]
+    if converts:
+        cut = converts[-1] + 1
+    elif steps and isinstance(steps[-1], T.Normalize):
+        cut = len(steps) - 1
+    else:
+        cut = len(steps)
+    post = steps[cut:]
+    if not all(isinstance(t, _POST_AUG_STEPS) for t in post):
+        raise RuntimeError(
+            "transform steps after T.ConvertImageDtype must only rescale values "
+            f"({[type(t).__name__ for t in _POST_AUG_STEPS]}), got "
+            f"{[type(t).__name__ for t in post]} -- a spatial step there would "
+            "run after augmentation."
+        )
+    return nn.Sequential(*steps[:cut]), (nn.Sequential(*post) if post else nn.Identity())
+
+
 class EmbeddingNet(nn.Module):
     """
     Input shape must be (N, C, H, W), where N is the number of frames.
@@ -873,15 +913,7 @@ class EmbeddingNet(nn.Module):
                 "likely corrupted or truncated -- delete it and let it re-download."
             )
 
-        # Split transforms at the final T.Normalize (if any), so preprocess()
-        # returns [0, 1] floats that callers can augment before normalisation.
-        t_list = list(self.transforms.children())
-        if isinstance(t_list[-1], T.Normalize):
-            self._pre_aug = nn.Sequential(*t_list[:-1])
-            self._normalize = t_list[-1]
-        else:
-            self._pre_aug = self.transforms
-            self._normalize = nn.Identity()
+        self._pre_aug, self._normalize = _split_transforms(self.transforms)
 
         dummy_in = torch.zeros(1, in_channels, 64, 64)
         dummy_in = self.transforms(dummy_in)
@@ -923,7 +955,7 @@ class EmbeddingNet(nn.Module):
 
     def encode_preprocessed(self, observation):
         """preprocess() output, optionally augmented -> (N, out_size)."""
-        observation = self._normalize(observation)        # mean/std normalisation
+        observation = self._normalize(observation)        # mean/std normalisation or [0, 255] rescale
         observation = observation.reshape(-1, *self.in_shape)
 
         # Gradient tracking is entirely the caller's responsibility (ambient

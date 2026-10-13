@@ -14,7 +14,11 @@ Three independent settings decide what happens to the encoder
   encoder.grads     which RL losses backprop into the encoder (below)
   encoder.aux       auxiliary encoder losses (src/losses.py)
   augmentation      configs/augmentation/*.yaml; applied to replay-batch
-                    encodes only, never to rollouts or evaluation
+                    encodes only, never to rollouts or evaluation. Its
+                    `stage` decides who sees the augmented view
+                    (src/views.py): rl = actor/critic, aux = aux losses
+                    only, both = both. One draw per update, shared by the
+                    critic and actor phases.
 
 The encoder trains iff grads != none or aux is non-empty. What the replay
 buffer stores follows from these (buffer_obs=auto):
@@ -88,6 +92,9 @@ Usage:
     python train_sac.py buffer_obs=pixels env.image_size=112           # slow-frozen control
     python train_sac.py 'encoder.aux=[{name:l2sp,weight:1.0}]' \
         env.image_size=112                                      # aux-only adaptation
+    python train_sac.py augmentation=random_shift augmentation.stage=aux \
+        'encoder.aux=[{name:aug_consistency,weight:0.1},{name:l2sp,weight:1.0}]' \
+        env.image_size=112                                      # consistency-only augmentation
     python train_sac.py env=pendulum embedding=none      # state-based sanity check
 """
 
@@ -113,7 +120,8 @@ from src.encoder_config import (
     resolve_buffer_obs,
     warn_unused_encoder_overrides,
 )
-from src.losses import AuxBatch, build_aux_losses, total_aux_loss
+from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
+from src.views import CollapseMonitor, encode_views
 from src.sac_utils import (
     Actor,
     ReplayBuffer,
@@ -162,11 +170,15 @@ def main(cfg: DictConfig) -> None:
         import wandb
 
         emb_tag = cfg.embedding.get("name") or "state"
+        # Run names are labels only; charts are keyed by the logged metric
+        # names, which stay fixed for continuity.
         tags = ""
         if encoder_trains:
             tags += "_ft-" + "-".join([routing] + enc.aux_names)
         if enc.aug_name is not None:
-            tags += f"_aug-{enc.aug_name}"
+            tags += f"_aug-{enc.aug_name}" + (
+                f"-{enc.aug_stage}" if enc.aug_stage != "rl" else ""
+            )
         if pixels_in_buffer and not encoder_trains and enc.aug_name is None:
             tags += "_slowfrozen"
         run_name = (
@@ -244,29 +256,37 @@ def main(cfg: DictConfig) -> None:
     amp_on = cfg.perf.amp_bf16 and device.type == "cuda"
     _grad_contract_checked = False
 
-    def encode(obs_batch, grad: bool, augment: bool = False) -> torch.Tensor:
-        """(B, H, W, C) uint8 (tensor or ndarray) -> (B, feat_dim) float32.
-        Same layout/dtype contract as FrozenEncoderWrapper: uint8 CHW into
-        EmbeddingNet, which handles resize/normalization internally.
-
-        augment: pass True only for training-batch encodes (sampled from
-        the replay buffer) -- never for rollout-time action selection or
-        eval(), where you want the encoder's clean view of the real
-        observation. No-op when no augmentation is configured. Applied
-        between EmbeddingNet.preprocess and encode_preprocessed, i.e. at the
-        encoder's input resolution."""
-        nonlocal _grad_contract_checked
+    # Three steps, so augmentation sits between preprocessing and the
+    # encoder (at the encoder's input resolution) and a view can be encoded
+    # more than once without re-drawing it -- see src/views.py.
+    def preprocess(obs_batch) -> torch.Tensor:
+        """(B, H, W, C) uint8 (tensor or ndarray) -> float (B, C, h, w) in
+        [0, 1] at the encoder's input resolution. Same layout/dtype contract
+        as FrozenEncoderWrapper."""
         x = (
             torch.as_tensor(np.ascontiguousarray(obs_batch))
             if not torch.is_tensor(obs_batch)
             else obs_batch
         )
         x = x.to(device).permute(0, 3, 1, 2)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
+            return embedding_net.preprocess(x)
+
+    def augment(x: torch.Tensor) -> torch.Tensor:
+        """Replay-batch views only -- never rollout-time action selection or
+        eval(), where the encoder should see the real observation. Runs in
+        fp32, outside autocast: it's cheap next to the encoder, and under
+        autocast kornia's convolutions (e.g. blur) would compute the
+        augmented view in bf16 -- the output is still fp32, but rounded by
+        up to ~2 uint8 levels while the clean view stays exact."""
+        with torch.no_grad():
+            return aug_module(x)
+
+    def featurize(x: torch.Tensor, grad: bool) -> torch.Tensor:
+        """preprocess() output (optionally augmented) -> (B, feat_dim) float32."""
+        nonlocal _grad_contract_checked
         ctx = torch.enable_grad() if grad else torch.no_grad()
         with ctx, torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
-            x = embedding_net.preprocess(x)
-            if augment and aug_module is not None:
-                x = aug_module(x)
             feats = embedding_net.encode_preprocessed(x)
         if grad and not _grad_contract_checked:
             # TODO(EmbeddingNet contract): if this trips, EmbeddingNet.encode
@@ -283,7 +303,7 @@ def main(cfg: DictConfig) -> None:
         return feats.float()
 
     def encode_single(obs_np) -> torch.Tensor:
-        return encode(np.asarray(obs_np)[None], grad=False)
+        return featurize(preprocess(np.asarray(obs_np)[None]), grad=False)
 
     # ── Networks / optimizers ─────────────────────────────────────────────────
     hidden = list(cfg.algo.net_arch)
@@ -331,6 +351,7 @@ def main(cfg: DictConfig) -> None:
         theta0 = {
             n: p.detach().cpu().clone() for n, p in embedding_net.named_parameters()
         }
+    aux_grad_clean, aux_grad_aug = aux_grad_views(aux_terms)
 
     def encoder_drift() -> float:
         with torch.no_grad():
@@ -365,6 +386,12 @@ def main(cfg: DictConfig) -> None:
         f"(learning starts at {cfg.algo.learning_starts:,})"
     )
     obs, _ = env.reset(seed=cfg.seed)
+    if aug_module is not None:
+        # One real frame through preprocess -> augmentation now, so an input
+        # contract violation (value range, channel count, non-square frame)
+        # fails at startup rather than at the first update after
+        # learning_starts. This is also where the one-time range check runs.
+        augment(preprocess(np.asarray(obs)[None]))
     t0 = time.time()
     # Per-phase encoder grad norms: each written ONLY by its own phase and
     # reset when that phase doesn't step this global_step -- so `both` mode
@@ -372,6 +399,7 @@ def main(cfg: DictConfig) -> None:
     # and `actor` mode logs NaN (not a stale value) on non-firing steps.
     enc_gnorm_critic = float("nan")
     enc_gnorm_actor = float("nan")
+    collapse = CollapseMonitor()   # training encoders only
 
     for global_step in range(1, cfg.algo.total_timesteps + 1):
         # ---- act --------------------------------------------------------------
@@ -425,9 +453,33 @@ def main(cfg: DictConfig) -> None:
         route_actor = routing in ("actor", "both")
 
         if pixels_in_buffer:
-            feats = encode(b_obs, grad=route_critic, augment=True)
-            # No target encoder: live encoder under no_grad (DrQ-v2 convention).
-            next_feats = encode(b_next_obs, grad=False, augment=True)
+            # One augmentation draw per update, routed by augmentation.stage.
+            views = encode_views(
+                featurize,
+                embedding_net,
+                preprocess(b_obs),
+                augment if aug_module is not None else None,
+                task_aug=enc.task_aug,
+                task_grad=route_critic,
+                aux_needs_clean=enc.aux_needs_clean,
+                aux_needs_aug=enc.aux_needs_aug,
+                aux_grad_clean=aux_grad_clean,
+                aux_grad_aug=aux_grad_aug,
+            )
+            feats = views.feats_task
+            # next_obs gets the task's view, with its own independent draw
+            # (DrQ-v2 augments obs and next_obs separately). No target
+            # encoder: live encoder under no_grad (DrQ-v2 convention).
+            x_next = preprocess(b_next_obs)
+            if enc.task_aug:
+                x_next = augment(x_next)
+            next_feats = featurize(x_next, grad=False)
+
+            # First update and every log step; each measurement is a GPU sync.
+            if encoder_trains and (
+                collapse.initial is None or global_step % cfg.algo.log_frequency == 0
+            ):
+                collapse.update(feats, where=f"step {global_step:,}")
         else:
             feats, next_feats = b_obs, b_next_obs
 
@@ -447,13 +499,21 @@ def main(cfg: DictConfig) -> None:
         qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
         qf_loss = qf1_loss + qf2_loss
 
+        aux_total, aux_values = None, {}
+        if aux_terms:
+            aux_total, aux_values = total_aux_loss(aux_terms, views.aux)
+
         enc_step_now = route_critic or bool(aux_terms)
         enc_gnorm_critic = float("nan")
         enc_gnorm_actor = float("nan")
         if enc_step_now:
             enc_optimizer.zero_grad(set_to_none=True)
         q_optimizer.zero_grad()
-        qf_loss.backward()
+        # One backward for both: the critic and an aux loss can share an
+        # encoder graph (src/views.py), which a second backward couldn't
+        # traverse. Aux losses don't touch the Q networks, so the critic's
+        # gradients are unchanged; the encoder's are the sum, as before.
+        (qf_loss if aux_total is None else qf_loss + aux_total).backward()
         q_gnorm = float(
             torch.nn.utils.clip_grad_norm_(
                 list(qf1.parameters()) + list(qf2.parameters()),
@@ -462,12 +522,6 @@ def main(cfg: DictConfig) -> None:
         )
         q_optimizer.step()
 
-        aux_total, aux_values = None, {}
-        if aux_terms:
-            aux_total, aux_values = total_aux_loss(
-                aux_terms, AuxBatch(encoder=embedding_net)
-            )
-            aux_total.backward()
         if enc_step_now:
             enc_gnorm_critic = float(
                 torch.nn.utils.clip_grad_norm_(
@@ -483,8 +537,9 @@ def main(cfg: DictConfig) -> None:
                     if route_actor:
                         # Re-encode with grad each inner iteration: the
                         # encoder may have just been updated, and the critic
-                        # phase's graph is already consumed.
-                        feats_pi = encode(b_obs, grad=True, augment=True)
+                        # phase's graph is already consumed. Same pixels (and
+                        # augmentation draw) the critic saw.
+                        feats_pi = featurize(views.x_task, grad=True)
                     else:
                         # Reuse critic-phase features (detached). If the
                         # encoder stepped this iteration these are stale by
@@ -560,6 +615,7 @@ def main(cfg: DictConfig) -> None:
                 f"  gnorm(q/actor)={q_gnorm:.2f}/{actor_gnorm:.2f}"
                 + (
                     f"  enc_gnorm(c/a)={enc_gnorm_critic:.2f}/{enc_gnorm_actor:.2f}"
+                    f"  emb_std_ratio={collapse.ratio:.2f}"
                     if encoder_trains
                     else ""
                 )
@@ -586,6 +642,8 @@ def main(cfg: DictConfig) -> None:
                     log["train/encoder_grad_norm_critic"] = enc_gnorm_critic
                     log["train/encoder_grad_norm_actor"] = enc_gnorm_actor
                     log["train/encoder_drift_l2"] = encoder_drift()
+                    log["train/embedding_std"] = collapse.current
+                    log["train/embedding_std_ratio"] = collapse.ratio
                     if aux_total is not None:
                         log["train/aux_loss"] = aux_total.item()
                         for name, value in aux_values.items():
