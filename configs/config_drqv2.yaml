@@ -1,0 +1,13 @@
+# train_drqv2.py: config_sac.yaml (env, embedding, encoder.*, augmentation,
+# buffer_obs, wandb, ...) with the DrQ-v2 agent.
+defaults:
+  - config_sac
+  - override algo: drqv2
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/drqv2/${env.name}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/drqv2_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${embedding.name}_seed${seed}

@@ -355,7 +355,9 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             if enc_optimizer is not None:
-                torch.nn.utils.clip_grad_norm_(enc_params, max_norm=cfg.encoder.grad_clip)
+                clip = cfg.encoder.grad_clip
+                torch.nn.utils.clip_grad_norm_(
+                    enc_params, max_norm=float("inf") if clip is None else clip)
                 enc_optimizer.step()
             optimizer.step()
             train_loss += loss.item()

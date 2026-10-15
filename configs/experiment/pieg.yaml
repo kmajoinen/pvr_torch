@@ -1,0 +1,28 @@
+# @package _global_
+# PIE-G (Yuan et al., 2022): frozen ImageNet ResNet18 up to layer2 at native
+# 84px, BatchNorm adapting, 3 frames fused by differences, a trainable
+# linear head fed by the critic, random shift + random overlay strong view.
+#   python train_drqv2.py +experiment=pieg env=dmc_walker \
+#       augmentation.strong.params.image_dir=/path/to/places365/val_256
+# With train_drqv2.py this is PIE-G's full recipe; train_sac.py also takes
+# it (PIE-G's encoder on SAC).
+defaults:
+  - override /embedding: resnet18
+  - override /augmentation: pieg
+
+env:
+  image_size: 84
+
+embedding:
+  preprocess: {resize: null, crop: null, mean: [0.5, 0.5, 0.5], std: [1.0, 1.0, 1.0]}
+  layer: layer2
+  head: linear
+  frame_stack: 3
+  frame_fusion: diff
+
+encoder:
+  grads: critic
+  trainable: head
+  lr: 1.0e-4          # PIE-G trains its head at the actor/critic rate
+  grad_clip: null     # and doesn't clip (DrQ-v2)
+  bn: adapt

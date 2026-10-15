@@ -1,0 +1,24 @@
+# DrQ-v2 (train_drqv2.py). Defaults follow facebookresearch/drqv2's easy-task
+# config; steps are agent steps (x action_repeat env frames).
+name: drqv2
+total_timesteps: 500_000      # agent steps (1M frames at action_repeat 2)
+action_repeat: 2              # env frames per agent step (rewards summed)
+buffer_size: 1_000_000
+learning_starts: 2000         # uniform random actions, no updates, until here
+batch_size: 256
+nstep: 3                      # n-step returns (never cross an episode end)
+gamma: 0.99
+lr: 1.0e-4                    # actor and critic; the encoder uses encoder.lr
+feature_dim: 50               # trunk width (Linear + LayerNorm + Tanh)
+hidden_dim: 1024
+tau: 0.01                     # target critic soft update, after every update
+update_every_steps: 2
+stddev_schedule:              # exploration std: linear init -> final over
+  init: 1.0                   #   `duration` agent steps (DrQ-v2: 100k for
+  final: 0.1                  #   easy tasks, 500k for medium)
+  duration: 100_000
+stddev_clip: 0.3              # noise clip for target and actor-update actions
+grad_clip: null               # null: no clipping (DrQ-v2); norms still logged
+log_frequency: 1000           # agent steps; multiples of update_every_steps
+eval_frequency: 10_000
+n_episodes_test: 5

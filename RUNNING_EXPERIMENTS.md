@@ -10,6 +10,10 @@ training and augmentation work. This complements `README.md` rather than replaci
   Supports frozen-fast PVR, slow-frozen PVR, PVR finetune (with gradient
   routing), aux losses, augmentation, and state-only baselines. Config:
   `configs/config_sac.yaml`.
+- **`train_drqv2.py`** — DrQ-v2's agent with the same encoder, augmentation,
+  buffer and wandb setup as `train_sac.py` (every `encoder.*`/`augmentation`
+  option works the same). Config: `configs/config_drqv2.yaml` (=
+  `config_sac.yaml` with `algo: drqv2`). See [DrQ-v2](#drq-v2-train_drqv2py).
 - **`train_sac_sb3.py`** — kept for posterity, Stable-Baselines3-backed.
   Supports state / CNN-from-scratch (SB3's NatureCNN) / frozen PVR (fast and
   slow) / PVR finetune (actor-only gradient routing, no `encoder.grads`
@@ -17,7 +21,8 @@ training and augmentation work. This complements `README.md` rather than replaci
   `configs/config_sac_sb3.yaml`. Use this specifically if you need SB3's
   `CnnPolicy` baseline or don't care about gradient-routing control.
 
-Everything below is about `train_sac.py` unless stated otherwise.
+Everything below is about `train_sac.py` unless stated otherwise; it all
+applies to `train_drqv2.py` as well.
 
 ## Environments
 
@@ -34,6 +39,7 @@ Only `configs/env/*.yaml` files that have a `builder:` field work with
 `train_sac.py`. Currently that's:
 
 - `dm_control_pixels.yaml` / `dm_control_state.yaml` (`dm_control/cheetah-run-v0`, pixels/state) — also the generic template for any other dm_control domain/task, see below
+- `dmc_walker.yaml` (`dm_control/walker-walk-v0`, pixels)
 - `carracing_pixels.yaml` (`builder: carracing`)
 - `pendulum.yaml` (`builder: state`, `Pendulum-v1`)
 - `adroit_door_pixels.yaml` / `adroit_door_state.yaml`, and the same `_pixels`/`_state` pair for `adroit_hammer`, `adroit_pen`, `adroit_relocate` (`builder: gym`/`state`)
@@ -60,7 +66,7 @@ dedicated file per combo — same pattern as `embedding.name=` overriding a
 base embedding config. Just override on the CLI:
 ```bash
 python train_sac.py env=dm_control_pixels env.id=dm_control/finger-spin-v0 env.name=dmc_finger_spin
-python train_sac.py env=dm_control_pixels env.id=dm_control/walker-walk-v0 env.name=dmc_walker
+python train_sac.py env=dm_control_pixels env.id=dm_control/reacher-easy-v0 env.name=dmc_reacher_easy
 ```
 (Adroit/FrankaKitchen got dedicated files instead, unlike dm_control, because each hand-manipulation task is a genuinely distinct env id with no shared domain/task template to override into — `AdroitHandDoor-v1`, `AdroitHandHammer-v1`, etc. aren't parameterizations of one base config the way dm_control ids are.)
 
@@ -210,18 +216,16 @@ layers remain available as their own encoder names (`resnet50_l3`,
   `train/qf_loss_strong` (BC: `train/bc_loss_strong`). The `pieg` preset is
   random shift plus an overlay strong view at weight 0.5.
 
-PIE-G's encoder recipe, on SAC:
+PIE-G's full recipe is the preset `configs/experiment/pieg.yaml` (all of
+the above plus layer2 at native 84px with a trainable linear head), on
+DrQ-v2 as in the paper, or on SAC:
 ```bash
-python train_sac.py embedding=resnet18 env.image_size=84 \
-    '+embedding.preprocess={resize:null,crop:null,mean:[0.5,0.5,0.5],std:[1.0,1.0,1.0]}' \
-    +embedding.layer=layer2 +embedding.head=linear \
-    +embedding.frame_stack=3 +embedding.frame_fusion=diff \
-    encoder.grads=critic encoder.trainable=head encoder.lr=1e-4 encoder.bn=adapt \
-    augmentation=pieg augmentation.strong.params.image_dir=/path/to/places365/val_256
+python train_drqv2.py +experiment=pieg env=dmc_walker \
+    augmentation.strong.params.image_dir=/path/to/places365/val_256
+python train_sac.py +experiment=pieg augmentation.strong.params.image_dir=...
 ```
-What still differs from PIE-G is the RL algorithm: PIE-G is DrQ-v2 (DDPG
-with n-step returns, scheduled exploration noise, and per-network
-Linear-LayerNorm-Tanh trunks), not SAC.
+Presets in `configs/experiment/` set a method's whole recipe; anything can
+still be overridden after them on the command line.
 
 `src/embeddings.py::_get_embedding()` supports quite a few more names than
 have a dedicated yaml file (e.g. `resnet50_l3`, `resnet50_l4`,
@@ -368,8 +372,7 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   `84`) and/or shrink `algo.buffer_size` for pixel-buffer runs.
 - **BatchNorm**: the encoder stays in `eval()` even while it trains, so
   BatchNorm running statistics never update (trainable BN affine params
-  only). Methods that rely on adapting BN statistics to RL frames, such as
-  PIE-G, can't be reproduced as published.
+  only), unless `encoder.bn=adapt` (see PIE-G options above).
 - **Migrating from `finetune.*`** (`config_version` 1): `finetune.enabled`
   is gone and any `finetune.*` key raises with a translation table.
   `finetune.encoder_grads` → `encoder.grads`, `encoder_lr`/`encoder_betas`/
@@ -410,6 +413,55 @@ python train_sac.py augmentation=random_shift augmentation.stage=both encoder.gr
 # BC with the BC loss training the encoder, plus augmentation
 python train_bc.py embedding=resnet18 encoder.grads=policy augmentation=random_shift
 ```
+
+## DrQ-v2 (`train_drqv2.py`)
+
+DrQ-v2's agent (Yarats et al. 2021; `src/rl/drqv2.py`,
+`configs/algo/drqv2.yaml`, defaults from its easy-task config): a
+deterministic tanh actor with scheduled exploration noise
+(`algo.stddev_schedule`, linear from `init` to `final` over `duration`
+agent steps; no entropy term), twin critics on n-step targets
+(`algo.nstep: 3`) with a clipped-noise target action (`algo.stddev_clip`),
+one update per `algo.update_every_steps` agent steps, and a
+Linear-LayerNorm-Tanh trunk (`algo.feature_dim`) in front of each MLP.
+Uniform random actions until `algo.learning_starts`.
+
+```bash
+# DrQ-v2 as published: critic-trained encoder, random shift
+python train_drqv2.py env=dmc_walker embedding=resnet18 env.image_size=84 encoder.grads=critic augmentation=random_shift
+
+# Frozen PVR on DrQ-v2 (the default encoder settings)
+python train_drqv2.py embedding=r3m_resnet50 env.image_size=112
+```
+
+- **Steps**: `algo.action_repeat: 2` env frames per agent step (rewards
+  summed). `total_timesteps`, `learning_starts`, the schedule and all
+  frequencies count agent steps; `charts/frames` logs env frames, the x-axis
+  DrQ-v2 papers use. `log_frequency`/`eval_frequency` must be multiples of
+  `update_every_steps`.
+- **Encoder**: DrQ-v2's own conv encoder isn't included; any embedding
+  works. DrQ-v2 trains its encoder from the critic only
+  (`encoder.grads=critic`); `encoder.lr` stays separate from `algo.lr`.
+- **Metrics** reuse `train_sac.py`'s keys where they mean the same thing
+  (`train/qf*_loss`, `train/qf*_values`, `train/target_q_mean`,
+  `train/actor_loss`, grad norms, encoder metrics, `eval/*`), plus
+  `train/actor_stddev`. Runs are named `drqv2_...`.
+- **`algo.grad_clip: null`** (DrQ-v2 doesn't clip); grad norms are still
+  logged. The encoder clips separately at `encoder.grad_clip` (null: no
+  clipping, as in the `pieg` preset).
+- **Deviation from the reference**: DrQ-v2's buffer only samples starts
+  with a full n-step window, so the last `nstep - 1` transitions of each
+  episode are never trained on. Here they are, with the shorter window that
+  remains (~0.4% of transitions at 500 agent steps per episode).
+
+`algo.nstep` and `algo.action_repeat` also exist for `train_sac.py`
+(default 1). SAC's n-step target, `r_t + γ r_{t+1} + ... + γ^n (Q - α log π)(s_{t+n})`,
+leaves out the entropy bonuses of the intermediate steps -- the usual
+simplification, so `nstep > 1` isn't exactly soft Q-learning. The replay buffer (`src/rl/buffer.py`, shared by both) keeps
+each episode's real final observation, so a truncated episode (time limit)
+bootstraps from its own last state; before, its last transition's next_obs
+was the next episode's first frame. n-step returns never cross an episode
+end, and a terminated step gets discount 0.
 
 ## Cluster job scripts
 

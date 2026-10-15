@@ -73,14 +73,17 @@ Design notes:
     vectors skip it: per-sample LN on a ~17-dim state aliases states that
     differ by uniform shift/scale and destroys magnitude information.
   - Bootstrapping is masked on `terminated` only, so truncation-only envs
-    (dm_control, 1000-step episodes) bootstrap through the time limit.
+    (dm_control, 1000-step episodes) bootstrap through the time limit, from
+    the episode's real final observation (src/rl/buffer.py). algo.nstep
+    gives n-step targets; algo.action_repeat repeats each action.
   - No target encoder: target-Q features come from the live encoder under
     no_grad (DrQ-v2 convention -- target networks exist for the Q heads only).
   - Encoder stays in eval() mode even while its weights train: pretrained
     ResNets carry BatchNorm, and letting BN running stats update on RL frames
     is a known silent-corruption source (and the failure mode behind this
     project's original resnet50 NaN). Frozen BN statistics, trainable BN
-    affine params -- the standard finetuning choice.
+    affine params -- the standard finetuning choice. encoder.bn=adapt
+    opts into updating them (PIE-G).
   - Pixel buffer memory: uint8 pixels cost buffer_size * H * W * 3 bytes
     (next_obs is derived from the following slot, not stored). At 224px
     that is ~15 GB per 100k -- override env.image_size (e.g. 112 or 84) or
@@ -97,6 +100,7 @@ Usage:
         env.image_size=112                                      # aux-only adaptation
     python train_sac.py env=pendulum embedding=none      # state-based sanity check
 """
+
 
 import os
 
@@ -121,16 +125,21 @@ from src.encoder_config import (
     resolve_buffer_obs,
     warn_unused_encoder_overrides,
 )
-from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
-from src.views import CollapseMonitor, encode_views
-from src.sac_utils import (
-    Actor,
-    ReplayBuffer,
-    SoftQNetwork,
-    _success_fn_for,
-    evaluate,
-    make_env,
+from src.losses import total_aux_loss
+from src.rl.buffer import ReplayBuffer
+from src.rl.common import (
+    EncoderOptim,
+    Encoding,
+    build_encoder_stack,
+    encode_replay_batch,
+    encoder_log,
+    encoder_record,
+    init_wandb,
+    log_episode,
+    log_eval,
 )
+from src.sac_utils import Actor, SoftQNetwork, _success_fn_for, evaluate, make_env
+from src.views import CollapseMonitor
 
 # ------------------------------------------------------------------------------
 # Main
@@ -163,137 +172,13 @@ def main(cfg: DictConfig) -> None:
     # Adapting BatchNorm statistics change the encoder without training it,
     # so it's saved then too.
     save_encoder = encoder_trains or enc.bn_adapt
-    if encoder_trains:
-        print(
-            f"Encoder trains: grads={routing}  aux={enc.aux_names}"
-            f"  lr={cfg.encoder.lr}"
-        )
 
-    # ── Encoder ───────────────────────────────────────────────────────────────
+    # ── Encoder, wandb, envs (src/rl/common.py) ───────────────────────────────
+    stack = build_encoder_stack(cfg, enc, emb_kwargs, device, pixels_in_buffer, buffer_reason)
+    embedding_net, pixels_in_buffer = stack.net, stack.pixels_in_buffer
     emb_name = cfg.embedding.get("name", None)
-    embedding_net = None
-    aug_module = None
-    strong_module = None
-    if emb_name is not None:
-        from src.augmentations import build_augmentation
-        from src.embeddings import EmbeddingNet
+    wandb = init_wandb(cfg, "sac", enc, stack)
 
-        # Only ever non-None on the pixel path (resolve_buffer_obs guarantees
-        # augmentation => pixels), so this banner means it really runs.
-        aug_module = build_augmentation(cfg.augmentation)
-        if aug_module is not None:
-            aug_module = aug_module.to(device)
-            print(
-                f"Augmentation: {enc.aug_name}  stage={enc.aug_stage}"
-                f"  params={dict(cfg.augmentation.get('params') or {})}"
-                "  (replay-batch encodes only; rollouts/eval stay clean)"
-            )
-        if enc.strong_name is not None:
-            strong_module = build_augmentation(cfg.augmentation.strong).to(device)
-            print(
-                f"Strong view: {enc.strong_name}  weight={enc.strong_weight}"
-                f"  params={dict(cfg.augmentation.strong.get('params') or {})}"
-                "  (on top of the task view; critic loss only)"
-            )
-
-        frame_stack = cfg.embedding.get("frame_stack", 1)
-        embedding_net = EmbeddingNet(
-            emb_name,
-            pretrained=True,
-            train=encoder_trains,
-            disable_cuda=(str(device) == "cpu"),
-            model_dir=cfg.model_dir,
-            input_size=cfg.env.get("image_size"),
-            **emb_kwargs,
-        )
-        # eval() ALWAYS, even while weights train: freeze BatchNorm running
-        # stats (see module docstring). Trainability is controlled purely via
-        # requires_grad below, never via train()-mode.
-        embedding_net.eval()
-        trainable = enc.trainable if encoder_trains else "none"
-        embedding_net.set_trainable(trainable)
-        if enc.bn_adapt and not embedding_net.has_batchnorm():
-            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers")
-        if enc.bn_adapt:
-            bn_ref = embedding_net.bn_stats()   # as loaded; for train/bn_stat_drift
-        print(
-            f"\nEmbedding: {emb_name}  →  obs_size: {embedding_net.out_size}"
-            f"  (trainable={trainable})"
-            + "".join(f"  {k}={v}" for k, v in emb_kwargs.items())
-        )
-        head_params = sum(p.numel() for p in embedding_net.head.parameters())
-        if head_params:
-            print(f"Encoder head: {head_params / 1e6:.1f}M parameters")
-
-        # The fast path stores features; when a wide output (e.g. head=flatten
-        # on an early layer) makes each feature vector bigger than the frame
-        # it came from, pixels are the cheaper thing to store.
-        frame_side = cfg.env.get("image_size")
-        if (not pixels_in_buffer and str(cfg.get("buffer_obs", "auto")) == "auto"
-                and frame_side):
-            frame_bytes = 3 * frame_stack * frame_side ** 2
-            feat_bytes = 4 * embedding_net.out_size
-            if feat_bytes > frame_bytes:
-                pixels_in_buffer = True
-                buffer_reason = (
-                    f"pixels (auto: a {embedding_net.out_size}-dim float32 feature "
-                    f"takes {feat_bytes / frame_bytes:.1f}x the memory of a "
-                    f"{frame_side}px frame; every update re-encodes the batch)"
-                )
-
-    # ── Weights & Biases ──────────────────────────────────────────────────────
-    # After the encoder: the buffer decision can still change there (the
-    # memory guard above), and the run name and logged config should
-    # describe the run that actually happens.
-    use_wandb = cfg.wandb.enabled
-    if use_wandb:
-        import wandb
-
-        emb_tag = cfg.embedding.get("name") or "state"
-        layer = cfg.embedding.get("layer")
-        if layer is not None:
-            emb_tag += f"-L{layer}" if isinstance(layer, int) else f"-{layer}"
-        if cfg.embedding.get("head") is not None:
-            emb_tag += f"-{cfg.embedding.head}"
-        if embedding_net is not None and embedding_net.frame_stack > 1:
-            emb_tag += f"-fs{embedding_net.frame_stack}{embedding_net.frame_fusion}"
-        # Run names are labels only; charts are keyed by the logged metric
-        # names, which stay fixed for continuity.
-        tags = ""
-        if encoder_trains:
-            tags += "_ft-" + "-".join([routing] + enc.aux_names)
-        if enc.bn_adapt:
-            tags += "_bnadapt"
-        if enc.aug_name is not None:
-            tags += f"_aug-{enc.aug_name}" + (
-                f"-{enc.aug_stage}" if enc.aug_stage != "rl" else ""
-            )
-        if enc.strong_name is not None:
-            tags += f"_strong-{enc.strong_name}"
-        if (pixels_in_buffer and not encoder_trains and enc.aug_name is None
-                and enc.strong_name is None and not enc.bn_adapt):
-            tags += "_slowfrozen"
-        run_name = (
-            cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{tags}_s{cfg.seed}"
-        )
-        wandb_config = OmegaConf.to_container(cfg, resolve=True)
-        wandb_config["buffer_obs_resolved"] = "pixels" if pixels_in_buffer else "features"
-        wandb_config["buffer_obs_reason"] = buffer_reason
-        if embedding_net is not None and embedding_net.build_warnings:
-            # Printed during construction, before wandb started; log them so
-            # a reloaded encoder built differently is visible in the run too.
-            wandb_config["encoder_build_warnings"] = embedding_net.build_warnings
-        wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            name=run_name,
-            mode=cfg.wandb.get("mode", "online"),
-            config=wandb_config,
-            save_code=True,
-        )
-        print(f"wandb run: {wandb.run.url}")
-
-    # ── Envs ──────────────────────────────────────────────────────────────────
     # Features path: env wrapper encodes, buffer stores features.
     # Pixels path: env emits pixels, encoding happens in the loop.
     wrap = not pixels_in_buffer
@@ -303,73 +188,14 @@ def main(cfg: DictConfig) -> None:
     env.action_space.seed(cfg.seed)
 
     action_dim = int(np.prod(env.action_space.shape))
+    obs_shape = env.observation_space.shape   # (H, W, C) uint8, or (feat_dim,) / state
     if pixels_in_buffer:
-        obs_shape = env.observation_space.shape  # (H, W, C) uint8
         feat_dim = int(embedding_net.out_size)
         buffer_dtype = np.uint8
     else:
-        obs_shape = env.observation_space.shape  # (feat_dim,) or state
         feat_dim = int(np.prod(obs_shape))
         buffer_dtype = np.float32
-
-    # ── Encoding helper (pixels path) ─────────────────────────────────────────
-    amp_on = cfg.perf.amp_bf16 and device.type == "cuda"
-    _grad_contract_checked = False
-
-    # Three steps, so augmentation sits between preprocessing and the
-    # encoder (at the encoder's input resolution) and a view can be encoded
-    # more than once without re-drawing it -- see src/views.py.
-    def preprocess(obs_batch) -> torch.Tensor:
-        """(B, H, W, C) uint8 (tensor or ndarray) -> float (B, C, h, w) in
-        [0, 1] at the encoder's input resolution. Same layout/dtype contract
-        as FrozenEncoderWrapper."""
-        x = (
-            torch.as_tensor(np.ascontiguousarray(obs_batch))
-            if not torch.is_tensor(obs_batch)
-            else obs_batch
-        )
-        x = x.to(device).permute(0, 3, 1, 2)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
-            return embedding_net.preprocess(x)
-
-    def augment(x: torch.Tensor) -> torch.Tensor:
-        """Replay-batch views only -- never rollout-time action selection or
-        eval(), where the encoder should see the real observation. Runs in
-        fp32, outside autocast: it's cheap next to the encoder, and under
-        autocast kornia's convolutions (e.g. blur) would compute the
-        augmented view in bf16 -- the output is still fp32, but rounded by
-        up to ~2 uint8 levels while the clean view stays exact."""
-        with torch.no_grad():
-            return aug_module(x)
-
-    def strong_augment(x: torch.Tensor) -> torch.Tensor:
-        """The strong view (augmentation.strong), applied on top of the task
-        view; same conventions as augment()."""
-        with torch.no_grad():
-            return strong_module(x)
-
-    def featurize(x: torch.Tensor, grad: bool) -> torch.Tensor:
-        """preprocess() output (optionally augmented) -> (B, feat_dim) float32."""
-        nonlocal _grad_contract_checked
-        ctx = torch.enable_grad() if grad else torch.no_grad()
-        with ctx, torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp_on):
-            feats = embedding_net.encode_preprocessed(x)
-        if grad and not _grad_contract_checked:
-            # TODO(EmbeddingNet contract): if this trips, EmbeddingNet.encode
-            # breaks the graph internally (no_grad/inference_mode, a numpy
-            # round-trip, or a non-differentiable jit path, e.g. some CLIP
-            # torch.jit archives). Fix inside src/embeddings.py for
-            # train=True, or add a grad-capable encode_train() there.
-            assert (
-                torch.is_tensor(feats) and feats.requires_grad
-            ), "EmbeddingNet.encode returned a graph-less result under enable_grad"
-            _grad_contract_checked = True
-        if not torch.is_tensor(feats):
-            feats = torch.as_tensor(feats, device=device)
-        return feats.float()
-
-    def encode_single(obs_np) -> torch.Tensor:
-        return featurize(preprocess(np.asarray(obs_np)[None]), grad=False)
+    E = Encoding(stack, device, cfg.perf.amp_bf16)
 
     # ── Networks / optimizers ─────────────────────────────────────────────────
     hidden = list(cfg.algo.net_arch)
@@ -381,7 +207,6 @@ def main(cfg: DictConfig) -> None:
     if obs_norm is None:
         obs_norm = emb_name is not None
     actor = Actor(feat_dim, action_dim, hidden, env.action_space, obs_norm).to(device)
-    assert isinstance(actor.obs_norm, torch.nn.Identity if emb_name is None else torch.nn.LayerNorm), f"obs_norm wiring wrong for emb_name={emb_name}"
     qf1 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
     qf2 = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
     qf1_target = SoftQNetwork(feat_dim, action_dim, hidden, obs_norm).to(device)
@@ -396,40 +221,7 @@ def main(cfg: DictConfig) -> None:
     actor_optimizer = optim.Adam(
         actor.parameters(), lr=cfg.algo.policy_lr, betas=tuple(cfg.algo.policy_betas)
     )
-
-    enc_optimizer, theta0, enc_params, aux_terms = None, None, [], []
-    if encoder_trains:
-        aux_terms = build_aux_losses(enc.aux_specs, embedding_net)
-        for t in aux_terms:
-            t.loss.to(device)
-        # Learnable heads owned by aux losses train alongside the encoder.
-        enc_params = list(embedding_net.parameters()) + [
-            p for t in aux_terms for p in t.loss.parameters()
-        ]
-        # Separate, much lower LR: at the head LRs a resnet18's weight sums
-        # drift ~3% in 50 gradient steps (measured) -- far too fast for a
-        # pretrained representation you want to adapt, not destroy.
-        enc_optimizer = optim.Adam(
-            enc_params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
-        )
-        # Kept on CPU: only read for the drift metric at log time, and a GPU
-        # copy would double the encoder's memory (l2sp keeps its own anchor).
-        # Backbone only: a trainable head's drift from its random init would
-        # dominate the metric and make it incomparable across routings.
-        theta0 = {
-            n: p.detach().cpu().clone()
-            for n, p in embedding_net.embedding.named_parameters()
-        }
-    aux_grad_clean, aux_grad_aug = aux_grad_views(aux_terms)
-
-    def encoder_drift() -> float:
-        with torch.no_grad():
-            return float(
-                sum(
-                    ((p.detach().cpu() - theta0[n]) ** 2).sum()
-                    for n, p in embedding_net.embedding.named_parameters()
-                ).sqrt()
-            )
+    eo = EncoderOptim(cfg, enc, embedding_net, device)
 
     # automatic entropy tuning
     if cfg.algo.autotune_alpha:
@@ -442,9 +234,10 @@ def main(cfg: DictConfig) -> None:
     else:
         alpha = cfg.algo.alpha
 
-    print(f"\nBuffer stores: {buffer_reason}")
+    print(f"\nBuffer stores: {stack.buffer_reason}")
     rb = ReplayBuffer(
-        cfg.algo.buffer_size, obs_shape, action_dim, device, obs_dtype=buffer_dtype
+        cfg.algo.buffer_size, obs_shape, action_dim, device, obs_dtype=buffer_dtype,
+        nstep=int(cfg.algo.get("nstep", 1)), gamma=cfg.algo.gamma,
     )
     save_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     best_eval_return = -float("inf")
@@ -455,14 +248,7 @@ def main(cfg: DictConfig) -> None:
         f"(learning starts at {cfg.algo.learning_starts:,})"
     )
     obs, _ = env.reset(seed=cfg.seed)
-    if aug_module is not None:
-        # One real frame through preprocess -> augmentation now, so an input
-        # contract violation (value range, channel count, non-square frame)
-        # fails at startup rather than at the first update after
-        # learning_starts. This is also where the one-time range check runs.
-        augment(preprocess(np.asarray(obs)[None]))
-    if strong_module is not None:
-        strong_augment(preprocess(np.asarray(obs)[None]))
+    E.check_augmentations(obs)
     t0 = time.time()
     # Per-phase encoder grad norms: each written ONLY by its own phase and
     # reset when that phase doesn't step this global_step -- so `both` mode
@@ -478,7 +264,7 @@ def main(cfg: DictConfig) -> None:
             action = env.action_space.sample()
         else:
             if pixels_in_buffer:
-                obs_t = encode_single(obs)
+                obs_t = E.encode_single(obs)
             else:
                 obs_t = torch.as_tensor(
                     obs, dtype=torch.float32, device=device
@@ -489,25 +275,13 @@ def main(cfg: DictConfig) -> None:
 
         next_obs, reward, terminated, truncated, info = env.step(action)
 
-        # bootstrap mask uses `terminated` only: on truncation (time limit)
-        # the value of next_obs is still real and should be bootstrapped.
-        rb.add(obs, next_obs, action, reward, terminated)
+        # The buffer keeps the episode's real final observation, and its
+        # discounts mask only termination: on truncation (time limit) the
+        # value of next_obs is still real and is bootstrapped.
+        rb.add(obs, next_obs, action, reward, terminated, truncated)
 
         if terminated or truncated:
-            ep = info.get("episode")
-            if ep is not None:
-                print(
-                    f"  step {global_step:>8,}  episodic_return={float(ep['r']):8.1f}"
-                )
-                if use_wandb:
-                    wandb.log(
-                        {
-                            "charts/episodic_return": float(ep["r"]),
-                            "charts/episodic_length": int(ep["l"]),
-                            "global_step": global_step,
-                        },
-                        step=global_step,
-                    )
+            log_episode(info, global_step, wandb)
             obs, _ = env.reset()
         else:
             obs = next_obs
@@ -516,7 +290,7 @@ def main(cfg: DictConfig) -> None:
             continue
 
         # ---- sample + featurize -----------------------------------------------
-        b_obs, b_next_obs, b_actions, b_rewards, b_terms = rb.sample(
+        b_obs, b_next_obs, b_actions, b_rewards, b_discounts = rb.sample(
             cfg.algo.batch_size
         )
 
@@ -531,32 +305,10 @@ def main(cfg: DictConfig) -> None:
 
         feats_strong = None
         if pixels_in_buffer:
-            # One augmentation draw per update, routed by augmentation.stage.
-            views = encode_views(
-                featurize,
-                embedding_net,
-                preprocess(b_obs),
-                augment if aug_module is not None else None,
-                task_aug=enc.task_aug,
-                task_grad=route_critic,
-                aux_needs_clean=enc.aux_needs_clean,
-                aux_needs_aug=enc.aux_needs_aug,
-                aux_grad_clean=aux_grad_clean,
-                aux_grad_aug=aux_grad_aug,
+            views, next_feats, feats_strong = encode_replay_batch(
+                E, stack, enc, eo, b_obs, b_next_obs, task_grad=route_critic
             )
             feats = views.feats_task
-            # next_obs gets the task's view, with its own independent draw
-            # (DrQ-v2 augments obs and next_obs separately). No target
-            # encoder: live encoder under no_grad (DrQ-v2 convention).
-            x_next = preprocess(b_next_obs)
-            if enc.task_aug:
-                x_next = augment(x_next)
-            next_feats = featurize(x_next, grad=False)
-            if strong_module is not None:
-                # SVEA-style strong view: on top of the task view, for the
-                # critic loss only; targets stay on the task view's next_obs.
-                feats_strong = featurize(strong_augment(views.x_task), grad=route_critic)
-
             # Every log step (each measurement is a GPU sync); the baseline is
             # set after CollapseMonitor's warmup, counted in updates.
             if encoder_trains and global_step % cfg.algo.log_frequency == 0:
@@ -571,9 +323,7 @@ def main(cfg: DictConfig) -> None:
             qf1_next = qf1_target(next_feats, next_actions)
             qf2_next = qf2_target(next_feats, next_actions)
             min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_log_pi
-            next_q_value = b_rewards + (
-                1 - b_terms
-            ) * cfg.algo.gamma * min_qf_next.view(-1)
+            next_q_value = b_rewards + b_discounts * min_qf_next.view(-1)
 
         qf1_a_values = qf1(feats, b_actions).view(-1)
         qf2_a_values = qf2(feats, b_actions).view(-1)
@@ -593,14 +343,14 @@ def main(cfg: DictConfig) -> None:
             critic_loss = (1 - w) * qf_loss + w * qf_loss_strong
 
         aux_total, aux_values = None, {}
-        if aux_terms:
-            aux_total, aux_values = total_aux_loss(aux_terms, views.aux)
+        if eo.aux_terms:
+            aux_total, aux_values = total_aux_loss(eo.aux_terms, views.aux)
 
-        enc_step_now = route_critic or bool(aux_terms)
+        enc_step_now = route_critic or bool(eo.aux_terms)
         enc_gnorm_critic = float("nan")
         enc_gnorm_actor = float("nan")
         if enc_step_now:
-            enc_optimizer.zero_grad(set_to_none=True)
+            eo.zero_grad()
         q_optimizer.zero_grad()
         # One backward for both: the critic and an aux loss can share an
         # encoder graph (src/views.py), which a second backward couldn't
@@ -614,14 +364,8 @@ def main(cfg: DictConfig) -> None:
             )
         )
         q_optimizer.step()
-
         if enc_step_now:
-            enc_gnorm_critic = float(
-                torch.nn.utils.clip_grad_norm_(
-                    enc_params, max_norm=cfg.encoder.grad_clip
-                )
-            )
-            enc_optimizer.step()
+            enc_gnorm_critic = eo.step()
 
         # ---- actor (+ alpha) update, delayed ------------------------------------
         if global_step % cfg.algo.policy_frequency == 0:
@@ -632,12 +376,12 @@ def main(cfg: DictConfig) -> None:
                         # encoder may have just been updated, and the critic
                         # phase's graph is already consumed. Same pixels (and
                         # augmentation draw) the critic saw.
-                        feats_pi = featurize(views.x_task, grad=True)
+                        feats_pi = E.featurize(views.x_task, grad=True)
                     else:
                         # Reuse critic-phase features (detached). If the
                         # encoder stepped this iteration these are stale by
-                        # exactly one enc_optimizer update -- negligible at
-                        # encoder_lr, and it saves a full encoder forward.
+                        # exactly one encoder update -- negligible at
+                        # encoder.lr, and it saves a full encoder forward.
                         feats_pi = feats.detach()
                 else:
                     feats_pi = feats
@@ -654,7 +398,7 @@ def main(cfg: DictConfig) -> None:
                 actor_loss = (alpha * log_pi - min_qf_pi).mean()
 
                 if route_actor:
-                    enc_optimizer.zero_grad(set_to_none=True)
+                    eo.zero_grad()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_gnorm = float(
@@ -664,12 +408,7 @@ def main(cfg: DictConfig) -> None:
                 )
                 actor_optimizer.step()
                 if route_actor:
-                    enc_gnorm_actor = float(
-                        torch.nn.utils.clip_grad_norm_(
-                            enc_params, max_norm=cfg.encoder.grad_clip
-                        )
-                    )
-                    enc_optimizer.step()
+                    enc_gnorm_actor = eo.step()
                 # Note: actor_loss.backward() also deposits gradients on
                 # qf1/qf2 params; q_optimizer.zero_grad() clears them before
                 # the next critic update (same ordering CleanRL relies on).
@@ -716,7 +455,7 @@ def main(cfg: DictConfig) -> None:
                     else ""
                 )
             )
-            if use_wandb:
+            if wandb is not None:
                 log = {
                     "train/qf1_loss": qf1_loss.item(),
                     "train/qf2_loss": qf2_loss.item(),
@@ -734,53 +473,23 @@ def main(cfg: DictConfig) -> None:
                 }
                 if cfg.algo.autotune_alpha:
                     log["train/alpha_loss"] = alpha_loss.item()
-                if enc.bn_adapt:
-                    log["train/bn_stat_drift"] = embedding_net.bn_stat_drift(bn_ref)
                 if qf_loss_strong is not None:
                     log["train/qf_loss_strong"] = qf_loss_strong.item() / 2.0
-                if encoder_trains:
-                    log["train/encoder_grad_norm_critic"] = enc_gnorm_critic
-                    log["train/encoder_grad_norm_actor"] = enc_gnorm_actor
-                    log["train/encoder_drift_l2"] = encoder_drift()
-                    log["train/embedding_std"] = collapse.current
-                    log["train/embedding_std_ratio"] = collapse.ratio
-                    if aux_total is not None:
-                        log["train/aux_loss"] = aux_total.item()
-                        for name, value in aux_values.items():
-                            log[f"train/aux/{name}"] = value
+                log.update(encoder_log(enc, stack, eo, collapse, enc_gnorm_critic,
+                                       enc_gnorm_actor, aux_total, aux_values))
                 wandb.log(log, step=global_step)
 
         # ---- periodic evaluation ----------------------------------------------------
         if global_step % cfg.algo.eval_frequency == 0:
             stats = evaluate(
-                actor,
+                lambda o: actor.get_action(o)[2],          # mean action
                 eval_env,
                 cfg.algo.n_episodes_test,
                 device,
-                encode_fn=encode_single if pixels_in_buffer else None,
+                encode_fn=E.encode_single if pixels_in_buffer else None,
                 success_fn=_success_fn_for(cfg.env.id),
             )
-            print(
-                f"  step {global_step:>8,}  EVAL return={stats['return_mean']:.1f}"
-                f"±{stats['return_std']:.1f}"
-                + (
-                    f"  success={stats['success_rate']:.2%}"
-                    if "success_rate" in stats
-                    else ""
-                )
-            )
-            if use_wandb:
-                log = {
-                    "eval/mean_reward": stats["return_mean"],
-                    "eval/std_reward": stats["return_std"],
-                    "global_step": global_step,
-                }
-                if "success_rate" in stats:
-                    log["eval/success_rate"] = stats["success_rate"]
-                wandb.log(
-                    log,
-                    step=global_step,
-                )
+            log_eval(stats, global_step, wandb)
             if stats["return_mean"] > best_eval_return:
                 best_eval_return = stats["return_mean"]
                 if cfg.save.enabled:
@@ -788,17 +497,8 @@ def main(cfg: DictConfig) -> None:
                         actor.state_dict(), os.path.join(save_dir, "best_actor.pt")
                     )
                     if save_encoder:
-                        # With the embedding config, so a reload with a
-                        # different layer/head/preprocess is flagged
-                        # (EmbeddingNet._load_checkpoint).
-                        torch.save(
-                            {
-                                "encoder": embedding_net.state_dict(),
-                                "embedding": OmegaConf.to_container(cfg.embedding, resolve=True),
-                                "input_size": embedding_net.input_size,
-                            },
-                            os.path.join(save_dir, "best_encoder.pt"),
-                        )
+                        torch.save(encoder_record(cfg, embedding_net),
+                                   os.path.join(save_dir, "best_encoder.pt"))
 
     # ── Final save ────────────────────────────────────────────────────────────
     if cfg.save.enabled:
@@ -809,15 +509,14 @@ def main(cfg: DictConfig) -> None:
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
         if save_encoder:
-            ckpt["encoder"] = embedding_net.state_dict()
-            ckpt["input_size"] = embedding_net.input_size
+            ckpt.update(encoder_record(cfg, embedding_net))
         torch.save(ckpt, os.path.join(save_dir, "final_checkpoint.pt"))
         print(f"\nSaved to: {save_dir}")
     print(f"Best eval return: {best_eval_return:.1f}")
 
     env.close()
     eval_env.close()
-    if use_wandb:
+    if wandb is not None:
         wandb.finish()
 
 

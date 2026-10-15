@@ -1,6 +1,7 @@
 """
-Env builders, replay buffer, and networks for train_sac.py's explicit SAC
-loop. Split out of train_sac.py to keep that file to the training loop
+Env builders, evaluation, and SAC networks for the explicit training loops
+(train_sac.py; the env builders and evaluate() are shared with
+train_drqv2.py). The replay buffer lives in src/rl/buffer.py. Split out of train_sac.py to keep that file to the training loop
 itself -- these pieces are self-contained (no closures over loop-local
 training state), so moving them here is a pure reorganization.
 
@@ -25,7 +26,31 @@ LOG_STD_MIN = -5
 # ------------------------------------------------------------------------------
 
 
-def _make_dmc(env_id: str, image_size: int):
+class ActionRepeat(gym.Wrapper):
+    """Repeat each action `repeat` times, summing the rewards and stopping
+    early if the episode ends (DrQ-v2 uses 2 on DMC). The builders apply it
+    to the base env, below any rendering wrapper, so only the frame the agent
+    actually sees is rendered."""
+
+    def __init__(self, env, repeat: int):
+        super().__init__(env)
+        self.repeat = repeat
+
+    def step(self, action):
+        total = 0.0
+        for _ in range(self.repeat):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total += float(reward)
+            if terminated or truncated:
+                break
+        return obs, total, terminated, truncated, info
+
+
+def _repeat(env, action_repeat: int):
+    return ActionRepeat(env, action_repeat) if action_repeat > 1 else env
+
+
+def _make_dmc(env_id: str, image_size: int, action_repeat: int = 1):
     import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
     from gymnasium.wrappers import AddRenderObservation
 
@@ -34,14 +59,14 @@ def _make_dmc(env_id: str, image_size: int):
         render_mode="rgb_array",
         render_kwargs=dict(height=image_size, width=image_size, camera_id=0),
     )
-    return AddRenderObservation(env, render_only=True)
+    return AddRenderObservation(_repeat(env, action_repeat), render_only=True)
 
 
-def _make_carracing(env_id: str, image_size: int):
-    return gym.make(env_id, render_mode="rgb_array")
+def _make_carracing(env_id: str, image_size: int, action_repeat: int = 1):
+    return _repeat(gym.make(env_id, render_mode="rgb_array"), action_repeat)
 
 
-def _make_gym(env_id: str, image_size: int):
+def _make_gym(env_id: str, image_size: int, action_repeat: int = 1):
     """Generic pixel builder for envs that don't natively emit pixel
     observations and don't support dm_control's render_kwargs convention
     (Adroit hand envs, FrankaKitchen): render_mode="rgb_array" + swap the
@@ -59,12 +84,12 @@ def _make_gym(env_id: str, image_size: int):
     import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
     from gymnasium.wrappers import AddRenderObservation, ResizeObservation
 
-    env = gym.make(env_id, render_mode="rgb_array")
+    env = _repeat(gym.make(env_id, render_mode="rgb_array"), action_repeat)
     env = AddRenderObservation(env, render_only=True)
     return ResizeObservation(env, (image_size, image_size))
 
 
-def _make_state(env_id: str, image_size: int):
+def _make_state(env_id: str, image_size: int, action_repeat: int = 1):
     if "dm_control" in env_id:
         import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
     elif "Adroit" in env_id or "FrankaKitchen" in env_id:
@@ -73,7 +98,7 @@ def _make_state(env_id: str, image_size: int):
     # (separate proprioceptive components) natively -- ReplayBuffer needs a
     # flat obs_shape, and a Dict space has no .shape at all. Box-observation
     # envs (e.g. Pendulum-v1) pass through this wrapper as a no-op.
-    return gym.wrappers.FlattenObservation(gym.make(env_id))
+    return gym.wrappers.FlattenObservation(_repeat(gym.make(env_id), action_repeat))
 
 
 ENV_BUILDERS = {
@@ -119,7 +144,10 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     (embedding.frame_fusion, see EmbeddingNet): `random` can take it as one
     wide input; pretrained backbones encode each frame and fuse the outputs.
     """
-    env = ENV_BUILDERS[cfg.env.builder](cfg.env.id, cfg.env.get("image_size", 84))
+    env = ENV_BUILDERS[cfg.env.builder](
+        cfg.env.id, cfg.env.get("image_size", 84),
+        action_repeat=int(cfg.algo.get("action_repeat", 1)),
+    )
     frame_stack = cfg.embedding.get("frame_stack", 1) if cfg.env.builder != "state" else 1
     if frame_stack > 1 and cfg.embedding.get("name") is not None:
         env = gym.wrappers.FrameStackObservation(env, frame_stack)
@@ -128,90 +156,6 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     if embedding_net is not None and wrap_encoder:
         env = FrozenEncoderWrapper(env, embedding_net, amp_bf16=cfg.perf.amp_bf16)
     return env
-
-
-# ------------------------------------------------------------------------------
-# Replay buffer (float32 feature/state vectors OR uint8 image frames)
-# ------------------------------------------------------------------------------
-
-
-class ReplayBuffer:
-    """
-    Stores obs once, not obs+next_obs separately -- next_obs is derived at
-    sample time as the following slot in the same circular array (same
-    scheme as SB3's ReplayBuffer(optimize_memory_usage=True), verified
-    against their actual sampling logic). Halves memory for pixel
-    observations, where next_obs is the same data as the following
-    transition's obs for every non-episode-boundary transition anyway.
-
-    Never samples index `pos` itself -- its "next" slot is either not
-    written yet (buffer not full) or belongs to whatever just overwrote it
-    (buffer full), not a valid successor. At true episode boundaries the
-    "next_obs" this derives is technically the start of a different
-    episode, not a real successor state -- same accepted imprecision as
-    SB3's implementation, harmless since terminated transitions never
-    bootstrap through next_obs in the loss (masked by 1 - terminated).
-    """
-
-    def __init__(
-        self,
-        capacity: int,
-        obs_shape: tuple,
-        action_dim: int,
-        device,
-        obs_dtype=np.float32,
-    ):
-        self.capacity = capacity
-        self.device = device
-        # Pre-flight estimate BEFORE allocating, so an oversized
-        # buffer_size/image_size combination announces itself instead of
-        # dying inside np.zeros.
-        itemsize = np.dtype(obs_dtype).itemsize
-        gb = capacity * int(np.prod(obs_shape)) * itemsize / 1e9
-        print(
-            f"Replay buffer: {capacity:,} x {obs_shape} {np.dtype(obs_dtype).name}"
-            f"  ({gb:.1f} GB for obs; next_obs derived, not stored separately)"
-        )
-        self.obs = np.zeros((capacity, *obs_shape), dtype=obs_dtype)
-        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.terminations = np.zeros(capacity, dtype=np.float32)
-        self.pos, self.full = 0, False
-
-    def add(self, obs, next_obs, action, reward, terminated):
-        # next_obs isn't stored -- the following add() call's obs becomes
-        # this transition's next_obs automatically once written to
-        # self.pos+1. Still taken as a parameter to keep this a drop-in
-        # call-site replacement (the caller always has both handy).
-        self.obs[self.pos] = obs
-        self.actions[self.pos] = action
-        self.rewards[self.pos] = reward
-        self.terminations[self.pos] = float(terminated)
-        self.pos = (self.pos + 1) % self.capacity
-        self.full = self.full or self.pos == 0
-
-    def __len__(self):
-        return self.capacity if self.full else self.pos
-
-    def sample(self, batch_size: int):
-        if self.full:
-            # Offset uniformly in [1, capacity) from pos, so idx is never
-            # pos itself and idx+1 is always a genuinely-written slot.
-            idx = (self.pos + np.random.randint(1, self.capacity, size=batch_size)) % self.capacity
-        else:
-            idx = np.random.randint(0, self.pos, size=batch_size)
-        next_idx = (idx + 1) % self.capacity
-        to = lambda x: torch.as_tensor(x, device=self.device)
-        # TODO(augmentation): per-sample random shift/crop (PIE-G / DrQ style)
-        # goes here, applied to to(self.obs[idx]) / to(self.obs[next_idx])
-        # before returning -- only meaningful when the buffer stores pixels.
-        return (
-            to(self.obs[idx]),
-            to(self.obs[next_idx]),
-            to(self.actions[idx]),
-            to(self.rewards[idx]),
-            to(self.terminations[idx]),
-        )
 
 
 # ------------------------------------------------------------------------------
@@ -319,12 +263,13 @@ def _success_fn_for(env_id: str):
     return None
 
 
-def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None, success_fn=None) -> dict:
-    """encode_fn: obs -> feature tensor (finetune path, where env emits
+def evaluate(act_fn, env, n_episodes: int, device, encode_fn=None, success_fn=None) -> dict:
+    """act_fn: (1, feat_dim) tensor -> (1, action_dim) deterministic action
+    (SAC: the mean action; DrQ-v2: the policy mean).
+    encode_fn: obs -> feature tensor (pixel path, where the env emits
     pixels); None when the env already emits features/state vectors.
     success_fn: see _success_fn_for(); None means no success-rate tracking
     (that key is omitted from the returned dict entirely)."""
-    actor.eval()
     returns = []
     successes = [] if success_fn is not None else None
     for _ in range(n_episodes):
@@ -339,8 +284,8 @@ def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None, success
                     obs, dtype=torch.float32, device=device
                 ).unsqueeze(0)
             with torch.no_grad():
-                _, _, mean_action = actor.get_action(obs_t)  # deterministic
-            obs, reward, term, trunc, info = env.step(mean_action.squeeze(0).cpu().numpy())
+                action = act_fn(obs_t)
+            obs, reward, term, trunc, info = env.step(action.squeeze(0).cpu().numpy())
             ep_return += float(reward)
             if ep_infos is not None:
                 ep_infos.append(info)
@@ -348,7 +293,6 @@ def evaluate(actor: Actor, env, n_episodes: int, device, encode_fn=None, success
         returns.append(ep_return)
         if successes is not None:
             successes.append(success_fn(ep_infos))
-    actor.train()
     stats = {
         "return_mean": float(np.mean(returns)),
         "return_std": float(np.std(returns)),

@@ -4,6 +4,9 @@ buffer_size: 1_000_000
 learning_starts: 5000
 batch_size: 256
 gamma: 0.99
+nstep: 1                      # n-step returns (never cross an episode end)
+action_repeat: 1              # env frames per agent step (rewards summed);
+                              # total_timesteps etc. count agent steps
 tau: 0.005                    # polyak coefficient for target critics
 policy_lr: 3.0e-4
 q_lr: 1.0e-3

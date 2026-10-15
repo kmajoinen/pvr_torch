@@ -14,6 +14,7 @@ encoder:
   lr: 1.0e-5               # separate encoder LR, well below q_lr/policy_lr
   betas: [0.9, 0.999]      # Adam (beta1, beta2) for the encoder optimizer
   grad_clip: 10.0          # clip norm on encoder gradients before each step
+                           #   (null: no clipping)
   trainable: all           # all | head -- head trains only embedding.head=linear,
                            #   on a frozen backbone (PIE-G)
   bn: frozen               # frozen | adapt -- adapt: BatchNorm uses each replay

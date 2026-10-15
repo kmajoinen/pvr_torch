@@ -1,1 +1,5 @@
+name: dmc_walker
+builder: dmc
 id: dm_control/walker-walk-v0
+image_size: 224   # native dm_control render resolution; see dm_control_pixels.yaml
+n_envs: 1
