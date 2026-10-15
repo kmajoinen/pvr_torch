@@ -175,6 +175,54 @@ trains its head at the actor/critic rate. PVR's compressed intermediate
 layers remain available as their own encoder names (`resnet50_l3`,
 `resnet50_l4`, `moco_*_l3`, ...).
 
+### PIE-G options: BatchNorm adaptation, frame stacking, strong views
+
+- **`encoder.bn: frozen | adapt`** — with `adapt`, BatchNorm layers (only
+  those) normalise each replay/training batch with its own statistics and
+  update their running ones; acting and evaluation use the running ones, as
+  in PIE-G. It changes features over time, so the buffer stores pixels, and
+  the encoder is saved even when no weights train. Encoders without
+  BatchNorm (ViTs) are rejected. `train/bn_stat_drift` logs how far the
+  running statistics have moved from their loaded values.
+- **`embedding.frame_stack: k`** + **`embedding.frame_fusion`** — the env
+  stacks k frames (the buffer holds all of them). `channels` feeds the stack
+  to the backbone as one wide input (`random` only, its default); `concat`
+  (the default otherwise) encodes each frame and joins the outputs; `diff`
+  is PIE-G's: frames 2..k plus each one's difference from the previous
+  frame. Fusion happens before the head, so a `linear` head sees all
+  frames. Augmentations treat a stack alike (same shift, same overlay
+  image); colour transforms need 3 channels, so they don't work with
+  stacks. SAC only: BC datasets hold single frames.
+- **`random_overlay`** — blends each frame with a natural image (SODA/SVEA).
+  Needs `params.image_dir`, a folder of images such as Places365's
+  validation set. This approximates DMC-GB's loader (used by SVEA and
+  PIE-G), which streams the full Places365 training split with a fresh
+  random resized crop and flip per image: here a fixed pool of `num_images`
+  (default 5000, the same every run) is loaded onto the GPU on first use,
+  at ~1.5× the frame side, and every draw gets its own random resized crop
+  (`crop_scale`) and flip. GPU memory is `num_images × 3 × side²` bytes:
+  ~240 MB at 126px (84px frames), ~1.7 GB at 336px (224px frames), so lower
+  `num_images` for large frames.
+- **`augmentation.strong`** — an optional second, stronger view applied on
+  top of the task view, which the critic (BC: the policy) also fits:
+  `(1 - weight) * L(task view) + weight * L(strong view)`, as in SVEA and
+  PIE-G. Targets and the actor stay on the task view. Logged as
+  `train/qf_loss_strong` (BC: `train/bc_loss_strong`). The `pieg` preset is
+  random shift plus an overlay strong view at weight 0.5.
+
+PIE-G's encoder recipe, on SAC:
+```bash
+python train_sac.py embedding=resnet18 env.image_size=84 \
+    '+embedding.preprocess={resize:null,crop:null,mean:[0.5,0.5,0.5],std:[1.0,1.0,1.0]}' \
+    +embedding.layer=layer2 +embedding.head=linear \
+    +embedding.frame_stack=3 +embedding.frame_fusion=diff \
+    encoder.grads=critic encoder.trainable=head encoder.lr=1e-4 encoder.bn=adapt \
+    augmentation=pieg augmentation.strong.params.image_dir=/path/to/places365/val_256
+```
+What still differs from PIE-G is the RL algorithm: PIE-G is DrQ-v2 (DDPG
+with n-step returns, scheduled exploration noise, and per-network
+Linear-LayerNorm-Tanh trunks), not SAC.
+
 `src/embeddings.py::_get_embedding()` supports quite a few more names than
 have a dedicated yaml file (e.g. `resnet50_l3`, `resnet50_l4`,
 `resnet50_places`, `moco_croponly*`, `demy`, `maskrcnn_l3`, and MoCo
@@ -280,7 +328,8 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   with `@register_aux_loss("name")`; the file's docstring has the contract.
 - **`augmentation`** — picks a file from `configs/augmentation/` (`none`,
   `random_shift`, `color_jitter`, `gaussian_blur`, `horizontal_flip`,
-  `random_erasing`, and `shift_jitter` as a pipeline example). Each has a
+  `random_erasing`, `random_overlay`, `shift_jitter` as a pipeline example,
+  and the `pieg` preset with a strong view, see below). Each has a
   `name`, a `stage` and `params`. `stage` decides who sees the augmented
   view (`src/views.py`):
 
@@ -300,9 +349,11 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   `src/augmentations.py` for the contract and how to add one.
 - **Collapse monitor** — whenever the encoder trains, the per-dimension std
   of its raw output (before the heads' LayerNorm) is logged as
-  `train/embedding_std` and `train/embedding_std_ratio` (relative to the
-  first update; also printed as `emb_std_ratio`), with a one-time warning
-  if it drops below 10%.
+  `train/embedding_std` and `train/embedding_std_ratio` (also printed as
+  `emb_std_ratio`), with a one-time warning if it drops below 10%. The
+  ratio's baseline is the first reading after 1000 updates (BC: batches),
+  not the first update, because a freshly initialised `linear` head changes
+  scale quickly at first; until then the ratio is NaN.
 - **`buffer_obs`** (SAC) — what the replay buffer stores. `auto` stores
   pixels if the encoder trains or augmentation is on (both need every
   sampled batch re-encoded), and features otherwise: the fast path, where

@@ -1,0 +1,15 @@
+# Random overlay (SODA / SVEA, Hansen et al., 2021): blends each frame with a
+# natural image, x' = (1 - alpha) * x + alpha * I. Needs a folder of images,
+# e.g. Places365's validation set (searched recursively for jpg/png):
+#   augmentation.params.image_dir=/scratch/.../places365/val_256
+# Approximates DMC-GB's loader (full Places365 training split, fresh random
+# resized crop + flip per image) with a fixed pool of num_images (the same
+# every run) kept on the GPU, each draw getting its own crop and flip.
+name: random_overlay
+stage: rl
+params:
+  image_dir: ???
+  alpha: 0.5
+  num_images: 5000
+  resolution: null       # pool image side; null = ~1.5x the frame side
+  crop_scale: [0.08, 1.0]

@@ -114,15 +114,14 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
                           encoding happens inside the training loop.
 
     frame_stack (cfg.embedding.get("frame_stack", 1)): stacks N consecutive
-    frames into the channel axis before anything else sees them. Only
-    meaningful for embeddings trained from scratch alongside the policy
-    (embedding=random) -- pretrained PVR backbones have a fixed 3-channel
-    first layer and can't accept a wider input at all, so this is never
-    applied for any other embedding regardless of what's set here.
+    frames into the channel axis, (H, W, 3N), before anything else sees
+    them. How the encoder uses the stack is its own business
+    (embedding.frame_fusion, see EmbeddingNet): `random` can take it as one
+    wide input; pretrained backbones encode each frame and fuse the outputs.
     """
     env = ENV_BUILDERS[cfg.env.builder](cfg.env.id, cfg.env.get("image_size", 84))
     frame_stack = cfg.embedding.get("frame_stack", 1) if cfg.env.builder != "state" else 1
-    if frame_stack > 1 and cfg.embedding.get("name") == "random":
+    if frame_stack > 1 and cfg.embedding.get("name") is not None:
         env = gym.wrappers.FrameStackObservation(env, frame_stack)
         env = _StackToChannels(env, frame_stack)
     env = gym.wrappers.RecordEpisodeStatistics(env)

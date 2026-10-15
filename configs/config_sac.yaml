@@ -16,6 +16,9 @@ encoder:
   grad_clip: 10.0          # clip norm on encoder gradients before each step
   trainable: all           # all | head -- head trains only embedding.head=linear,
                            #   on a frozen backbone (PIE-G)
+  bn: frozen               # frozen | adapt -- adapt: BatchNorm uses each replay
+                           #   batch's statistics and updates its running ones
+                           #   during updates, running ones when acting (PIE-G)
   aux: []                  # aux losses (src/losses.py), e.g.
                            #   'encoder.aux=[{name:l2sp,weight:1.0}]'
 

@@ -1,0 +1,19 @@
+# PIE-G's augmentation (Yuan et al., 2022): DrQ-v2 random shift on the task
+# view, plus random overlay as a strong view the critic also fits, SVEA-style:
+#   critic loss = (1 - weight) * L(shifted) + weight * L(shifted + overlay)
+# PIE-G weights the two equally (weight 0.5). Set the overlay's image folder:
+#   augmentation.strong.params.image_dir=/scratch/.../places365/val_256
+name: random_shift
+stage: rl
+params:
+  pad_frac: null       # null with pad also null = 4/84 (DrQ-v2's pad=4 at 84px)
+  pad: null
+strong:
+  name: random_overlay
+  weight: 0.5
+  params:
+    image_dir: ???
+    alpha: 0.5
+    num_images: 5000
+    resolution: null   # pool image side; null = ~1.5x the frame side
+    crop_scale: [0.08, 1.0]

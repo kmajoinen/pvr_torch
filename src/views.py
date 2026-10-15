@@ -113,19 +113,34 @@ def encode_views(
 
 class CollapseMonitor:
     """Tracks the per-dimension std of the raw encoder output across a batch,
-    relative to its first measured value, and warns once if it drops below
-    warn_frac -- the signature of an encoder collapsing toward a constant
-    (see aug_consistency in src/losses.py). Measure features before any
-    LayerNorm, which would hide a collapse."""
+    relative to a baseline, and warns once if it drops below warn_frac --
+    the signature of an encoder collapsing toward a constant (see
+    aug_consistency in src/losses.py). Measure features before any
+    LayerNorm, which would hide a collapse.
 
-    def __init__(self, warn_frac: float = 0.1):
+    The baseline is the first measurement at or after `warmup` training
+    steps, not the very first one: a freshly initialised trainable head
+    (embedding.head=linear) starts with tiny weights that Adam largely
+    rebuilds within its first ~100 updates, so its first reading would be a
+    poor reference and the warning would fire on healthy runs. Until the
+    baseline exists, ratio is NaN."""
+
+    def __init__(self, warn_frac: float = 0.1, warmup: int = 1000):
         self.warn_frac = warn_frac
+        self.warmup = warmup
         self.initial = None
         self.current = float("nan")
         self._warned = False
 
-    def update(self, feats: torch.Tensor, where: str = "") -> None:
+    def update(self, feats: torch.Tensor, step: int, where: str = "") -> None:
+        """step: training steps (updates/batches) taken so far. Batches of
+        fewer than 2 rows are skipped: their std is NaN, and a NaN baseline
+        would disable the monitor for the rest of the run."""
+        if feats.shape[0] < 2:
+            return
         self.current = feats.detach().float().std(dim=0).mean().item()
+        if step < self.warmup:
+            return
         if self.initial is None:
             self.initial = self.current
         elif not self._warned and self.current < self.warn_frac * self.initial:

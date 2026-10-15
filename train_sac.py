@@ -160,6 +160,9 @@ def main(cfg: DictConfig) -> None:
     emb_kwargs = embedding_kwargs(cfg)
     routing = enc.grads
     encoder_trains = enc.trains
+    # Adapting BatchNorm statistics change the encoder without training it,
+    # so it's saved then too.
+    save_encoder = encoder_trains or enc.bn_adapt
     if encoder_trains:
         print(
             f"Encoder trains: grads={routing}  aux={enc.aux_names}"
@@ -170,6 +173,7 @@ def main(cfg: DictConfig) -> None:
     emb_name = cfg.embedding.get("name", None)
     embedding_net = None
     aug_module = None
+    strong_module = None
     if emb_name is not None:
         from src.augmentations import build_augmentation
         from src.embeddings import EmbeddingNet
@@ -184,11 +188,17 @@ def main(cfg: DictConfig) -> None:
                 f"  params={dict(cfg.augmentation.get('params') or {})}"
                 "  (replay-batch encodes only; rollouts/eval stay clean)"
             )
+        if enc.strong_name is not None:
+            strong_module = build_augmentation(cfg.augmentation.strong).to(device)
+            print(
+                f"Strong view: {enc.strong_name}  weight={enc.strong_weight}"
+                f"  params={dict(cfg.augmentation.strong.get('params') or {})}"
+                "  (on top of the task view; critic loss only)"
+            )
 
         frame_stack = cfg.embedding.get("frame_stack", 1)
         embedding_net = EmbeddingNet(
             emb_name,
-            in_channels=3 * frame_stack if emb_name == "random" else 3,
             pretrained=True,
             train=encoder_trains,
             disable_cuda=(str(device) == "cpu"),
@@ -202,6 +212,10 @@ def main(cfg: DictConfig) -> None:
         embedding_net.eval()
         trainable = enc.trainable if encoder_trains else "none"
         embedding_net.set_trainable(trainable)
+        if enc.bn_adapt and not embedding_net.has_batchnorm():
+            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers")
+        if enc.bn_adapt:
+            bn_ref = embedding_net.bn_stats()   # as loaded; for train/bn_stat_drift
         print(
             f"\nEmbedding: {emb_name}  →  obs_size: {embedding_net.out_size}"
             f"  (trainable={trainable})"
@@ -241,16 +255,23 @@ def main(cfg: DictConfig) -> None:
             emb_tag += f"-L{layer}" if isinstance(layer, int) else f"-{layer}"
         if cfg.embedding.get("head") is not None:
             emb_tag += f"-{cfg.embedding.head}"
+        if embedding_net is not None and embedding_net.frame_stack > 1:
+            emb_tag += f"-fs{embedding_net.frame_stack}{embedding_net.frame_fusion}"
         # Run names are labels only; charts are keyed by the logged metric
         # names, which stay fixed for continuity.
         tags = ""
         if encoder_trains:
             tags += "_ft-" + "-".join([routing] + enc.aux_names)
+        if enc.bn_adapt:
+            tags += "_bnadapt"
         if enc.aug_name is not None:
             tags += f"_aug-{enc.aug_name}" + (
                 f"-{enc.aug_stage}" if enc.aug_stage != "rl" else ""
             )
-        if pixels_in_buffer and not encoder_trains and enc.aug_name is None:
+        if enc.strong_name is not None:
+            tags += f"_strong-{enc.strong_name}"
+        if (pixels_in_buffer and not encoder_trains and enc.aug_name is None
+                and enc.strong_name is None and not enc.bn_adapt):
             tags += "_slowfrozen"
         run_name = (
             cfg.wandb.run_name or f"sac_{cfg.env.name}_{emb_tag}{tags}_s{cfg.seed}"
@@ -320,6 +341,12 @@ def main(cfg: DictConfig) -> None:
         up to ~2 uint8 levels while the clean view stays exact."""
         with torch.no_grad():
             return aug_module(x)
+
+    def strong_augment(x: torch.Tensor) -> torch.Tensor:
+        """The strong view (augmentation.strong), applied on top of the task
+        view; same conventions as augment()."""
+        with torch.no_grad():
+            return strong_module(x)
 
     def featurize(x: torch.Tensor, grad: bool) -> torch.Tensor:
         """preprocess() output (optionally augmented) -> (B, feat_dim) float32."""
@@ -434,6 +461,8 @@ def main(cfg: DictConfig) -> None:
         # fails at startup rather than at the first update after
         # learning_starts. This is also where the one-time range check runs.
         augment(preprocess(np.asarray(obs)[None]))
+    if strong_module is not None:
+        strong_augment(preprocess(np.asarray(obs)[None]))
     t0 = time.time()
     # Per-phase encoder grad norms: each written ONLY by its own phase and
     # reset when that phase doesn't step this global_step -- so `both` mode
@@ -494,6 +523,13 @@ def main(cfg: DictConfig) -> None:
         route_critic = routing in ("critic", "both")
         route_actor = routing in ("actor", "both")
 
+        if enc.bn_adapt:
+            # BatchNorm normalises with each replay batch's own statistics
+            # and updates its running ones for every encode of this update;
+            # acting and evaluation (after the update) use the running ones.
+            embedding_net.set_bn_train(True)
+
+        feats_strong = None
         if pixels_in_buffer:
             # One augmentation draw per update, routed by augmentation.stage.
             views = encode_views(
@@ -516,12 +552,16 @@ def main(cfg: DictConfig) -> None:
             if enc.task_aug:
                 x_next = augment(x_next)
             next_feats = featurize(x_next, grad=False)
+            if strong_module is not None:
+                # SVEA-style strong view: on top of the task view, for the
+                # critic loss only; targets stay on the task view's next_obs.
+                feats_strong = featurize(strong_augment(views.x_task), grad=route_critic)
 
-            # First update and every log step; each measurement is a GPU sync.
-            if encoder_trains and (
-                collapse.initial is None or global_step % cfg.algo.log_frequency == 0
-            ):
-                collapse.update(feats, where=f"step {global_step:,}")
+            # Every log step (each measurement is a GPU sync); the baseline is
+            # set after CollapseMonitor's warmup, counted in updates.
+            if encoder_trains and global_step % cfg.algo.log_frequency == 0:
+                collapse.update(feats, step=global_step - cfg.algo.learning_starts,
+                                where=f"step {global_step:,}")
         else:
             feats, next_feats = b_obs, b_next_obs
 
@@ -540,6 +580,17 @@ def main(cfg: DictConfig) -> None:
         qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
         qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
         qf_loss = qf1_loss + qf2_loss
+        # The loss the critic steps on. qf1/qf2/qf_loss above stay the task
+        # view's, so their logged metrics keep their meaning.
+        critic_loss = qf_loss
+        qf_loss_strong = None
+        if feats_strong is not None:
+            qf_loss_strong = (
+                F.mse_loss(qf1(feats_strong, b_actions).view(-1), next_q_value)
+                + F.mse_loss(qf2(feats_strong, b_actions).view(-1), next_q_value)
+            )
+            w = enc.strong_weight
+            critic_loss = (1 - w) * qf_loss + w * qf_loss_strong
 
         aux_total, aux_values = None, {}
         if aux_terms:
@@ -555,7 +606,7 @@ def main(cfg: DictConfig) -> None:
         # encoder graph (src/views.py), which a second backward couldn't
         # traverse. Aux losses don't touch the Q networks, so the critic's
         # gradients are unchanged; the encoder's are the sum, as before.
-        (qf_loss if aux_total is None else qf_loss + aux_total).backward()
+        (critic_loss if aux_total is None else critic_loss + aux_total).backward()
         q_gnorm = float(
             torch.nn.utils.clip_grad_norm_(
                 list(qf1.parameters()) + list(qf2.parameters()),
@@ -634,6 +685,9 @@ def main(cfg: DictConfig) -> None:
                     a_optimizer.step()
                     alpha = log_alpha.exp().item()
 
+        if enc.bn_adapt:
+            embedding_net.set_bn_train(False)   # acting/eval: running statistics
+
         # ---- polyak target update -----------------------------------------------
         if global_step % cfg.algo.target_network_frequency == 0:
             tau = cfg.algo.tau
@@ -680,6 +734,10 @@ def main(cfg: DictConfig) -> None:
                 }
                 if cfg.algo.autotune_alpha:
                     log["train/alpha_loss"] = alpha_loss.item()
+                if enc.bn_adapt:
+                    log["train/bn_stat_drift"] = embedding_net.bn_stat_drift(bn_ref)
+                if qf_loss_strong is not None:
+                    log["train/qf_loss_strong"] = qf_loss_strong.item() / 2.0
                 if encoder_trains:
                     log["train/encoder_grad_norm_critic"] = enc_gnorm_critic
                     log["train/encoder_grad_norm_actor"] = enc_gnorm_actor
@@ -729,7 +787,7 @@ def main(cfg: DictConfig) -> None:
                     torch.save(
                         actor.state_dict(), os.path.join(save_dir, "best_actor.pt")
                     )
-                    if encoder_trains:
+                    if save_encoder:
                         # With the embedding config, so a reload with a
                         # different layer/head/preprocess is flagged
                         # (EmbeddingNet._load_checkpoint).
@@ -750,7 +808,7 @@ def main(cfg: DictConfig) -> None:
             "qf2": qf2.state_dict(),
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
-        if encoder_trains:
+        if save_encoder:
             ckpt["encoder"] = embedding_net.state_dict()
             ckpt["input_size"] = embedding_net.input_size
         torch.save(ckpt, os.path.join(save_dir, "final_checkpoint.pt"))

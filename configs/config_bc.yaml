@@ -28,6 +28,9 @@ encoder:
   grad_clip: 1.0           # clip norm on encoder gradients before each step
   trainable: all           # all | head -- head trains only embedding.head=linear,
                            #   on a frozen backbone
+  bn: frozen               # frozen | adapt -- adapt: BatchNorm uses each training
+                           #   batch's statistics and updates its running ones;
+                           #   validation/eval use the running ones
   aux: []                  # aux losses (src/losses.py), e.g.
                            #   'encoder.aux=[{name:l2sp,weight:1.0}]'
 

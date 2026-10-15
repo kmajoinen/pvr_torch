@@ -172,6 +172,95 @@ class RandomShiftsAug(nn.Module):
         return out.to(in_dtype)
 
 
+@register_augmentation("random_overlay")
+class RandomOverlay(nn.Module):
+    """Random overlay from SODA / SVEA (Hansen et al., 2021), PIE-G's strong
+    augmentation: x' = (1 - alpha) * x + alpha * I, with I a natural image
+    drawn independently per sample.
+
+    An approximation of DMC-GB's loader, which SVEA and PIE-G use: that
+    streams the full Places365 training split and gives every image a fresh
+    RandomResizedCrop + RandomHorizontalFlip. Here, images come from
+    `image_dir` (searched recursively for .jpg/.jpeg/.png), and a fixed pool
+    of `num_images` of them (chosen with a fixed seed, so every run uses the
+    same pool) is kept on the batch's device; every draw then gets its own
+    random resized crop (scale `crop_scale`, DMC-GB's default) and flip, so
+    overlays stay varied even from a finite pool.
+
+    The pool is loaded on the first call, once the frame size is known: at
+    `resolution` (default ~1.5x the frame side, so crops are taken from more
+    pixels than they end up with) -- e.g. ~126px for 84px frames. GPU memory
+    is num_images * 3 * resolution^2 bytes: ~240 MB for 5000 images at
+    126px, ~1.7 GB at 336px (224px frames), so lower num_images there.
+    With a frame-stacked input (3*k channels) the same overlay (same image,
+    crop and flip) goes on every frame of a sample, as in SODA.
+    """
+
+    _EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+    def __init__(self, image_dir: Optional[str] = None, alpha: float = 0.5,
+                 num_images: int = 5000, resolution: Optional[int] = None,
+                 crop_scale=(0.08, 1.0)):
+        super().__init__()
+        import os
+        if not image_dir or image_dir == "???":
+            raise ValueError("random_overlay needs params.image_dir: a folder of natural images "
+                             "(e.g. Places365's validation set)")
+        if not os.path.isdir(image_dir):
+            raise FileNotFoundError(f"random_overlay image_dir {image_dir!r} is not a directory")
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"random_overlay alpha must be in [0, 1], got {alpha}")
+        files = sorted(
+            os.path.join(root, f)
+            for root, _, names in os.walk(image_dir)
+            for f in names if f.lower().endswith(self._EXTENSIONS)
+        )
+        if not files:
+            raise FileNotFoundError(f"no .jpg/.jpeg/.png images under {image_dir!r}")
+        order = torch.randperm(len(files), generator=torch.Generator().manual_seed(0))
+        self._paths = [files[i] for i in order[:num_images].tolist()]
+        self.alpha = alpha
+        self.resolution = resolution
+        self.crop_scale = tuple(crop_scale)
+        self._frame_size = None
+        self.register_buffer("pool", None, persistent=False)   # loaded on first call
+
+    @staticmethod
+    def _load(paths, resolution):
+        import torchvision.transforms.functional as TF
+        from torchvision.io import ImageReadMode, read_image
+        images = []
+        for p in paths:
+            img = read_image(p, mode=ImageReadMode.RGB)                     # uint8 (3, H, W)
+            img = TF.resize(img, resolution, antialias=True)
+            images.append(TF.center_crop(img, resolution))
+        return torch.stack(images)                                          # uint8 (M, 3, r, r)
+
+    def _setup(self, h, w, device):
+        side = self.resolution or int(round(1.5 * max(h, w)))
+        print(f"random_overlay: loading {len(self._paths)} images at {side}px "
+              f"({len(self._paths) * 3 * side * side / 1e6:.0f} MB)")
+        self.pool = self._load(self._paths, side).to(device)
+        K = _kornia()
+        self._crop = K.RandomResizedCrop((h, w), scale=self.crop_scale)
+        self._flip = K.RandomHorizontalFlip(p=0.5)
+        self._frame_size = (h, w)
+
+    def forward(self, x):
+        n, c, h, w = x.shape
+        if c % 3:
+            raise ValueError(f"random_overlay needs 3*k channels (RGB frames), got {c}")
+        if self.pool is None:
+            self._setup(h, w, x.device)
+        elif (h, w) != self._frame_size:
+            raise ValueError(f"random_overlay was set up for {self._frame_size} frames, got {(h, w)}")
+        idx = torch.randint(0, self.pool.shape[0], (n,), device=self.pool.device)
+        images = self.pool[idx].to(device=x.device, dtype=x.dtype) / 255.0
+        images = self._flip(self._crop(images))       # per sample: fresh crop and flip
+        images = images.repeat(1, c // 3, 1, 1)
+        return (1 - self.alpha) * x + self.alpha * images
+
+
 # ------------------------------------------------------------------------------
 # Kornia-backed transforms
 # ------------------------------------------------------------------------------

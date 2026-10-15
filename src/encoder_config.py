@@ -52,6 +52,9 @@ class EncoderSettings:
     task_aug: bool          # the task loss sees augmented observations
     aux_needs_clean: bool   # some aux loss reads the clean view (needs_features)
     aux_needs_aug: bool     # some aux loss reads the augmented view
+    bn_adapt: bool = False              # encoder.bn=adapt
+    strong_name: Optional[str] = None   # augmentation.strong: the SVEA-style second view
+    strong_weight: float = 0.0
 
     @property
     def aux_names(self) -> List[str]:
@@ -80,9 +83,35 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     aug_readers = [s["name"] for s, c in zip(aux_specs, aux_classes) if c.needs_augmented]
 
     aug = cfg.get("augmentation") or {}
+    from omegaconf import OmegaConf
+    if OmegaConf.is_config(aug):
+        unset = sorted(OmegaConf.missing_keys(aug))
+        if unset:
+            raise ValueError(f"augmentation settings must be set: {['augmentation.' + k for k in unset]}")
     aug_name = aug.get("name")
     aug_name = None if aug_name in (None, "none") else str(aug_name)
     aug_stage = str(aug.get("stage", "rl"))
+
+    # augmentation.strong: an optional second, stronger view of the task
+    # observations (applied on top of the task view), which the critic loss
+    # (BC: the policy loss) also fits: (1 - weight) * L(task view) +
+    # weight * L(strong view) -- SVEA (Hansen et al., 2021), PIE-G.
+    strong = aug.get("strong")
+    strong_name, strong_weight = None, 0.0
+    if strong is not None:
+        strong_name = strong.get("name")
+        strong_name = None if strong_name in (None, "none") else str(strong_name)
+        if strong_name is not None:
+            strong_weight = strong.get("weight", 0.5)
+            if isinstance(strong_weight, bool) or not isinstance(strong_weight, (int, float)) \
+                    or not 0 < strong_weight <= 1:
+                raise ValueError(f"augmentation.strong.weight={strong_weight!r}: expected a number in (0, 1]")
+            strong_weight = float(strong_weight)
+
+    bn = str(enc.get("bn", "frozen"))
+    if bn not in ("frozen", "adapt"):
+        raise ValueError(f"encoder.bn={bn!r}; expected frozen or adapt")
+    bn_adapt = bn == "adapt"
     if aug_stage not in AUG_STAGES:
         raise ValueError(f"augmentation.stage={aug_stage!r}; expected one of {AUG_STAGES}")
     if aug_name is None and aug_stage != "rl":
@@ -122,7 +151,9 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     if not has_embedding:
         used = [k for k, on in (("encoder.grads", grads != "none"),
                                 ("encoder.aux", bool(aux_specs)),
-                                ("augmentation", aug_name is not None)) if on]
+                                ("augmentation", aug_name is not None),
+                                ("augmentation.strong", strong_name is not None),
+                                ("encoder.bn=adapt", bn_adapt)) if on]
         if used:
             raise ValueError(
                 f"{', '.join(used)} set, but there is no encoder (embedding=none): "
@@ -144,6 +175,7 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     return EncoderSettings(
         has_embedding, grads, aux_specs, trains, trainable, aug_name, aug_stage,
         task_aug, aux_needs_clean, aux_needs_aug,
+        bn_adapt=bn_adapt, strong_name=strong_name, strong_weight=strong_weight,
     )
 
 
@@ -164,7 +196,8 @@ def embedding_kwargs(cfg) -> dict:
     # .get() returns None for a `???` value instead of raising, which would
     # silently fall back to the architecture's default weights. (`k in emb`
     # is False for `???` too, hence keys().)
-    missing = [k for k in ("arch", "checkpoint", "preprocess", "layer", "head", "head_dim")
+    missing = [k for k in ("arch", "checkpoint", "preprocess", "layer", "head", "head_dim",
+                           "frame_stack", "frame_fusion")
                if k in emb.keys() and OmegaConf.is_missing(emb, k)]
     if missing:
         raise ValueError(
@@ -217,6 +250,26 @@ def embedding_kwargs(cfg) -> dict:
         if isinstance(head_dim, bool) or not isinstance(head_dim, int) or head_dim < 1:
             raise ValueError(f"embedding.head_dim={head_dim!r}: expected a positive integer")
         kwargs["head_dim"] = head_dim
+
+    # Frame stacking (EmbeddingNet): k frames per observation, fused by
+    # channels (into the backbone's input; `random` only), concat or diff
+    # (PIE-G) of the per-frame outputs.
+    from src.truncation import FRAME_FUSIONS
+    frame_stack = emb.get("frame_stack", 1)
+    if isinstance(frame_stack, bool) or not isinstance(frame_stack, int) or frame_stack < 1:
+        raise ValueError(f"embedding.frame_stack={frame_stack!r}: expected an integer >= 1")
+    fusion = emb.get("frame_fusion")
+    if fusion is not None:
+        if fusion not in FRAME_FUSIONS:
+            raise ValueError(f"embedding.frame_fusion={fusion!r}; expected one of {FRAME_FUSIONS}")
+        if frame_stack < 2:
+            raise ValueError("embedding.frame_fusion needs embedding.frame_stack > 1")
+        if fusion == "channels" and str(emb.get("arch") or emb.name) != "random":
+            raise ValueError("embedding.frame_fusion=channels only works with the `random` encoder "
+                             "(others have a fixed 3-channel first layer); use concat or diff")
+        kwargs["frame_fusion"] = str(fusion)
+    if frame_stack > 1:
+        kwargs["frame_stack"] = frame_stack
     return kwargs
 
 
@@ -239,6 +292,10 @@ def resolve_buffer_obs(cfg, s: EncoderSettings) -> Tuple[bool, str]:
                      + (f", aux={s.aux_names}" if s.aux_specs else ""))
     if s.aug_name is not None:
         needs.append(f"augmentation {s.aug_name!r} is drawn per sample at every update")
+    if s.strong_name is not None:
+        needs.append(f"strong view {s.strong_name!r} is drawn per sample at every update")
+    if s.bn_adapt:
+        needs.append("encoder.bn=adapt: BatchNorm statistics keep changing, so features can't be cached")
 
     if mode == "features":
         if needs:

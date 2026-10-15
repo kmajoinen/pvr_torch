@@ -124,7 +124,6 @@ def main(cfg: DictConfig) -> None:
     use_wandb = cfg.wandb.enabled
     if use_wandb:
         import wandb
-        from omegaconf import OmegaConf
         wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.entity,
@@ -175,8 +174,15 @@ def main(cfg: DictConfig) -> None:
         dataset, [n_train, n_val],
         generator=torch.Generator().manual_seed(cfg.seed),
     )
+    # drop_last: a short final batch (possibly one sample) would give the
+    # collapse monitor a NaN std and, with encoder.bn=adapt, push BatchNorm's
+    # running statistics around with a couple of images. Shuffling drops a
+    # different < batch_size remainder each epoch.
     train_loader = DataLoader(train_ds, batch_size=cfg.algo.batch_size,
-                              shuffle=True, num_workers=2, pin_memory=True)
+                              shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+    if len(train_loader) == 0:
+        raise ValueError(f"the training split has {len(train_ds)} samples, fewer than "
+                         f"algo.batch_size={cfg.algo.batch_size}: lower the batch size")
     val_loader   = DataLoader(val_ds,   batch_size=cfg.algo.batch_size,
                               shuffle=False, num_workers=2, pin_memory=True)
     print(f"  train: {n_train:,}  val: {n_val:,}")
@@ -186,6 +192,12 @@ def main(cfg: DictConfig) -> None:
     aug_module = None
     obs_size = int(np.prod(dataset.obs_shape))
     emb_name = cfg.embedding.get('name', None)
+    strong_module = None
+    if emb_name is not None and cfg.embedding.get('frame_stack', 1) > 1:
+        raise NotImplementedError(
+            "embedding.frame_stack > 1 isn't supported by train_bc.py: its datasets "
+            "hold single frames, and evaluation doesn't stack them either."
+        )
     if emb_name is not None:
         from src.augmentations import build_augmentation
         from src.embeddings import EmbeddingNet
@@ -196,6 +208,11 @@ def main(cfg: DictConfig) -> None:
             print(f"Augmentation: {enc.aug_name}  stage={enc.aug_stage}"
                   f"  params={dict(cfg.augmentation.get('params') or {})}"
                   "  (training batches only; validation/eval stay clean)")
+        if enc.strong_name is not None:
+            strong_module = build_augmentation(cfg.augmentation.strong).to(device)
+            print(f"Strong view: {enc.strong_name}  weight={enc.strong_weight}"
+                  f"  params={dict(cfg.augmentation.strong.get('params') or {})}"
+                  "  (on top of the task view; BC loss only)")
 
         embedding = EmbeddingNet(
             emb_name,
@@ -211,6 +228,10 @@ def main(cfg: DictConfig) -> None:
         embedding.eval()
         trainable = enc.trainable if encoder_trains else "none"
         embedding.set_trainable(trainable)
+        if enc.bn_adapt and not embedding.has_batchnorm():
+            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers")
+        if enc.bn_adapt:
+            bn_ref = embedding.bn_stats()   # as loaded; for train/bn_stat_drift
         obs_size = embedding.out_size
         print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={trainable})"
               + "".join(f"  {k}={v}" for k, v in emb_kwargs.items()))
@@ -263,13 +284,14 @@ def main(cfg: DictConfig) -> None:
     augment = _augment if aug_module is not None else None
     collapse = CollapseMonitor()   # training encoders only
 
-    if augment is not None:
-        # One real dataset frame through preprocess -> augmentation now, so an
-        # input contract violation (value range, channel count, non-square
-        # frame) fails before training starts. This is also where the
-        # one-time range check runs.
-        with torch.no_grad():
-            augment(embedding.preprocess(torch.as_tensor(train_ds[0][0])[None]))
+    for module in (aug_module, strong_module):
+        if module is not None:
+            # One real dataset frame through preprocess -> augmentation now, so
+            # an input contract violation (value range, channel count,
+            # non-square frame) fails before training starts. This is also
+            # where the one-time range check runs.
+            with torch.no_grad():
+                module(embedding.preprocess(torch.as_tensor(train_ds[0][0])[None]))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     n_batches = len(train_loader)
@@ -283,12 +305,17 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(1, cfg.algo.max_epochs + 1):
         # Train
         policy.train()
+        if enc.bn_adapt:
+            # Training batches: BatchNorm uses each batch's statistics and
+            # updates its running ones; validation/eval use the running ones.
+            embedding.set_bn_train(True)
         t0 = time.time()
         train_loss = 0.0
         for i, (obs_b, act_b) in enumerate(train_loader):
             obs_b = obs_b.to(device)
             act_b = act_b.to(device)
             views = None
+            feats_strong = None
             if embedding is not None:
                 # One augmentation draw per batch, routed by augmentation.stage
                 # (src/views.py). The BC loss reaches the encoder only with
@@ -305,10 +332,17 @@ def main(cfg: DictConfig) -> None:
                     aux_grad_aug=aux_grad_aug,
                 )
                 obs_b = views.feats_task
-                if encoder_trains and collapse.initial is None:
-                    collapse.update(obs_b, where="first batch")
+                if strong_module is not None:
+                    with torch.no_grad():
+                        x_strong = strong_module(views.x_task)
+                    feats_strong = featurize(x_strong, policy_grads)
             pred = policy(obs_b)
             loss = F.mse_loss(pred, act_b)
+            bc_loss_strong = None
+            if feats_strong is not None:
+                # SVEA-style: the policy also fits the strong view's actions.
+                bc_loss_strong = F.mse_loss(policy(feats_strong), act_b)
+                loss = (1 - enc.strong_weight) * loss + enc.strong_weight * bc_loss_strong
 
             aux_total, aux_values = None, {}
             if aux_terms:
@@ -337,7 +371,10 @@ def main(cfg: DictConfig) -> None:
         train_loss /= n_batches
         scheduler.step()
         if encoder_trains:
-            collapse.update(obs_b, where=f"epoch {epoch}")
+            # Baseline after CollapseMonitor's warmup, counted in batches.
+            collapse.update(obs_b, step=epoch * n_batches, where=f"epoch {epoch}")
+        if enc.bn_adapt:
+            embedding.set_bn_train(False)   # validation/eval: running statistics
 
         # Validate
         policy.eval()
@@ -354,7 +391,7 @@ def main(cfg: DictConfig) -> None:
             best_val_loss = val_loss
             if cfg.save.enabled:
                 torch.save(policy.state_dict(), os.path.join(save_dir, 'best_policy.pt'))
-                if encoder_trains:
+                if encoder_trains or enc.bn_adapt:
                     # The policy is only usable with the encoder it was
                     # trained on. Same format as train_sac.py's best_encoder.pt.
                     torch.save(
@@ -374,6 +411,10 @@ def main(cfg: DictConfig) -> None:
                 log['train/aux_loss'] = aux_total.item()
                 for name, value in aux_values.items():
                     log[f'train/aux/{name}'] = value
+            if enc.bn_adapt:
+                log['train/bn_stat_drift'] = embedding.bn_stat_drift(bn_ref)
+            if bc_loss_strong is not None:
+                log['train/bc_loss_strong'] = bc_loss_strong.item()
             if encoder_trains:
                 log['train/embedding_std'] = collapse.current
                 log['train/embedding_std_ratio'] = collapse.ratio
@@ -409,7 +450,8 @@ def main(cfg: DictConfig) -> None:
         wandb.finish()
     print(f"\nBest val loss: {best_val_loss:.4f}")
     print(f"Model saved to: {save_dir}/best_policy.pt"
-          + (f" (with its encoder, {save_dir}/best_encoder.pt)" if encoder_trains else ""))
+          + (f" (with its encoder, {save_dir}/best_encoder.pt)"
+             if encoder_trains or enc.bn_adapt else ""))
 
 
 if __name__ == "__main__":

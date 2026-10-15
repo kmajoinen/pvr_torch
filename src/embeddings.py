@@ -1,8 +1,6 @@
 import glob
 import os
 import numpy as np
-import gymnasium as gym
-from gymnasium.spaces import Box
 
 import torch
 import torch.nn as nn
@@ -331,13 +329,12 @@ def _extract_openclip_transform_params(preprocess_val):
 class UberModel(nn.Module):
     def __init__(self, models):
         super(UberModel, self).__init__()
-        self.models = models
+        # A ModuleList, not a plain list: otherwise the sub-models are
+        # invisible to .parameters(), .modules(), .to() and state_dict(), so
+        # nothing trains, BatchNorm can't be found and saved encoders are empty.
+        self.models = nn.ModuleList(models)
         assert all(models[0].training == m.training for m in models)
         self.training = models[0].training
-
-    def to(self, device):
-        self.models = [m.to(device=device) for m in self.models]
-        return self
 
     def forward(self, x):
         return torch.cat([m(x) for m in self.models],
@@ -1073,7 +1070,8 @@ class EmbeddingNet(nn.Module):
     """
     def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
                  disable_cuda=False, model_dir=None, arch=None, checkpoint=None,
-                 preprocess=None, input_size=None, layer=None, head=None, head_dim=None):
+                 preprocess=None, input_size=None, layer=None, head=None, head_dim=None,
+                 frame_stack=1, frame_fusion=None):
         super(EmbeddingNet, self).__init__()
 
         self.embedding_name = embedding_name
@@ -1081,7 +1079,6 @@ class EmbeddingNet(nn.Module):
         if self.embedding_name == 'true_state':
             return
 
-        self.in_channels = in_channels
         self.arch = arch or embedding_name
         self.checkpoint = checkpoint
         if checkpoint is not None and self.arch not in CHECKPOINT_ARCHS:
@@ -1090,10 +1087,36 @@ class EmbeddingNet(nn.Module):
                 "builder always loads or downloads its own default weights first. "
                 f"Supported: {sorted(CHECKPOINT_ARCHS)}"
             )
+
+        # Frame stacking: the input carries frame_stack frames of in_channels
+        # each. 'channels' feeds the whole stack to the backbone as one wide
+        # input (only `random` accepts that); 'concat'/'diff' encode each
+        # frame separately and fuse the outputs before the head (see
+        # src/truncation.py's fuse_frames).
+        from src.truncation import FRAME_FUSIONS
+        self.frame_stack = int(frame_stack or 1)
+        if self.frame_stack > 1:
+            frame_fusion = frame_fusion or ("channels" if self.arch == "random" else "concat")
+            if frame_fusion not in FRAME_FUSIONS:
+                raise ValueError(f"embedding.frame_fusion={frame_fusion!r}; expected one of {FRAME_FUSIONS}")
+            if frame_fusion == "channels" and self.arch != "random":
+                raise ValueError(
+                    f"embedding.frame_fusion=channels feeds a {in_channels * self.frame_stack}-channel "
+                    f"input to the backbone, which only `random` accepts (arch={self.arch!r} "
+                    "has a fixed 3-channel first layer). Use concat or diff."
+                )
+        elif frame_fusion is not None:
+            raise ValueError("embedding.frame_fusion needs embedding.frame_stack > 1")
+        self.frame_fusion = frame_fusion if self.frame_stack > 1 else None
+        self._per_frame = self.frame_fusion in ("concat", "diff")
+        self._seq_first = None   # token layout of per-frame outputs, found below
+        self.in_channels = in_channels * self.frame_stack
+        backbone_channels = self.in_channels if self.frame_fusion == "channels" else in_channels
+
         # With a checkpoint: build without default weights (no download); the
         # file is loaded below, once the head exists.
         self.embedding, self.transforms, self._forward_fn = _get_embedding(
-            self.arch, in_channels, pretrained and checkpoint is None, train,
+            self.arch, backbone_channels, pretrained and checkpoint is None, train,
             model_dir=None if checkpoint is not None else model_dir,
         )
         if preprocess is not None:
@@ -1110,6 +1133,8 @@ class EmbeddingNet(nn.Module):
             "arch": self.arch, "layer": layer, "head": head,
             "head_dim": (head_dim or DEFAULT_HEAD_DIM) if head == "linear" else None,
             "preprocess": _canonical_preprocess(preprocess),
+            "frame_stack": self.frame_stack,
+            "frame_fusion": self.frame_fusion,
         }
         # Differences from a loaded checkpoint's build record; empty if none.
         # Kept so the training scripts can log them, not just print them.
@@ -1121,12 +1146,14 @@ class EmbeddingNet(nn.Module):
         self.input_size = input_size or 64
         # A batch of 2, so make_head can tell a (T, N, D) token layout apart
         # from (N, T, D).
-        dummy_in = torch.zeros(2, in_channels, self.input_size, self.input_size)
-        dummy_in = self.transforms(dummy_in)
-        self.in_shape = dummy_in.shape[1:]
+        dummy_in = torch.zeros(2, self.in_channels, self.input_size, self.input_size)
         with torch.no_grad():
-            dummy_raw = self._forward(dummy_in)
-            self.head = make_head(head, dummy_raw, batch=2, head_dim=head_dim)
+            dummy_pre = self._preprocess_frames(dummy_in)
+            self.in_shape = dummy_pre.shape[1:]
+            dummy_raw = self._raw_output(dummy_pre)
+            # Fused per-frame outputs are already batch-first.
+            self.head = make_head(head, dummy_raw, batch=2, head_dim=head_dim,
+                                  seq_first=False if self._per_frame else None)
             self.out_size = int(np.prod(self.head(dummy_raw).shape[1:]))
 
         if checkpoint is not None:
@@ -1180,16 +1207,41 @@ class EmbeddingNet(nn.Module):
         observation = observation.to(device=self.device)
         if not observation.is_contiguous():
             observation = observation.contiguous()
-        return self._pre_aug(observation)
+        return self._preprocess_frames(observation)
+
+    def _preprocess_frames(self, x):
+        """_pre_aug, per frame when frames are encoded separately; the
+        output keeps the stacked (N, k*C, h, w) layout, so an augmentation
+        applied to it treats the whole stack alike (same shift, same
+        overlay image)."""
+        if not self._per_frame:
+            return self._pre_aug(x)
+        n, c = x.shape[:2]
+        x = self._pre_aug(x.reshape(n * self.frame_stack, c // self.frame_stack, *x.shape[2:]))
+        return x.reshape(n, c, *x.shape[2:])
+
+    def _raw_output(self, x):
+        """Preprocessed (and maybe augmented) frames -> the backbone's raw
+        output, with stacked frames fused (batch-first)."""
+        if not self._per_frame:
+            x = self._normalize(x)                    # mean/std normalisation or [0, 255] rescale
+            # Fold any extra leading dims into the batch. Taken from the
+            # input, not in_shape, so frames at a size other than the one
+            # measured in __init__ still pass when the pipeline doesn't resize.
+            return self._forward(x.reshape(-1, *x.shape[-3:]))
+        from src.truncation import fuse_frames, tokens_seq_first
+        n, c = x.shape[:2]
+        frames = x.reshape(n * self.frame_stack, c // self.frame_stack, *x.shape[2:])
+        out = self._forward(self._normalize(frames))
+        if out.ndim == 3:
+            if self._seq_first is None:
+                self._seq_first = tokens_seq_first(out, frames.shape[0])
+            if self._seq_first:
+                out = out.transpose(0, 1)
+        return fuse_frames(out, n, self.frame_stack, self.frame_fusion)
 
     def encode_preprocessed(self, observation):
         """preprocess() output, optionally augmented -> (N, out_size)."""
-        observation = self._normalize(observation)        # mean/std normalisation or [0, 255] rescale
-        # Fold any extra leading dims into the batch. Taken from the input,
-        # not in_shape, so frames at a size other than the one measured in
-        # __init__ still pass when the pipeline doesn't resize.
-        observation = observation.reshape(-1, *observation.shape[-3:])
-
         # Gradient tracking is entirely the caller's responsibility (ambient
         # torch.no_grad()/enable_grad() context + requires_grad on this
         # module's params) -- this used to branch on self.embedding.training
@@ -1200,7 +1252,7 @@ class EmbeddingNet(nn.Module):
         # is frozen (requires_grad=False on every param, non-grad-requiring
         # input), autograd already builds no backward graph on its own --
         # forcing no_grad() explicitly was redundant for that case anyway.
-        out = self.head(self._forward(observation))
+        out = self.head(self._raw_output(observation))
         if out.shape[1] != self.out_size:
             # A plain reshape(-1, out_size) could silently fold features into
             # the batch dimension here instead of failing.
@@ -1256,12 +1308,17 @@ class EmbeddingNet(nn.Module):
         meta = record['embedding']
         layer = meta.get('layer')
         head = meta.get('head') or ('avgpool' if layer is not None else None)
+        arch = meta.get('arch') or meta.get('name')
+        frame_stack = int(meta.get('frame_stack') or 1)
         saved = {
-            'arch': meta.get('arch') or meta.get('name'),
+            'arch': arch,
             'layer': layer,
             'head': head,
             'head_dim': (meta.get('head_dim') or DEFAULT_HEAD_DIM) if head == 'linear' else None,
             'preprocess': _canonical_preprocess(meta.get('preprocess')),
+            'frame_stack': frame_stack,
+            'frame_fusion': (meta.get('frame_fusion') or ('channels' if arch == 'random' else 'concat'))
+                            if frame_stack > 1 else None,
         }
         diffs = [f"{k}: saved {saved[k]!r}, now {self.build_spec[k]!r}"
                  for k in saved if saved[k] != self.build_spec[k]]
@@ -1279,6 +1336,32 @@ class EmbeddingNet(nn.Module):
                   f"encoder, so its weights give a different representation here -- "
                   + "; ".join(diffs))
 
+    def _batchnorms(self):
+        return [m for m in self.embedding.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+
+    def has_batchnorm(self) -> bool:
+        return bool(self._batchnorms())
+
+    def set_bn_train(self, train: bool) -> None:
+        """BatchNorm layers only: train mode normalises with each batch's own
+        statistics and updates the running ones (encoder.bn=adapt, as in
+        PIE-G); eval mode uses the running statistics. Everything else
+        (e.g. a ViT's dropout) stays in eval mode either way."""
+        for m in self._batchnorms():
+            m.train(train)
+
+    def bn_stats(self):
+        """BatchNorm running statistics (running_mean/var), as CPU copies."""
+        return {n: b.detach().cpu().clone() for n, b in self.embedding.named_buffers()
+                if n.endswith(("running_mean", "running_var"))}
+
+    def bn_stat_drift(self, reference) -> float:
+        """L2 distance of the running statistics from `reference`
+        (a bn_stats() snapshot): how far encoder.bn=adapt has moved them."""
+        current = self.bn_stats()
+        return float(torch.sqrt(sum(((current[n] - reference[n]) ** 2).sum() for n in reference)
+                                + torch.zeros(())))
+
     def set_trainable(self, mode: str) -> None:
         """Which parameters get requires_grad: 'none', 'all' (backbone and
         head), or 'head' (a linear head on a frozen backbone, as in PIE-G).
@@ -1295,32 +1378,3 @@ class EmbeddingNet(nn.Module):
         if self.embedding_name == 'true_state':
             return observation.squeeze().cpu().numpy()
         return self.encode(observation).squeeze().cpu().numpy()
-
-
-# ==============================================================================
-# EMBEDDING WRAPPER
-# ==============================================================================
-
-class EmbeddingWrapper(gym.ObservationWrapper):
-    def __init__(self, env, embedding):
-        gym.ObservationWrapper.__init__(self, env)
-
-        in_channels = env.observation_space.shape[2]
-        assert in_channels % 3 == 0,  \
-                """ Only RGB images are supported.
-                    Be sure that observation shape is (H, W, n * 3),
-                    where n is the number of frames per observation. """
-
-        self.in_channels = 3
-        self.n_frames = in_channels // 3
-
-        self.embedding = embedding
-        self.observation_space = Box(
-                    low=-np.inf, high=np.inf,
-                    shape=(self.embedding.out_size * self.n_frames,)
-        )
-
-    def observation(self, observation):
-        # if self.n_frames > 1, each passes through the embedding separately
-        observation = np.stack(np.split(observation, self.n_frames, axis=-1)) # (H, W, self.n_frames * 3) -> (self.n_frames, H, W, 3)
-        return self.embedding(torch.from_numpy(observation)).flatten()

@@ -179,22 +179,49 @@ class _LinearHead(nn.Module):
         return self.ln(self.fc(x.reshape(x.shape[0], -1)))
 
 
+def tokens_seq_first(sample: torch.Tensor, batch: int) -> bool:
+    """Is a 3-D (tokens) output (T, N, D), e.g. OpenAI CLIP, rather than
+    (N, T, D)? Decided from a dummy batch of known size."""
+    if sample.shape[0] == batch and sample.shape[1] != batch:
+        return False
+    if sample.shape[1] == batch and sample.shape[0] != batch:
+        return True
+    raise RuntimeError(f"can't tell the token layout of a {tuple(sample.shape)} output")
+
+
+FRAME_FUSIONS = ("channels", "concat", "diff")
+
+
+def fuse_frames(raw: torch.Tensor, batch: int, frames: int, mode: str) -> torch.Tensor:
+    """Combine per-frame encoder outputs (batch * frames leading rows,
+    batch-first) into one output per sample, along the feature axis (dim 1
+    for maps (N, C, H, W) and vectors (N, D); the last dim for tokens
+    (N, T, D)):
+      concat  all k frames side by side
+      diff    PIE-G: frames 2..k, then each one's difference from the frame
+              before it (the earlier frame detached, as in PIE-G)
+    """
+    per = raw.reshape(batch, frames, *raw.shape[1:])
+    if mode == "diff":
+        current = per[:, 1:]
+        per = torch.cat([current, current - per[:, :-1].detach()], dim=1)
+    parts = per.unbind(dim=1)
+    return torch.cat(parts, dim=-1 if raw.ndim == 3 else 1)
+
+
 def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
-              head_dim: Optional[int] = None) -> nn.Module:
+              head_dim: Optional[int] = None, seq_first: Optional[bool] = None) -> nn.Module:
     """Head for an encoder whose raw output on a dummy batch of `batch`
-    frames is `sample`."""
+    frames is `sample`. seq_first: token layout if already known (None:
+    detect it)."""
     if head is not None and head not in HEADS:
         raise ValueError(f"embedding.head={head!r}; expected one of {HEADS}")
     if head_dim is not None and head != "linear":
         raise ValueError(f"embedding.head_dim only applies to head=linear (got head={head})")
 
     if sample.ndim == 3:
-        if sample.shape[0] == batch and sample.shape[1] != batch:
-            seq_first = False
-        elif sample.shape[1] == batch and sample.shape[0] != batch:
-            seq_first = True
-        else:
-            raise RuntimeError(f"can't tell the token layout of a {tuple(sample.shape)} output")
+        if seq_first is None:
+            seq_first = tokens_seq_first(sample, batch)
         kind = "tokens"
     elif sample.ndim == 4:
         kind, seq_first = "map", False
