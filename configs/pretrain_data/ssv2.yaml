@@ -1,0 +1,11 @@
+# Something-Something v2, prepared by src/data/prepare_ssv2.py (once per split).
+name: ssv2
+root: ???                                # the --out folder of prepare_ssv2.py
+train_manifest: manifest_train.csv
+val_manifest: manifest_validation.csv    # null: validate on train_manifest (R3M's code does)
+image_size: 224                          # frame side the prep script wrote (--size)
+frames_as_stored: true                   # feed frames at their stored size: only the
+                                         #   encoder's normalisation applies, not its
+                                         #   resize/crop (R3M's code uses its 224px frames
+                                         #   whole). Needs image_size = the encoder's input size
+text_strip: 0                            # characters cut from the start of every text

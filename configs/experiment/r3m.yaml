@@ -1,0 +1,36 @@
+# @package _global_
+# R3M (Nair et al., 2022) for pretrain.py: a ResNet trained from scratch with
+# R3M's objective (src/losses.py) and its released models' settings --
+# batch 16 videos x 5 frames, Adam 1e-4, one random resized crop per video
+# (scale 0.2-1), 224px frames used whole with ImageNet normalisation
+# (pretrain_data.frames_as_stored), fp32. The paper's experiments ran 1M
+# steps (the default here); its released models 1.5M.
+#   python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2_frames
+#   python pretrain.py +experiment=r3m embedding=resnet18 ...    # smaller encoder
+defaults:
+  - override /embedding: resnet50
+  - override /augmentation: random_resized_crop
+
+embedding:
+  pretrained: false           # from scratch, as R3M
+
+augmentation:
+  params:
+    scale: [0.2, 1.0]
+
+objectives:
+  - name: r3m
+    weight: 1.0
+    tcn_weight: 1.0
+    lang_weight: 1.0
+    l1_weight: 1.0e-5
+    l2_weight: 1.0e-5
+    num_negatives: 3
+    alpha: 0.2
+    hidden_dim: 1024
+
+clip_augmentation: shared
+batch_size: 16
+train_steps: 1_000_000
+lr: 1.0e-4
+eval_frequency: 20_000

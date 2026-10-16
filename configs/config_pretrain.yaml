@@ -1,0 +1,53 @@
+# pretrain.py: train an encoder with video objectives (src/losses.py), then
+# use it in train_sac.py / train_drqv2.py / train_bc.py. A method's recipe is
+# a preset, e.g. +experiment=r3m (configs/experiment/r3m.yaml).
+defaults:
+  - embedding: resnet50       # architecture; embedding.pretrained=false trains from scratch
+  - pretrain_data: ssv2       # configs/pretrain_data/*.yaml
+  - augmentation: none        # configs/augmentation/*.yaml (`stage` is ignored here)
+  - _self_
+
+objectives: []                # [{name: r3m, weight: 1.0, ...params}], see src/losses.py
+trainable: all                # all | head (a linear head on a frozen backbone)
+clip_augmentation: shared     # shared: one augmentation draw per video, the same on
+                              #   all its frames (R3M's rctraj) | per_frame
+
+batch_size: 16                # videos per step
+train_steps: 1_000_000
+lr: 1.0e-4                    # Adam, encoder and objective heads alike
+betas: [0.9, 0.999]
+weight_decay: 0.0
+grad_clip: null               # null: no clipping (the norm is still logged)
+num_workers: 10               # data-loader processes (JPEG decoding)
+
+log_frequency: 100            # steps; logged values are averages over the interval
+eval_frequency: 20_000        # one validation batch, then checkpoint.pt is saved
+save:
+  enabled: true
+  keep_every: 100_000         # also keep encoder_step<N>.pt every N steps (null: never)
+resume: true                  # continue from <run dir>/checkpoint.pt if it exists
+                              #   (rerun with the same hydra.run.dir)
+
+seed: 1
+device: cuda
+model_dir: null               # see config_sac.yaml
+
+wandb:
+  enabled: false
+  project: pvr_torch
+  entity: majoinen-karri
+  run_name: null
+
+perf:
+  tf32: true
+  cudnn_benchmark: true
+  amp_bf16: false             # bf16 autocast for the encoder forward
+
+hydra:
+  job:
+    chdir: true
+  run:
+    dir: outputs/pretrain/${pretrain_data.name}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/pretrain_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${embedding.name}_seed${seed}

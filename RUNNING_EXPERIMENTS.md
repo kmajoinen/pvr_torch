@@ -14,6 +14,10 @@ training and augmentation work. This complements `README.md` rather than replaci
   buffer and wandb setup as `train_sac.py` (every `encoder.*`/`augmentation`
   option works the same). Config: `configs/config_drqv2.yaml` (=
   `config_sac.yaml` with `algo: drqv2`). See [DrQ-v2](#drq-v2-train_drqv2py).
+- **`pretrain.py`** — trains an encoder on video with registered objectives
+  (R3M so far), producing a checkpoint the scripts above load as an
+  embedding. Config: `configs/config_pretrain.yaml`. See
+  [Pretraining](#pretraining-pretrainpy).
 - **`train_sac_sb3.py`** — kept for posterity, Stable-Baselines3-backed.
   Supports state / CNN-from-scratch (SB3's NatureCNN) / frozen PVR (fast and
   slow) / PVR finetune (actor-only gradient routing, no `encoder.grads`
@@ -463,9 +467,98 @@ bootstraps from its own last state; before, its last transition's next_obs
 was the next episode's first frame. n-step returns never cross an episode
 end, and a terminated step gets discount 0.
 
+## Pretraining (`pretrain.py`)
+
+Trains any encoder this repo builds (`embedding=`, from scratch with
+`embedding.pretrained=false`) on a video dataset with objectives from the
+same registry as the RL aux losses (`src/losses.py`). A method is a preset
+in `configs/experiment/`; everything else (architecture, data, augmentation,
+batch size, objective weights) stays an ordinary override, so a reduced or
+modified recreation is one command.
+
+```bash
+# R3M, released-model settings, ResNet-50 on Something-Something v2
+python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2_frames
+# smaller encoder / ablations
+python pretrain.py +experiment=r3m embedding=resnet18 pretrain_data.root=...
+python pretrain.py +experiment=r3m objectives.0.lang_weight=0 pretrain_data.root=...
+```
+
+**Data.** A clip dataset is a folder of per-video frame folders
+(`000001.jpg`...) plus a manifest (`path,len,txt`), R3M's frame layout
+(`src/data/clips.py`; the official R3M code would additionally need its own
+`manifest.csv` with absolute paths and its 2-character text prefix). Something-Something v2 (about 169k training videos,
+~20 GB of webm; register at Qualcomm's site) is converted with:
+```bash
+python -m src.data.prepare_ssv2 --videos $SSV2/20bn-something-something-v2 \
+    --labels $SSV2/labels/something-something-v2-train.json \
+    --out /scratch/.../ssv2_frames --split train --workers 32   # then --split validation
+```
+Frames are 224×224 JPEGs (`--resize squash`, as R3M describes its Ego4D
+frames; `center_crop` keeps the aspect ratio), texts are SSv2's per-video
+labels ("putting a pen on a table"; `--text template` for the class
+template). Expect on the order of 100 GB and several million files for the
+training split -- check the scratch file-count quota. `--limit N` converts a
+subset; reruns skip videos finished with the same settings. Other datasets need only a script that
+writes the same layout, plus a `configs/pretrain_data/<name>.yaml`
+(`text_strip: 2` reproduces R3M's cut of Ego4D's "C " narration prefix).
+
+**R3M** (`configs/experiment/r3m.yaml`, objective `r3m`): time-contrastive,
+video-language and L1/L2 terms, a term-for-term port of the official
+`r3m/trainer.py`. `tests/test_r3m.py` checks it against the official code
+(identical metrics and identical weights after an Adam step; runs when the
+`r3m` package is installed). With real DistilBERT as well (needs
+`transformers` and a download): `PVR_TEST_NETWORK=1 python -m pytest
+tests/test_r3m.py -k real_distilbert` -- if only that fails, check the
+transformers version first and pin it. Settings are the released models': 16 videos ×
+5 frames per step, Adam 1e-4, weights 1/1/1e-5/1e-5, 3 negatives, start/goal
+frames from the first/last 20%, one `random_resized_crop` (scale 0.2–1) per
+video, ResNet trained from scratch with BatchNorm in train mode, 224px frames
+used whole with ImageNet normalisation (`pretrain_data.frames_as_stored`),
+fp32, and DistilBERT's dropout on while training with the text re-encoded at
+every reward call, as in the official code (`text_dropout: false`: encode
+once per step without dropout -- cheaper, but a deviation). 1M steps by default (the paper's experiments; the
+released models ran 1.5M). The language term needs `transformers` and
+DistilBERT (`distilbert-base-uncased`), cached beforehand on clusters
+without internet (`run_pretrain.sh`). Differences from the official code:
+- validation batches come from the SSv2 validation split; the official code
+  draws them from the training manifest (`pretrain_data.val_manifest=null`
+  does that too). Validation doesn't affect training.
+- the crop runs on the GPU per batch instead of in loader workers (same crop
+  distribution: torchvision's own sampling);
+- one GPU, no DataParallel; logged values are interval averages.
+
+**Output and use.** The run directory gets `checkpoint.pt` (latest state for
+resuming; saved with every validation batch, every `eval_frequency` steps),
+encoder-only `encoder_step<N>.pt` every `save.keep_every` steps and at the
+end (never overwritten), and `embedding.yaml`, pointing at the latest
+snapshot: copy it to `configs/embedding/<name>.yaml` and use
+`embedding=<name>` in `train_sac.py`/`train_drqv2.py`/`train_bc.py`. The
+encoder keeps the architecture's default input pipeline (ResNets: resize
+256, center crop 224), the same one the released R3M weights get here, so
+the two compare under identical RL preprocessing. Interrupted runs resume
+from `checkpoint.pt` when rerun with the same `hydra.run.dir`; the data
+stream is reseeded from the step, so it continues rather than repeats. The official R3M checkpoints load the same way:
+`embedding.arch=resnet50 embedding.checkpoint=~/.r3m/r3m_50/model.pt` (or
+the `snapshot.pt` of an official training run).
+
+**Throughput.** stdout/wandb report `charts/steps_per_sec` and
+`charts/data_wait_frac` (share of time waiting for the loader). To size a
+full run, train a few hundred steps on a converted subset (`--limit 2000`)
+per architecture and read both; a high `data_wait` means more
+`num_workers`/CPUs, not a bigger GPU.
+
+**Adding an objective**: register it in `src/losses.py` with
+`needs_clips = True` and a `clip_sampler()` that returns a `FrameSampler`
+(which frames of each video it reads); `forward()` gets
+`batch.clip_feats` (B, T, D) and `batch.text`. Clip objectives are rejected
+in `encoder.aux`, since replay buffers hold no clips.
+
 ## Cluster job scripts
 
-`run_sac.sh` (full run) and `debug_sac.sh` (quick smoke test) are the
+`run_pretrain.sh` is the R3M-on-SSv2 template for `pretrain.py` (with the
+one-time data and DistilBERT steps in its header). `run_sac.sh` (full run)
+and `debug_sac.sh` (quick smoke test) are the
 current SLURM templates for `train_sac.py` — copy and adjust
 `embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed. `sac_train.sh` /
 `sac_debug.sh` are the equivalents for `train_sac_sb3.py`.

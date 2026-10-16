@@ -261,6 +261,38 @@ class RandomOverlay(nn.Module):
         return (1 - self.alpha) * x + self.alpha * images
 
 
+@register_augmentation("random_resized_crop")
+class RandomResizedCrop(nn.Module):
+    """torchvision's RandomResizedCrop, drawn per sample: a crop covering
+    `scale` of the image area with aspect ratio in `ratio`, resized back to
+    the input size (bilinear). Crop boxes come from torchvision's own
+    get_params (same rejection sampling and fallback), so the distribution
+    is torchvision's -- R3M uses scale (0.2, 1.0). Channel-agnostic: on a
+    stacked input (3*k channels: frame stacks, or pretrain.py's clips with
+    clip_augmentation=shared) every frame of a sample gets the same crop.
+    Draws on the CPU RNG; one resize per sample, so it's meant for batches
+    of tens, not thousands."""
+
+    def __init__(self, scale=(0.08, 1.0), ratio=(3 / 4, 4 / 3)):
+        super().__init__()
+        scale, ratio = tuple(float(v) for v in scale), tuple(float(v) for v in ratio)
+        if not 0 < scale[0] <= scale[1] <= 1:
+            raise ValueError(f"random_resized_crop scale must satisfy 0 < min <= max <= 1, got {scale}")
+        if not 0 < ratio[0] <= ratio[1]:
+            raise ValueError(f"random_resized_crop ratio must satisfy 0 < min <= max, got {ratio}")
+        self.scale, self.ratio = scale, ratio
+
+    def forward(self, x):
+        import torchvision.transforms as T
+        import torchvision.transforms.functional as TF
+        h, w = x.shape[-2:]
+        out = torch.empty_like(x)
+        for i in range(x.shape[0]):
+            top, left, ch, cw = T.RandomResizedCrop.get_params(x[i], self.scale, self.ratio)
+            out[i] = TF.resized_crop(x[i], top, left, ch, cw, [h, w], antialias=True)
+        return out
+
+
 # ------------------------------------------------------------------------------
 # Kornia-backed transforms
 # ------------------------------------------------------------------------------

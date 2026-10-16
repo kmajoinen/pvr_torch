@@ -49,7 +49,8 @@ def _read_state_dict(path):
 
 def _read_checkpoint(path):
     """torch.load a checkpoint and unwrap the usual wrapper dicts: 'encoder'
-    (this repo's saved encoders), 'state_dict', 'model'. Returns
+    (this repo's saved encoders), 'state_dict', 'model', and the official R3M
+    code's 'r3m' snapshots (image encoder only). Returns
     (state_dict, build record): the record holds the embedding config the
     encoder was built with ('embedding' entry, or 'config'.embedding in a
     final_checkpoint.pt) and the frame size it encoded ('input_size'); both
@@ -80,6 +81,13 @@ def _read_checkpoint(path):
             record['embedding'] = raw['config']['embedding']
         if isinstance(raw.get('input_size'), int):
             record['input_size'] = raw['input_size']
+    if isinstance(raw, dict) and isinstance(raw.get('r3m'), dict):
+        # The official R3M code's snapshots (its train_representation.py, and
+        # the released ~/.r3m/r3m_*/model.pt): a DataParallel-wrapped model
+        # whose image encoder is module.convnet.* -- a torchvision ResNet
+        # with fc removed. Keep that; drop the language parts.
+        prefix = 'module.convnet.'
+        raw = {k[len(prefix):]: v for k, v in raw['r3m'].items() if k.startswith(prefix)}
     state_dict = raw
     for key in ('encoder', 'state_dict', 'model'):
         if isinstance(state_dict, dict) and isinstance(state_dict.get(key), dict):

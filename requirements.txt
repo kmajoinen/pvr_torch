@@ -35,6 +35,12 @@ git+https://github.com/ir413/mvp.git
 # MaskRCNN embedding only — large build, install separately if needed:
 # git+https://github.com/facebookresearch/detectron2.git
 
+# ── Pretraining (pretrain.py) ────────────────────────────────────────────────
+# Unpinned: not in the environment this file was generated from -- pin to
+# the versions you install.
+transformers                   # R3M's frozen DistilBERT sentence encoder
+av                             # PyAV: video decoding for src/data/prepare_ssv2.py
+
 # ── RL backend / experiment tracking ────────────────────────────────────────
 stable_baselines3==2.9.0
 wandb==0.25.0
