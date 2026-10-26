@@ -1,0 +1,11 @@
+# MoCo v2's augmentation after the random resized crop (which the image loader
+# does, pretrain_data.train_crop): colour jitter (p 0.8), grayscale (p 0.2),
+# gaussian blur (p 0.5), horizontal flip. Each view gets its own draws.
+name: pipeline
+stage: rl
+params:
+  transforms:
+    - {name: color_jitter, params: {brightness: 0.4, contrast: 0.4, saturation: 0.4, hue: 0.1, p: 0.8}}
+    - {name: random_grayscale, params: {p: 0.2}}
+    - {name: gaussian_blur, params: {kernel_size: 23, sigma: [0.1, 2.0], p: 0.5}}
+    - {name: horizontal_flip, params: {p: 0.5}}

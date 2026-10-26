@@ -14,9 +14,9 @@ training and augmentation work. This complements `README.md` rather than replaci
   buffer and wandb setup as `train_sac.py` (every `encoder.*`/`augmentation`
   option works the same). Config: `configs/config_drqv2.yaml` (=
   `config_sac.yaml` with `algo: drqv2`). See [DrQ-v2](#drq-v2-train_drqv2py).
-- **`pretrain.py`** — trains an encoder on video with registered objectives
-  (R3M so far), producing a checkpoint the scripts above load as an
-  embedding. Config: `configs/config_pretrain.yaml`. See
+- **`pretrain.py`** — trains an encoder with registered objectives, on video
+  (R3M) or images (ImageNet: supervised, MoCo v2), producing a checkpoint the
+  scripts above load as an embedding. Config: `configs/config_pretrain.yaml`. See
   [Pretraining](#pretraining-pretrainpy).
 - **`train_sac_sb3.py`** — kept for posterity, Stable-Baselines3-backed.
   Supports state / CNN-from-scratch (SB3's NatureCNN) / frozen PVR (fast and
@@ -470,8 +470,9 @@ end, and a terminated step gets discount 0.
 ## Pretraining (`pretrain.py`)
 
 Trains any encoder this repo builds (`embedding=`, from scratch with
-`embedding.pretrained=false`) on a video dataset with objectives from the
-same registry as the RL aux losses (`src/losses.py`). A method is a preset
+`embedding.pretrained=false`) on a video or image dataset
+(`pretrain_data.type: clips | images`) with objectives from the same
+registry as the RL aux losses (`src/losses.py`). A method is a preset
 in `configs/experiment/`; everything else (architecture, data, augmentation,
 batch size, objective weights) stays an ordinary override, so a reduced or
 modified recreation is one command.
@@ -548,16 +549,94 @@ full run, train a few hundred steps on a converted subset (`--limit 2000`)
 per architecture and read both; a high `data_wait` means more
 `num_workers`/CPUs, not a bigger GPU.
 
-**Adding an objective**: register it in `src/losses.py` with
+### ImageNet (supervised, MoCo v2)
+
+```bash
+# torchvision's reference recipe: 90 epochs, SGD 0.1 per 256 images, /10 every 30 epochs
+python pretrain.py +experiment=imagenet_supervised pretrain_data.root=/path/to/imagenet
+# MoCo v2, 200 epochs (PVR's MoCo ResNets); crop-only variant: augmentation=none
+python pretrain.py +experiment=moco_v2 pretrain_data.root=/path/to/imagenet
+python pretrain.py +experiment=moco_v2 embedding=resnet18 augmentation=none ...
+```
+
+**Getting ImageNet** (Kaggle): accept the rules of the
+`imagenet-object-localization-challenge` competition on kaggle.com, put an
+API token in `~/.kaggle/kaggle.json`, then
+`pip install kaggle && kaggle competitions download -c imagenet-object-localization-challenge -p <dir>`
+(~160 GB, one zip). Don't unzip it: 1.33M files, more than a typical
+scratch file quota. Convert the zip directly into ~150 shard files:
+```bash
+python -m src.data.prepare_imagenet --source <dir>/imagenet-object-localization-challenge.zip \
+    --out /scratch/.../imagenet --workers 16
+```
+The converter also reads the extracted Kaggle folder, torchvision's
+`train/<wnid>/` + `val/<wnid>/` layout, or that layout packed in one tar (a
+cluster's shared `ILSVRC2012_imagefolder.tar`, streamed once from start to
+end, never extracted). Labels follow the sorted-wnid order
+torchvision's ImageNet models use. Images are stored byte-for-byte;
+`--short-side 256` re-encodes larger ones, which makes decoding (usually the
+bottleneck) several times cheaper at a small cost in detail. `--classes
+<file of wnids>` (e.g. ImageNet-100's list) and `--per-class N` make
+subsets. Every stored image is decoded once during conversion, so a
+file the training loader can't read fails there instead of mid-run
+(`--no-verify` skips it). Each worker holds the zip's index in memory:
+request ~32 GB for 16 workers.
+
+**Without converting:** `pretrain_data.root` can also point at an extracted
+ImageFolder tree (`<root>/train/<wnid>/`, `<root>/val/<wnid>/`; labels in the
+same sorted-wnid order). On Triton, `run_imagenet.sh` does this by default:
+it extracts the shared `ILSVRC2012_imagefolder.tar` to the node's local
+`/tmp/$SLURM_JOB_ID` at job start (scicomp's local-storage pattern), trains
+from there, and removes it at the end. Don't point it at millions of files
+on a shared filesystem: listing and reading them is slow there.
+
+**Storage** (`src/data/shards.py`): plain tar files of ~1 GB plus an
+`index.npz` with each image's shard, byte offset and label; a loader worker
+reads an image with one positioned read. `tar tf` still lists a shard.
+
+**Data pipeline** (`src/data/images.py`): every epoch is a fresh
+permutation without replacement. Loader workers decode each image and cut
+one RandomResizedCrop per view (`pretrain_data.train_crop`; MoCo: 2 views,
+scale 0.2–1) to `image_size`; the GPU then applies `augmentation` to each
+view with its own draws. Validation: resize 256, center crop 224, a full
+pass over the split (`pretrain_data.eval_batches` limits it; MoCo validates
+its contrastive loss on random crops). Runs are sized in epochs (`epochs`,
+`eval_every_epochs`, `save.keep_every_epochs`), learning rates scale with
+`batch_size / lr_reference_batch`, and `lr_schedule` (step, cosine, warmup)
+changes once per epoch, as in the reference recipes. Resuming continues at
+the exact position in the epoch (same `batch_size` and `num_workers`).
+
+**MoCo v2** (objective `moco`): query view through the encoder and an MLP
+head, key view through momentum copies of both (0.999, updated at each
+training step), InfoNCE against a 65536-key queue at temperature 0.2. The
+paper's 8-GPU BatchNorm shuffling is emulated on one GPU (`bn_splits: 8`:
+both views encoded in chunks of 32, the keys after a random permutation).
+Implemented from the papers, not the official code (its license is
+non-commercial).
+
+**Compute.** One GPU for now (multi-GPU DDP is a planned follow-up). On one
+A100, a ResNet-18 at 90 epochs is roughly a day if the loader keeps up,
+ResNet-50 several times that -- watch `data_wait`; `perf.amp_bf16=true` and
+`--short-side 256` help. ImageNet-100 or fewer epochs make quick runs
+practical. The supervised classifier and MoCo's heads belong to the
+objective, so the saved encoder is the feature extractor, used in RL with
+the standard ResNet input pipeline.
+
+**Adding an objective**: register it in `src/losses.py`. Clip objectives:
 `needs_clips = True` and a `clip_sampler()` that returns a `FrameSampler`
-(which frames of each video it reads); `forward()` gets
-`batch.clip_feats` (B, T, D) and `batch.text`. Clip objectives are rejected
-in `encoder.aux`, since replay buffers hold no clips.
+(which frames of each video it reads); `forward()` gets `batch.clip_feats`
+(B, T, D) and `batch.text`. Image objectives: `needs_views = <n>` (and
+`needs_labels`); `forward()` gets `batch.views` (n augmented views,
+preprocessed but not normalised) and encodes them itself with
+`batch.encoder.encode_preprocessed`. Both kinds are rejected in
+`encoder.aux`, since replay buffers hold neither clips nor labelled
+multi-view images.
 
 ## Cluster job scripts
 
 `run_pretrain.sh` is the R3M-on-SSv2 template for `pretrain.py` (with the
-one-time data and DistilBERT steps in its header). `run_sac.sh` (full run)
+one-time data and DistilBERT steps in its header); `run_imagenet.sh` the
+ImageNet one (supervised or MoCo v2). `run_sac.sh` (full run)
 and `debug_sac.sh` (quick smoke test) are the
 current SLURM templates for `train_sac.py` — copy and adjust
 `embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed. `sac_train.sh` /

@@ -3,7 +3,7 @@
 # a preset, e.g. +experiment=r3m (configs/experiment/r3m.yaml).
 defaults:
   - embedding: resnet50       # architecture; embedding.pretrained=false trains from scratch
-  - pretrain_data: ssv2       # configs/pretrain_data/*.yaml
+  - pretrain_data: ssv2       # configs/pretrain_data/*.yaml (type: clips | images)
   - augmentation: none        # configs/augmentation/*.yaml (`stage` is ignored here)
   - _self_
 
@@ -12,19 +12,34 @@ trainable: all                # all | head (a linear head on a frozen backbone)
 clip_augmentation: shared     # shared: one augmentation draw per video, the same on
                               #   all its frames (R3M's rctraj) | per_frame
 
-batch_size: 16                # videos per step
+batch_size: 16                # videos / images per step
 train_steps: 1_000_000
-lr: 1.0e-4                    # Adam, encoder and objective heads alike
-betas: [0.9, 0.999]
+epochs: null                  # image data: train this many epochs instead (overrides train_steps)
+optimizer: adam               # adam | sgd -- encoder and objective heads alike
+lr: 1.0e-4
+lr_reference_batch: null      # set (e.g. 256): lr is scaled by batch_size / this (linear scaling)
+betas: [0.9, 0.999]           # adam
+momentum: 0.9                 # sgd
+nesterov: false               # sgd
 weight_decay: 0.0
+lr_schedule:
+  name: constant              # constant | cosine | step; with epochs, in epochs and changed
+                              #   once per epoch (torchvision, MoCo), else in steps
+  warmup: 0                   # linear warmup over this many epochs/steps
+  milestones: []              # step: multiply by gamma at each
+  gamma: 0.1
+  total: null                 # cosine: length (null: the whole run)
 grad_clip: null               # null: no clipping (the norm is still logged)
 num_workers: 10               # data-loader processes (JPEG decoding)
 
 log_frequency: 100            # steps; logged values are averages over the interval
-eval_frequency: 20_000        # one validation batch, then checkpoint.pt is saved
+eval_frequency: 20_000        # steps between validations (clips: one batch; images: the
+                              #   validation split), after each checkpoint.pt is saved
+eval_every_epochs: null       # image data: validate every N epochs instead
 save:
   enabled: true
   keep_every: 100_000         # also keep encoder_step<N>.pt every N steps (null: never)
+  keep_every_epochs: null     # image data: every N epochs instead
 resume: true                  # continue from <run dir>/checkpoint.pt if it exists
                               #   (rerun with the same hydra.run.dir)
 

@@ -1,0 +1,13 @@
+# ImageNet-1k, prepared by src/data/prepare_imagenet.py (shards, read directly
+# from Kaggle's zip or torchvision's folder layout).
+name: imagenet
+type: images
+root: ???                         # the --out folder of prepare_imagenet.py
+train_split: train
+val_split: val
+image_size: 224                   # crop size fed to the encoder
+train_crop:                       # RandomResizedCrop per view, in the loader workers
+  scale: [0.08, 1.0]
+  ratio: [0.75, 1.3333333333333333]
+eval_resize: 256                  # validation: resize the short side, then center-crop image_size
+eval_batches: null                # null: the whole validation split each time

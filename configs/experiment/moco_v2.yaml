@@ -1,0 +1,39 @@
+# @package _global_
+# MoCo v2 (Chen et al., 2020) on ImageNet, the paper's 200-epoch recipe: two
+# views per image, random resized crop (scale 0.2-1) + colour jitter (p 0.8)
+# + grayscale (p 0.2) + gaussian blur (p 0.5) + flip; 128-dim MLP head, queue
+# 65536, momentum 0.999, temperature 0.2; SGD lr 0.03 per 256 images, weight
+# decay 1e-4, cosine schedule. BatchNorm shuffling emulated with 8 chunks.
+# PVR's crop-only ablation: augmentation=none (crops only).
+#   python pretrain.py +experiment=moco_v2 pretrain_data.root=/path/to/imagenet
+defaults:
+  - override /embedding: resnet50
+  - override /pretrain_data: imagenet
+  - override /augmentation: moco_v2
+
+embedding:
+  pretrained: false
+
+pretrain_data:
+  train_crop:
+    scale: [0.2, 1.0]
+  eval_batches: 20      # validation = contrastive loss/accuracy on 20 batches (two random crops each)
+
+objectives:
+  - {name: moco, weight: 1.0, dim: 128, queue_size: 65536, momentum: 0.999, temperature: 0.2,
+     mlp: true, bn_splits: 8}
+
+batch_size: 256
+epochs: 200
+optimizer: sgd
+lr: 0.03
+lr_reference_batch: 256
+momentum: 0.9
+weight_decay: 1.0e-4
+lr_schedule: {name: cosine}
+eval_every_epochs: 1
+save:
+  keep_every: null
+  keep_every_epochs: 50
+num_workers: 16
+log_frequency: 500

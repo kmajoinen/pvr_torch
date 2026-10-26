@@ -344,6 +344,13 @@ def _color_jitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=1.0):
     )
 
 
+@register_augmentation("random_grayscale")
+def _random_grayscale(p=0.2):
+    # MoCo v2 / SimCLR: grayscale (replicated to 3 channels) with probability p.
+    K = _kornia()
+    return _RequireRGB(K.RandomGrayscale(p=p), "random_grayscale")
+
+
 @register_augmentation("gaussian_blur")
 def _gaussian_blur(kernel_size=5, sigma=(0.1, 2.0), p=1.0):
     # sigma is a (min, max) range sampled per sample. Kornia only treats it

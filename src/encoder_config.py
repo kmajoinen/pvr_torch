@@ -78,11 +78,13 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
 
     aux_specs = list(_plain(enc.get("aux")) or [])
     aux_classes = aux_loss_classes(aux_specs)
-    video_only = [s["name"] for s, c in zip(aux_specs, aux_classes) if c.needs_clips or c.needs_text]
-    if video_only:
+    pretrain_only = [s["name"] for s, c in zip(aux_specs, aux_classes)
+                     if c.needs_clips or c.needs_text or c.needs_views or c.needs_labels]
+    if pretrain_only:
         raise ValueError(
-            f"encoder.aux {video_only}: these objectives read video clips or text, which "
-            "replay buffers and BC datasets don't provide. Use them in pretrain.py."
+            f"encoder.aux {pretrain_only}: these objectives read video clips, text, multi-view "
+            "images or class labels, which replay buffers and BC datasets don't provide. Use "
+            "them in pretrain.py."
         )
     aux_needs_clean = any(c.needs_features for c in aux_classes)
     aux_needs_aug = any(c.needs_augmented for c in aux_classes)

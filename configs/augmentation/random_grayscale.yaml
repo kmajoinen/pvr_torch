@@ -1,0 +1,5 @@
+# Grayscale with probability p (kornia), as in MoCo v2 / SimCLR.
+name: random_grayscale
+stage: rl
+params:
+  p: 0.2

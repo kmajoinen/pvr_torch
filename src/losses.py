@@ -39,11 +39,16 @@ Contract:
         needs_augmented = True   # batch.obs_aug / batch.feats_aug
         needs_clips     = True   # batch.clip_feats: several frames per video
         needs_text      = True   # batch.text: one description per video
+        needs_views     = 2      # batch.views: this many augmented views per image
+        needs_labels    = True   # batch.labels: one class per image
     needs_augmented also requires an augmentation with stage aux or both
     (see src/views.py). Clips and text come from video datasets, so only
     pretrain.py supplies them; the RL/BC scripts reject such objectives. A
     clip objective also says which frames it wants: clip_sampler() returns a
-    picklable FrameSampler (it runs in data-loader workers).
+    picklable FrameSampler (it runs in data-loader workers). Image
+    objectives (needs_views) get the views as preprocessed, augmented
+    images and run batch.encoder on them themselves, so they control how
+    (MoCo: in chunks, for its BatchNorm shuffling).
   - forward() may return (loss, metrics) instead of the loss alone: metrics
     is a dict of extra scalars to log (tensors or floats), logged as
     <name>/<key>.
@@ -87,6 +92,12 @@ class AuxBatch:
     # the order it returned them, with gradient; and each video's text.
     clip_feats: Optional[torch.Tensor] = None
     text: Optional[Sequence[str]] = None
+    # Image objectives (pretrain.py): needs_views views of each of B images,
+    # each float (B, 3, H, W) at the encoder's input size, independently
+    # cropped and augmented, before mean/std normalisation (encode them
+    # with batch.encoder.encode_preprocessed); and class labels (B,).
+    views: Optional[List[torch.Tensor]] = None
+    labels: Optional[torch.Tensor] = None
 
 
 class FrameSampler:
@@ -106,6 +117,8 @@ class AuxLoss(nn.Module):
     needs_augmented: bool = False
     needs_clips: bool = False
     needs_text: bool = False
+    needs_views: int = 0
+    needs_labels: bool = False
 
     def __init__(self, encoder: nn.Module):
         super().__init__()
@@ -467,6 +480,128 @@ class R3M(AuxLoss):
             full_loss = full_loss + self.tcn_weight * tcnloss
 
         return full_loss, {k: v.detach() for k, v in metrics.items()}
+
+
+def _topk_accuracy(logits, labels, ks=(1, 5)):
+    ks = [k for k in ks if k <= logits.shape[1]]
+    hit = logits.topk(max(ks), dim=1).indices == labels[:, None]
+    return {f"top{k}": hit[:, :k].any(1).float().mean() for k in ks}
+
+
+@register_aux_loss("supervised")
+class Supervised(AuxLoss):
+    """Image classification: cross-entropy of a linear classifier on the
+    encoder's output (torchvision's ImageNet ResNets: fc on the pooled
+    features). The classifier belongs to the objective, so the saved encoder
+    stays a feature extractor."""
+    needs_views = 1
+    needs_labels = True
+
+    @classmethod
+    def check_params(cls, num_classes=1000, label_smoothing=0.0) -> None:
+        if int(num_classes) != num_classes or num_classes < 2:
+            raise ValueError(f"supervised num_classes must be a whole number >= 2, got {num_classes}")
+        if not 0.0 <= label_smoothing < 1.0:
+            raise ValueError(f"supervised label_smoothing must be in [0, 1), got {label_smoothing}")
+
+    def __init__(self, encoder: nn.Module, num_classes: int = 1000, label_smoothing: float = 0.0):
+        super().__init__(encoder)
+        self.check_params(num_classes, label_smoothing)
+        self.fc = nn.Linear(encoder.out_size, int(num_classes))
+        self.label_smoothing = label_smoothing
+
+    def forward(self, batch: AuxBatch):
+        logits = self.fc(batch.encoder.encode_preprocessed(batch.views[0])).float()
+        loss = F.cross_entropy(logits, batch.labels, label_smoothing=self.label_smoothing)
+        return loss, {k: v.detach() for k, v in _topk_accuracy(logits, batch.labels).items()}
+
+
+@register_aux_loss("moco")
+class MoCo(AuxLoss):
+    """MoCo v2 (He et al., 2020; Chen et al., 2020): contrastive learning
+    between two augmented views of each image, against a queue of keys from
+    past batches. The query view goes through the encoder and a projection
+    head; the key view through momentum (EMA) copies of both, updated at the
+    start of every training forward pass, as in the paper's code. Loss:
+    InfoNCE over (positive key, queue) at `temperature`; keys are enqueued
+    after each training batch.
+
+    bn_splits: the paper trains on 8 GPUs and shuffles the key batch across
+    them, so a sample's query and key BatchNorm statistics come from
+    different images (otherwise BatchNorm leaks which samples belong
+    together). Here both views are encoded in bn_splits chunks, the keys
+    after a random permutation -- the same thing on one GPU (batch 256 / 8 =
+    32 images per BatchNorm, as in the paper).
+
+    Defaults are MoCo v2's: 128-dim MLP head, queue 65536, momentum 0.999,
+    temperature 0.2. Metric: acc1, how often the positive key scores
+    highest (the official code's training accuracy)."""
+    needs_views = 2
+
+    @classmethod
+    def check_params(cls, dim=128, queue_size=65536, momentum=0.999, temperature=0.2, mlp=True,
+                     bn_splits=8) -> None:
+        for name, v in (("dim", dim), ("queue_size", queue_size), ("bn_splits", bn_splits)):
+            if int(v) != v or v < 1:
+                raise ValueError(f"moco {name} must be a whole number >= 1, got {v}")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"moco momentum must be in [0, 1), got {momentum}")
+        if temperature <= 0:
+            raise ValueError(f"moco temperature must be > 0, got {temperature}")
+
+    def __init__(self, encoder: nn.Module, dim: int = 128, queue_size: int = 65536,
+                 momentum: float = 0.999, temperature: float = 0.2, mlp: bool = True,
+                 bn_splits: int = 8):
+        super().__init__(encoder)
+        self.check_params(dim, queue_size, momentum, temperature, mlp, bn_splits)
+        import copy
+        d = encoder.out_size
+        self.head = (nn.Sequential(nn.Linear(d, d), nn.ReLU(inplace=True), nn.Linear(d, dim))
+                     if mlp else nn.Linear(d, dim))
+        # Momentum copies: part of the objective's state (saved, resumed),
+        # never optimised.
+        self.key_encoder = copy.deepcopy(encoder).requires_grad_(False)
+        self.key_head = copy.deepcopy(self.head).requires_grad_(False)
+        self.register_buffer("queue", F.normalize(torch.randn(int(dim), int(queue_size)), dim=0))
+        self.register_buffer("queue_ptr", torch.zeros((), dtype=torch.long))
+        self.momentum, self.temperature, self.bn_splits = momentum, temperature, int(bn_splits)
+
+    @torch.no_grad()
+    def _momentum_update(self, encoder):
+        m = self.momentum
+        for q, k in ((encoder, self.key_encoder), (self.head, self.key_head)):
+            for pq, pk in zip(q.parameters(), k.parameters()):
+                pk.mul_(m).add_(pq.detach(), alpha=1 - m)
+
+    def _project(self, encoder, head, x, perm=None):
+        if perm is not None:
+            x = x[perm]
+        out = torch.cat([head(encoder.encode_preprocessed(c)) for c in x.chunk(self.bn_splits)])
+        if perm is not None:
+            out = out[torch.argsort(perm)]
+        return F.normalize(out.float(), dim=1)
+
+    @torch.no_grad()
+    def _enqueue(self, k):
+        size = self.queue.shape[1]
+        idx = (self.queue_ptr + torch.arange(len(k), device=k.device)) % size
+        self.queue[:, idx] = k.T
+        self.queue_ptr.copy_((self.queue_ptr + len(k)) % size)
+
+    def forward(self, batch: AuxBatch):
+        x_q, x_k = batch.views[0], batch.views[1]
+        q = self._project(batch.encoder, self.head, x_q)
+        with torch.no_grad():
+            if self.training:
+                self._momentum_update(batch.encoder)
+            k = self._project(self.key_encoder, self.key_head, x_k,
+                              perm=torch.randperm(len(x_k), device=x_k.device))
+        logits = torch.cat([(q * k).sum(1, keepdim=True), q @ self.queue.clone()], dim=1) / self.temperature
+        target = torch.zeros(len(q), dtype=torch.long, device=q.device)
+        loss = F.cross_entropy(logits, target)
+        if self.training:
+            self._enqueue(k)
+        return loss, {"acc1": (logits.argmax(1) == 0).float().mean().detach()}
 
 
 # ------------------------------------------------------------------------------
