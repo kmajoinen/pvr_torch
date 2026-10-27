@@ -18,6 +18,10 @@ training and augmentation work. This complements `README.md` rather than replaci
   (R3M) or images (ImageNet: supervised, MoCo v2), producing a checkpoint the
   scripts above load as an embedding. Config: `configs/config_pretrain.yaml`. See
   [Pretraining](#pretraining-pretrainpy).
+- **`train_bc.py`** — behavioral cloning from offline datasets (V-D4RL,
+  Minari, pickled trajectories), with the same `encoder.*`/`augmentation`
+  options (BC: `encoder.grads` is `none | policy`). Config:
+  `configs/config_bc.yaml`. See [Behavioral cloning](#behavioral-cloning-train_bcpy).
 - **`train_sac_sb3.py`** — kept for posterity, Stable-Baselines3-backed.
   Supports state / CNN-from-scratch (SB3's NatureCNN) / frozen PVR (fast and
   slow) / PVR finetune (actor-only gradient routing, no `encoder.grads`
@@ -467,6 +471,31 @@ bootstraps from its own last state; before, its last transition's next_obs
 was the next episode's first frame. n-step returns never cross an episode
 end, and a terminated step gets discount 0.
 
+## Behavioral cloning (`train_bc.py`)
+
+An MLP policy (`hidden_size`, tanh-bounded output) regresses the dataset's
+actions with MSE, on embedding features for pixel datasets or raw state
+otherwise. 5% of the dataset is held out for `val/loss`; the policy is also
+rolled out in `dataset.eval_env_id` every `algo.eval_frequency` epochs for
+`algo.n_episodes_test` episodes (`eval/mean_reward`). `dataset=` picks the
+data: `vd4rl_cheetah_expert` (or `vd4rl` with `dataset.task`/`dataset.quality`,
+downloaded from the HF hub on first use), `door_expert` (Minari),
+`halfcheetah_expert`, or a pickle from
+`behavioral_cloning/save_opt_trajectories.py` (`dmc_cheetah_random`).
+Training counts epochs, not env steps: the data is fixed (cheetah_run expert
+is ~50k transitions, ~1.5k batches per epoch at `algo.batch_size: 32`), and
+wandb logs with `step=epoch`. Every batch is re-encoded from pixels, so
+frozen and finetuned encoders cost about the same per epoch. Datasets hold
+single frames, so `embedding.frame_stack > 1` is rejected.
+
+```bash
+# Frozen ResNet-18 on V-D4RL cheetah_run expert
+python train_bc.py dataset=vd4rl_cheetah_expert embedding=resnet18
+
+# Same, with the BC loss finetuning the encoder
+python train_bc.py dataset=vd4rl_cheetah_expert embedding=resnet18 encoder.grads=policy
+```
+
 ## Pretraining (`pretrain.py`)
 
 Trains any encoder this repo builds (`embedding=`, from scratch with
@@ -479,30 +508,38 @@ modified recreation is one command.
 
 ```bash
 # R3M, released-model settings, ResNet-50 on Something-Something v2
-python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2_frames
+python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2
 # smaller encoder / ablations
 python pretrain.py +experiment=r3m embedding=resnet18 pretrain_data.root=...
 python pretrain.py +experiment=r3m objectives.0.lang_weight=0 pretrain_data.root=...
 ```
 
-**Data.** A clip dataset is a folder of per-video frame folders
-(`000001.jpg`...) plus a manifest (`path,len,txt`), R3M's frame layout
-(`src/data/clips.py`; the official R3M code would additionally need its own
-`manifest.csv` with absolute paths and its 2-character text prefix). Something-Something v2 (about 169k training videos,
-~20 GB of webm; register at Qualcomm's site) is converted with:
+**Data.** A clip dataset is a manifest (`path,len,txt[,start]`, one row per
+video) plus its frames, stored either as frame shards (the default: the
+frames of all videos in ~1 GB tar files with an index, a few hundred files
+for all of SSv2) or as per-video frame folders (`000001.jpg`..., R3M's
+layout; one file per frame, so millions for SSv2 -- more than a typical
+scratch file quota). `src/data/clips.py` reads either; the official R3M code
+would additionally need its own `manifest.csv` with absolute paths and its
+2-character text prefix. Something-Something v2 (about 169k training videos,
+~20 GB of webm; on Triton a shared archive, which `run_prepare_ssv2.sh`
+extracts to a node's local disk and converts there) is converted once per
+split, in a CPU job:
 ```bash
 python -m src.data.prepare_ssv2 --videos $SSV2/20bn-something-something-v2 \
-    --labels $SSV2/labels/something-something-v2-train.json \
-    --out /scratch/.../ssv2_frames --split train --workers 32   # then --split validation
+    --labels $SSV2/something-something-v2-labels/labels/train.json \
+    --out $WRKDIR/data/ssv2 --split train --workers 32   # then --split validation (labels/validation.json)
 ```
 Frames are 224×224 JPEGs (`--resize squash`, as R3M describes its Ego4D
 frames; `center_crop` keeps the aspect ratio), texts are SSv2's per-video
 labels ("putting a pen on a table"; `--text template` for the class
-template). Expect on the order of 100 GB and several million files for the
-training split -- check the scratch file-count quota. `--limit N` converts a
-subset; reruns skip videos finished with the same settings. Other datasets need only a script that
-writes the same layout, plus a `configs/pretrain_data/<name>.yaml`
-(`text_strip: 2` reproduces R3M's cut of Ego4D's "C " narration prefix).
+template). Expect on the order of 100 GB for the training split.
+`--limit N` converts a subset. Shards aren't resumable (an interrupted split
+is converted again); `--format folders` is, skipping videos finished with
+the same settings. `run_pretrain.sh` copies the shards to the node's local
+disk at job start. Other datasets need only a script that writes the same
+layout, plus a `configs/pretrain_data/<name>.yaml` (`text_strip: 2`
+reproduces R3M's cut of Ego4D's "C " narration prefix).
 
 **R3M** (`configs/experiment/r3m.yaml`, objective `r3m`): time-contrastive,
 video-language and L1/L2 terms, a term-for-term port of the official
@@ -640,4 +677,6 @@ ImageNet one (supervised or MoCo v2). `run_sac.sh` (full run)
 and `debug_sac.sh` (quick smoke test) are the
 current SLURM templates for `train_sac.py` — copy and adjust
 `embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed. `sac_train.sh` /
-`sac_debug.sh` are the equivalents for `train_sac_sb3.py`.
+`sac_debug.sh` are the equivalents for `train_sac_sb3.py`. `run_ft_bc.sh`
+is the template for `train_bc.py` (ResNet-18 finetuning on cheetah_run;
+`run_bc.sh` is a legacy script for a different cluster).

@@ -5,13 +5,24 @@ description.
 
     python -m src.data.prepare_ssv2 \
         --videos /scratch/.../20bn-something-something-v2 \
-        --labels /scratch/.../labels/something-something-v2-train.json \
-        --out /scratch/.../ssv2_frames --split train --workers 32
+        --labels /scratch/.../something-something-v2-labels/labels/train.json \
+        --out /scratch/.../ssv2 --split train --workers 32
 
-Run once per split (train, validation). Writes <out>/frames/<id>/000001.jpg...
-and <out>/manifest_<split>.csv. Re-running skips videos already done with the
-same --size/--resize/--quality (a .done file in each folder records them;
-different settings reconvert), so an interrupted job can just be restarted.
+Run once per split (train, validation). Two output formats (--format):
+
+  shards   (default) <out>/<split>/shard_*.tar + index.npz (src/data/shards.py):
+           every frame a JPEG member <id>/000001.jpg..., ~1 GB per shard -- a
+           few hundred files for all of SSv2 instead of millions, so it fits a
+           scratch file quota and copies to a node's local disk in minutes.
+           The manifest's `start` column is each video's first frame in the
+           index. Not resumable: an interrupted split is converted again.
+  folders  <out>/frames/<id>/000001.jpg... (R3M's layout; one file per frame).
+           Re-running skips videos already done with the same
+           --size/--resize/--quality (a .done file in each folder records them;
+           different settings reconvert).
+
+Both write <out>/manifest_<split>.csv (path, len, txt[, start]), which
+src/data/clips.py reads either way.
 --limit N converts only the first N videos of the split (a quick subset).
 
 Text: SSv2's per-video `label` ("putting a pen on a table") by default, the
@@ -45,12 +56,22 @@ def _resize(frame, size: int, mode: str):
     return frame[top:top + size, left:left + size]
 
 
+def encode_frames(video_path: str, size: int, resize: str, quality: int):
+    """Every frame of a video, resized, as JPEG bytes."""
+    import av
+    import cv2
+    out = []
+    with av.open(video_path) as container:
+        for frame in container.decode(video=0):
+            rgb = _resize(frame.to_ndarray(format="rgb24"), size, resize)
+            out.append(cv2.imencode(".jpg", rgb[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes())
+    return out
+
+
 def convert_video(video_path: str, out_dir: str, size: int, resize: str, quality: int) -> int:
     """Decode every frame, write 000001.jpg..., return the frame count.
     Skipped (count read back) if out_dir's .done marker records the same
     settings; otherwise the folder's frames are replaced."""
-    import av
-    import cv2
     settings = {"size": size, "resize": resize, "quality": quality}
     done = os.path.join(out_dir, ".done")
     try:
@@ -64,13 +85,11 @@ def convert_video(video_path: str, out_dir: str, size: int, resize: str, quality
         for name in os.listdir(out_dir):
             os.remove(os.path.join(out_dir, name))
     os.makedirs(out_dir, exist_ok=True)
-    n = 0
-    with av.open(video_path) as container:
-        for frame in container.decode(video=0):
-            rgb = _resize(frame.to_ndarray(format="rgb24"), size, resize)
-            n += 1
-            cv2.imwrite(os.path.join(out_dir, f"{n:06d}.jpg"), rgb[..., ::-1],
-                        [cv2.IMWRITE_JPEG_QUALITY, quality])
+    frames = encode_frames(video_path, size, resize, quality)
+    for n, data in enumerate(frames, 1):
+        with open(os.path.join(out_dir, f"{n:06d}.jpg"), "wb") as f:
+            f.write(data)
+    n = len(frames)
     with open(done + ".tmp", "w") as f:
         json.dump({"frames": n, **settings}, f)
     os.replace(done + ".tmp", done)
@@ -87,6 +106,19 @@ def _job(args):
         return vid, 0, f"{type(e).__name__}: {e}"
 
 
+def _encode_chunk(jobs):
+    """Shards mode: (vid, frames or None, error) per (vid, path, size, resize, quality)."""
+    import cv2
+    cv2.setNumThreads(1)
+    out = []
+    for vid, path, size, resize, quality in jobs:
+        try:
+            out.append((vid, encode_frames(path, size, resize, quality), None))
+        except Exception as e:  # a corrupt video shouldn't stop the whole split
+            out.append((vid, None, f"{type(e).__name__}: {e}"))
+    return out
+
+
 def _text(entry: dict, mode: str) -> str:
     if mode == "none":
         return ""
@@ -98,9 +130,11 @@ def _text(entry: dict, mode: str) -> str:
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--videos", required=True, help="folder with <id>.webm files")
-    p.add_argument("--labels", required=True, help="the split's json, e.g. something-something-v2-train.json")
+    p.add_argument("--labels", required=True, help="the split's json, e.g. something-something-v2-labels/labels/train.json")
     p.add_argument("--out", required=True, help="dataset root (frames/ and manifests go here)")
     p.add_argument("--split", required=True, help="names the manifest: manifest_<split>.csv")
+    p.add_argument("--format", choices=("shards", "folders"), default="shards")
+    p.add_argument("--shard-gb", type=float, default=1.0)
     p.add_argument("--size", type=int, default=224)
     p.add_argument("--resize", choices=("squash", "center_crop"), default="squash")
     p.add_argument("--text", choices=("label", "template", "none"), default="label")
@@ -117,25 +151,51 @@ def main(argv=None):
         entries = entries[:a.limit]
     if a.text != "none" and entries and "label" not in entries[0]:
         sys.exit(f"{a.labels} has no labels (the test split?); use --text none")
-    jobs = [(e["id"], os.path.join(a.videos, f"{e['id']}.{a.ext}"),
-             os.path.join(a.out, "frames", e["id"]), a.size, a.resize, a.quality) for e in entries]
-    print(f"{len(jobs):,} videos -> {a.out} ({a.size}px {a.resize}, {a.workers} workers)")
+    print(f"{len(entries):,} videos -> {a.out} ({a.format}, {a.size}px {a.resize}, {a.workers} workers)")
+    lengths, starts, failed, t0 = {}, {}, [], time.time()
 
-    lengths, failed, t0 = {}, [], time.time()
-    with ProcessPoolExecutor(a.workers) as pool:
-        for i, (vid, n, err) in enumerate(pool.map(_job, jobs, chunksize=16), 1):
-            if err is not None or n == 0:
-                failed.append((vid, err or "no frames"))
-            else:
-                lengths[vid] = n
-            if i % 1000 == 0 or i == len(jobs):
-                print(f"  {i:,}/{len(jobs):,}  {i / (time.time() - t0):.0f} videos/s  failed={len(failed)}")
+    def progress(i):
+        if i % 1000 == 0 or i == len(entries):
+            print(f"  {i:,}/{len(entries):,}  {i / (time.time() - t0):.0f} videos/s  failed={len(failed)}")
+
+    if a.format == "folders":
+        jobs = [(e["id"], os.path.join(a.videos, f"{e['id']}.{a.ext}"),
+                 os.path.join(a.out, "frames", e["id"]), a.size, a.resize, a.quality) for e in entries]
+        with ProcessPoolExecutor(a.workers) as pool:
+            for i, (vid, n, err) in enumerate(pool.map(_job, jobs, chunksize=16), 1):
+                if err is not None or n == 0:
+                    failed.append((vid, err or "no frames"))
+                else:
+                    lengths[vid] = n
+                progress(i)
+    else:
+        from src.data.shards import ShardWriter, ordered_map
+        jobs = [(e["id"], os.path.join(a.videos, f"{e['id']}.{a.ext}"), a.size, a.resize, a.quality)
+                for e in entries]
+        with ShardWriter(os.path.join(a.out, a.split), max_bytes=int(a.shard_gb * (1 << 30))) as w, \
+                ProcessPoolExecutor(a.workers) as pool:
+            for i, (vid, frames, err) in enumerate(
+                    ordered_map(pool, _encode_chunk, jobs, chunksize=4, in_flight=4 * a.workers), 1):
+                if err is not None or not frames:
+                    failed.append((vid, err or "no frames"))
+                else:
+                    starts[vid], lengths[vid] = len(w.keys), len(frames)
+                    for n, data in enumerate(frames, 1):
+                        w.add(f"{vid}/{n:06d}.jpg", data)
+                progress(i)
 
     import pandas as pd
-    rows = [{"path": os.path.join("frames", e["id"]), "len": lengths[e["id"]], "txt": _text(e, a.text)}
-            for e in entries if e["id"] in lengths]
+    rows = []
+    for e in entries:
+        if e["id"] in lengths:
+            row = {"path": a.split if a.format == "shards" else os.path.join("frames", e["id"]),
+                   "len": lengths[e["id"]], "txt": _text(e, a.text)}
+            if a.format == "shards":
+                row["start"] = starts[e["id"]]
+            rows.append(row)
     manifest = os.path.join(a.out, f"manifest_{a.split}.csv")
-    pd.DataFrame(rows, columns=["path", "len", "txt"]).to_csv(manifest, index=False)
+    columns = ["path", "len", "txt"] + (["start"] if a.format == "shards" else [])
+    pd.DataFrame(rows, columns=columns).to_csv(manifest, index=False)
     total = sum(lengths.values())
     print(f"Wrote {manifest}: {len(rows):,} videos, {total:,} frames"
           + (f", mean {total / len(rows):.1f} per video" if rows else ""))

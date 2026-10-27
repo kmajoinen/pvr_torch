@@ -1,5 +1,6 @@
 # Something-Something v2, prepared by src/data/prepare_ssv2.py (once per split).
 name: ssv2
+type: clips
 root: ???                                # the --out folder of prepare_ssv2.py
 train_manifest: manifest_train.csv
 val_manifest: manifest_validation.csv    # null: validate on train_manifest (R3M's code does)

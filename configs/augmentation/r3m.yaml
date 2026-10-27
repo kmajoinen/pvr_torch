@@ -1,0 +1,7 @@
+# R3M's augmentation: one random resized crop (scale 0.2-1) per video, the same
+# on all its frames (pretrain.py's clip_augmentation=shared).
+name: random_resized_crop
+stage: rl
+params:
+  scale: [0.2, 1.0]
+  ratio: [0.75, 1.3333333333333333]

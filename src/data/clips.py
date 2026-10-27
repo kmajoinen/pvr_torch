@@ -1,16 +1,22 @@
 """
 Video clip datasets for pretraining (pretrain.py).
 
-On disk -- R3M's frame layout (its official loader reads the same folders;
-running that code on this data would still need its own manifest.csv, with
-absolute paths and its 2-character text prefix):
+On disk, a manifest plus the frames, in either of two layouts:
 
-    <root>/<manifest>.csv     one row per video: path, len, txt
-    <root>/<path>/000001.jpg  its frames, numbered 1..len, all the same size
+    <root>/<manifest>.csv     one row per video: path, len, txt[, start]
+
+  folders  <root>/<path>/000001.jpg ...: the video's frames, numbered 1..len
+           (R3M's frame layout; its official loader reads the same folders,
+           though running that code would still need its own manifest.csv,
+           with absolute paths and its 2-character text prefix)
+  shards   (a `start` column) <root>/<path>/ is a shard folder
+           (src/data/shards.py) holding the frames of many videos; frame i
+           of a video is index row start + i - 1
 
 `path` is relative to <root> (or absolute); `txt` is the video's description
-(may be empty). src/data/prepare_ssv2.py writes this for Something-Something
-v2; any other video source only needs a script that writes the same.
+(may be empty); all frames have the same size. src/data/prepare_ssv2.py
+writes either for Something-Something v2; any other video source only needs
+a script that writes the same.
 
 ClipDataset samples forever, with replacement: each item is one uniformly
 drawn video and the frames its FrameSampler picks (src/losses.py), as
@@ -35,6 +41,7 @@ class ClipManifest:
             raise FileNotFoundError(f"clip manifest {path!r} not found")
         # Strings: SSv2-style numeric folder names would otherwise parse as ints.
         df = pd.read_csv(path, keep_default_na=False, dtype={"path": str, "txt": str})
+        sharded = "start" in df.columns
         missing = {"path", "len", "txt"} - set(df.columns)
         if missing:
             raise ValueError(f"{path!r} lacks columns {sorted(missing)} (expected path, len, txt)")
@@ -48,6 +55,7 @@ class ClipManifest:
         # text_strip: characters cut from the start of every text (R3M's
         # Ego4D loader cuts the narrations' "C " prefix this way).
         self.texts: List[str] = [str(t)[text_strip:] for t in df["txt"]]
+        self.starts = df["start"].to_numpy(dtype=np.int64) if sharded else None
         self.source = path
 
     def __len__(self):
@@ -68,6 +76,19 @@ class ClipDataset(IterableDataset):
         self.manifest = manifest
         self.sampler = sampler
         self.seed = seed
+        self._shards = {}             # shard folder -> (index, reader), loaded on first use
+
+    def _frame(self, i: int, idx: int) -> torch.Tensor:
+        m = self.manifest
+        if m.starts is None:
+            return read_frame(m.paths[i], idx)
+        from src.data.images import decode
+        from src.data.shards import ShardReader, load_index
+        d = m.paths[i]
+        if d not in self._shards:
+            self._shards[d] = (load_index(d, fields=("shard", "offset", "size")), ShardReader(d))
+        index, reader = self._shards[d]
+        return decode(reader.read(index, int(m.starts[i]) + idx - 1))
 
     def _rng(self):
         info = get_worker_info()
@@ -77,7 +98,7 @@ class ClipDataset(IterableDataset):
     def sample(self, rng):
         m = self.manifest
         i = int(rng.integers(0, len(m)))
-        frames = [read_frame(m.paths[i], idx) for idx in self.sampler(int(m.lengths[i]), rng)]
+        frames = [self._frame(i, idx) for idx in self.sampler(int(m.lengths[i]), rng)]
         return torch.stack(frames), m.texts[i]
 
     def __iter__(self):

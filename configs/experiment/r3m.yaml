@@ -5,18 +5,14 @@
 # (scale 0.2-1), 224px frames used whole with ImageNet normalisation
 # (pretrain_data.frames_as_stored), fp32. The paper's experiments ran 1M
 # steps (the default here); its released models 1.5M.
-#   python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2_frames
+#   python pretrain.py +experiment=r3m pretrain_data.root=/path/to/ssv2
 #   python pretrain.py +experiment=r3m embedding=resnet18 ...    # smaller encoder
 defaults:
   - override /embedding: resnet50
-  - override /augmentation: random_resized_crop
+  - override /augmentation: r3m
 
 embedding:
   pretrained: false           # from scratch, as R3M
-
-augmentation:
-  params:
-    scale: [0.2, 1.0]
 
 objectives:
   - name: r3m
