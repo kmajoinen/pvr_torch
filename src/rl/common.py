@@ -403,3 +403,27 @@ def encoder_record(cfg, net) -> dict:
         "embedding": OmegaConf.to_container(cfg.embedding, resolve=True),
         "input_size": net.input_size,
     }
+
+
+def buffer_options(algo_cfg, pixels_in_buffer: bool) -> dict:
+    """ReplayBuffer storage options from algo.buffer_* (compression applies
+    to pixel buffers only: feature vectors barely compress)."""
+    compression = str(algo_cfg.get("buffer_compression") or "none")
+    if compression != "none" and not pixels_in_buffer:
+        print(f"Note: algo.buffer_compression={compression} ignored: the buffer stores features, not pixels")
+        compression = "none"
+    if compression == "none":
+        return {}
+    return {"compression": compression, "compression_level": algo_cfg.get("buffer_compression_level"),
+            "decode_threads": int(algo_cfg.get("buffer_decode_threads") or 8),
+            "max_gb": algo_cfg.get("buffer_max_gb")}
+
+
+def buffer_status(rb):
+    """(stdout fragment, wandb metrics) for a compressed buffer's size; empty otherwise."""
+    if getattr(rb, "compression", "none") == "none":
+        return "", {}
+    gb, ratio = rb.stored_bytes / 1e9, rb.compression_ratio()
+    return (f"  buffer={gb:.1f}GB({ratio:.1f}x)",
+            {"charts/buffer_gb": gb, "charts/buffer_compression_ratio": ratio, "charts/buffer_size": len(rb)})
+

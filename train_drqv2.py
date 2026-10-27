@@ -61,6 +61,8 @@ from src.rl.buffer import ReplayBuffer
 from src.rl.common import (
     EncoderOptim,
     Encoding,
+    buffer_options,
+    buffer_status,
     build_encoder_stack,
     encode_replay_batch,
     encoder_log,
@@ -144,7 +146,7 @@ def main(cfg: DictConfig) -> None:
     print(f"\nBuffer stores: {stack.buffer_reason}")
     rb = ReplayBuffer(
         a.buffer_size, obs_shape, action_dim, device, obs_dtype=buffer_dtype,
-        nstep=int(a.nstep), gamma=a.gamma,
+        nstep=int(a.nstep), gamma=a.gamma, **buffer_options(a, pixels_in_buffer),
     )
     save_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
     best_eval_return = -float("inf")
@@ -291,6 +293,7 @@ def main(cfg: DictConfig) -> None:
                 f"  actor_loss={actor_loss.item():8.3f}"
                 f"  std={std:.3f}  SPS={sps}"
                 f"  gnorm(q/actor)={q_gnorm:.2f}/{actor_gnorm:.2f}"
+                + buffer_status(rb)[0]
                 + (
                     f"  enc_gnorm(c/a)={enc_gnorm_critic:.2f}/{enc_gnorm_actor:.2f}"
                     f"  emb_std_ratio={collapse.ratio:.2f}"
@@ -311,6 +314,7 @@ def main(cfg: DictConfig) -> None:
                     "train/q_grad_norm": q_gnorm,
                     "train/actor_grad_norm": actor_gnorm,
                     "charts/SPS": sps,
+                    **buffer_status(rb)[1],
                     "charts/frames": global_step * action_repeat,
                     "global_step": global_step,
                 }

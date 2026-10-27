@@ -41,6 +41,7 @@ git+https://github.com/ir413/mvp.git
 transformers                   # R3M's frozen DistilBERT sentence encoder
 av                             # PyAV: video decoding for src/data/prepare_ssv2.py
 kaggle                         # optional: downloading ImageNet (see RUNNING_EXPERIMENTS.md)
+zstandard                      # optional: algo.buffer_compression=zstd (replay buffer)
 
 # ── RL backend / experiment tracking ────────────────────────────────────────
 stable_baselines3==2.9.0

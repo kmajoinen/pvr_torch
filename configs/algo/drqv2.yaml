@@ -4,6 +4,12 @@ name: drqv2
 total_timesteps: 500_000      # agent steps (1M frames at action_repeat 2)
 action_repeat: 2              # env frames per agent step (rewards summed)
 buffer_size: 1_000_000
+buffer_compression: none      # none | zstd | lz4 | zlib: lossless per-frame compression of pixel
+                              #   buffers (~3-5x at 224px); zstd needs `pip install zstandard`,
+                              #   lz4 `pip install lz4`; zlib is built in but slower to decode
+buffer_compression_level: null  # codec level (null: zstd 3, lz4 0, zlib 1)
+buffer_decode_threads: 8      # threads decompressing sampled batches (in the background)
+buffer_max_gb: null           # cap on compressed storage: the buffer stops growing there
 learning_starts: 2000         # uniform random actions, no updates, until here
 batch_size: 256
 nstep: 3                      # n-step returns (never cross an episode end)

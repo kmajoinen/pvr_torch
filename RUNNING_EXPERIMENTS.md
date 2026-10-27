@@ -40,7 +40,7 @@ applies to `train_drqv2.py` as well.
 |-------------|----------------|-------|
 | `dmc`       | `_make_dmc`    | dm_control via shimmy; renders pixels at `cfg.env.image_size` via dm_control's own `render_kwargs` (height/width/camera_id) |
 | `carracing` | `_make_carracing` | Gymnasium's `CarRacing-v3`, native pixel obs |
-| `gym`       | `_make_gym`    | generic pixel builder for envs with no native pixel obs and no dm_control-style render_kwargs (Adroit, FrankaKitchen) — `AddRenderObservation` at the env's default camera/resolution; `image_size` isn't used to control render resolution here, only `EmbeddingNet`'s own resize downstream |
+| `gym`       | `_make_gym`    | generic pixel builder for envs with no native pixel obs and no dm_control-style render_kwargs (Adroit, FrankaKitchen) — `AddRenderObservation` at the env's default camera and native resolution (480×480 for Adroit), then resized to `image_size` before the replay buffer |
 | `state`     | `_make_state`  | raw/flattened proprioceptive state (any Gym/dm_control env; `Dict` observations get auto-flattened) |
 
 Only `configs/env/*.yaml` files that have a `builder:` field work with
@@ -377,7 +377,16 @@ buffer_obs: auto     # SAC only: auto | features | pixels
 - **Memory**: pixels in the replay buffer cost `buffer_size × H × W × 3`
   bytes (next_obs is derived from the following slot, not stored). At 224px
   that's ~15GB per 100k transitions — override `env.image_size=112` (or
-  `84`) and/or shrink `algo.buffer_size` for pixel-buffer runs.
+  `84`), shrink `algo.buffer_size`, or compress the buffer:
+  `algo.buffer_compression=zstd` (lossless; `pip install zstandard`; `lz4`
+  and the built-in but slower `zlib` also work). Rendered frames compress
+  ~3–5× at 224px (measured: DMC cheetah ~5×, Adroit hammer ~3.7×), so 1M
+  frames take ~30–40 GB instead of 151 GB. Sampled batches are decompressed
+  in background threads (`algo.buffer_decode_threads`) while the previous
+  update runs, so each update trains on a batch drawn one update earlier.
+  `algo.buffer_max_gb` caps the compressed size (the buffer stops growing
+  there), and `charts/buffer_gb` / `charts/buffer_compression_ratio` log
+  it as it fills. Leave headroom in `--mem` beyond the buffer.
 - **BatchNorm**: the encoder stays in `eval()` even while it trains, so
   BatchNorm running statistics never update (trainable BN affine params
   only), unless `encoder.bn=adapt` (see PIE-G options above).
