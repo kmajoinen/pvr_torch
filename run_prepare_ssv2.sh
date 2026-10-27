@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=prep_ssv2
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=32G
-#SBATCH --time=12:00:00
-#SBATCH --tmp=60G                # the archive's extracted contents (~25 GB) + margin
-#SBATCH --constraint=localdisk   # a node with a local disk (diskless nodes' /tmp is RAM)
+#SBATCH --cpus-per-task=16       # one conversion worker per CPU
+#SBATCH --mem=48G                # the extracted archive (~25 GB, fixed: /tmp is a RAM disk on
+                                 #   diskless CPU nodes) + workers (~0.5 GB each) + main
+#SBATCH --time=24:00:00          # conversion can't resume: leave margin
+# No --tmp/--constraint=localdisk: Triton's CPU partitions may not offer them;
+# /tmp is then RAM, which --mem above covers.
 #SBATCH --error=./outs/prep_ssv2_%A/e.err
 #SBATCH --output=./outs/prep_ssv2_%A/o.out
 
@@ -27,6 +28,9 @@ trap 'exit 143' TERM                  # cancel/timeout: stop here (EXIT then cle
 
 # Extracted straight from the shared drive (one sequential read): no copy of
 # the archive needed next to its contents.
+need_kb=$(du -k --apparent-size "$ARCHIVE" | cut -f1); free_kb=$(df -k --output=avail /tmp | tail -1)
+[ "$need_kb" -lt "$free_kb" ] || { echo "/tmp has $((free_kb / 1048576)) GB free, the archive needs $((need_kb / 1048576)) GB"; exit 1; }
+df -h /tmp
 echo "extracting $ARCHIVE -> $LOCAL"; time tar -xf "$ARCHIVE" -C "$LOCAL"
 VIDEOS="$LOCAL/20bn-something-something-v2"
 LABELS="$LOCAL/something-something-v2-labels/labels"
