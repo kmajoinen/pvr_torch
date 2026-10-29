@@ -482,6 +482,119 @@ class R3M(AuxLoss):
         return full_loss, {k: v.detach() for k, v in metrics.items()}
 
 
+class VIPFrameSampler(FrameSampler):
+    """VIP's four frames per video (VIPBuffer._sample in the official
+    vip/utils/data_loaders.py), in this order:
+      start  anywhere but the last two frames
+      goal   after start
+      s0     in [start, goal)
+      s1     s0 + 1
+    -- a random sub-trajectory start..goal and one transition inside it. The
+    official loader numbers frames 0..length-1; these are its draws, shifted
+    to frames 1..length. Evaluation batches sample the same way (the
+    official validation loader differs only in having no augmentation)."""
+    frames_per_clip = 4
+    min_length = 3
+
+    def __call__(self, length: int, rng) -> List[int]:
+        start = rng.integers(0, length - 2)
+        goal = rng.integers(start + 1, length)
+        s0 = rng.integers(start, goal)
+        s1 = min(s0 + 1, goal)
+        return [int(i) + 1 for i in (start, goal, s0, s1)]
+
+
+@register_aux_loss("vip")
+class VIP(AuxLoss):
+    """VIP (Ma et al., 2023): a port of the loss in the official
+    vip/trainer.py, term for term, with the same random draws in the same
+    order (negatives via torch.randperm).
+
+    The negative embedding distance V(o; g) = -||phi(o) - phi(g)|| is a
+    goal-conditioned value function, trained with VIP's dual offline-RL
+    objective under a reward of -1 per step:
+      vip    (1 - gamma) * -V(start; goal), which pulls a sub-trajectory's
+             start towards its goal, plus log-mean-exp of
+             -(r + gamma V(s1; goal) - V(s0; goal)) over the batch: a soft
+             temporal-difference term on the transition (s0, s1). With
+             num_negatives > 0 the same term again for transitions taken
+             from other videos in the batch, against this video's goal.
+      l1/l2  mean L1 and L2 norms of all embeddings
+    No text: VIP learns from frames alone, so it reads any clip dataset.
+
+    Defaults are the official VIP model class's: gamma 0.98, l1 and l2
+    weights 1e-3 (its released config), no negatives. The released model
+    trained with num_negatives: 3 (the paper, Appendix D.1, and
+    config_vip_ego4d.yaml, which the VIP README names as the released
+    model's config); the vip preset sets that. VIP's representation is a
+    ResNet-50 with its fc resized to 1024, i.e. embedding.head=fc (the
+    preset sets it too). The official loader's reward tensor is float64,
+    which promotes its TD term to double precision; here it stays in the
+    embeddings' dtype. With float32 rewards the official trainer gives
+    exactly this loss and update; with float64 ones the losses agree to
+    ~1e-7, but Adam's first step (about lr * sign(grad)) can flip on
+    near-zero gradients. Metrics use the official names (vip_loss, l1loss,
+    l2loss).
+    """
+    needs_clips = True
+
+    @classmethod
+    def check_params(cls, gamma=0.98, l1_weight=1e-3, l2_weight=1e-3, num_negatives=0) -> None:
+        if not 0.0 < gamma < 1.0:
+            raise ValueError(f"vip gamma must be in (0, 1), got {gamma}")
+        for name, w in (("l1_weight", l1_weight), ("l2_weight", l2_weight)):
+            if w < 0:
+                raise ValueError(f"vip {name} must be >= 0, got {w}")
+        if int(num_negatives) != num_negatives or num_negatives < 0:
+            raise ValueError(f"vip num_negatives must be a whole number >= 0, got {num_negatives}")
+
+    def __init__(self, encoder: nn.Module, gamma: float = 0.98, l1_weight: float = 1e-3,
+                 l2_weight: float = 1e-3, num_negatives: int = 0):
+        super().__init__(encoder)
+        self.check_params(gamma, l1_weight, l2_weight, num_negatives)
+        self.gamma, self.l1_weight, self.l2_weight = gamma, l1_weight, l2_weight
+        self.num_negatives = int(num_negatives)
+
+    def clip_sampler(self, train: bool = True) -> FrameSampler:
+        return VIPFrameSampler()
+
+    @staticmethod
+    def sim(a, b):
+        return -torch.linalg.norm(a - b, dim=-1)
+
+    def forward(self, batch: AuxBatch):
+        eps = 1e-8
+        alle = batch.clip_feats                                   # (B, 4, D)
+        bs = alle.shape[0]
+        alles = alle.reshape(bs * 4, -1)
+        e0, eg, es0, es1 = alle.unbind(1)
+        metrics = {}
+
+        l2loss = torch.linalg.norm(alles, ord=2, dim=-1).mean()
+        l1loss = torch.linalg.norm(alles, ord=1, dim=-1).mean()
+        metrics["l2loss"] = l2loss
+        metrics["l1loss"] = l1loss
+        full_loss = self.l2_weight * l2loss + self.l1_weight * l1loss
+
+        g = self.gamma
+        r = -1.0                    # official: float(s0 == goal) - 1, and s0 < goal always
+        V_0 = self.sim(e0, eg)
+        V_s = self.sim(es0, eg)
+        V_s_next = self.sim(es1, eg)
+        V_loss = (1 - g) * -V_0.mean() + torch.log(eps + torch.mean(torch.exp(-(r + g * V_s_next - V_s))))
+        if self.num_negatives > 0:
+            V_s_neg, V_s_next_neg = [], []
+            for _ in range(self.num_negatives):
+                perm = torch.randperm(bs)
+                V_s_neg.append(self.sim(es0[perm], eg))
+                V_s_next_neg.append(self.sim(es1[perm], eg))
+            V_s_neg, V_s_next_neg = torch.cat(V_s_neg), torch.cat(V_s_next_neg)
+            V_loss = V_loss + torch.log(eps + torch.mean(torch.exp(-(-1.0 + g * V_s_next_neg - V_s_neg))))
+        metrics["vip_loss"] = V_loss
+        full_loss = full_loss + V_loss
+        return full_loss, {k: v.detach() for k, v in metrics.items()}
+
+
 def _topk_accuracy(logits, labels, ks=(1, 5)):
     ks = [k for k in ks if k <= logits.shape[1]]
     hit = logits.topk(max(ks), dim=1).indices == labels[:, None]
@@ -602,6 +715,67 @@ class MoCo(AuxLoss):
         if self.training:
             self._enqueue(k)
         return loss, {"acc1": (logits.argmax(1) == 0).float().mean().detach()}
+
+
+@register_aux_loss("mae")
+class MAE(AuxLoss):
+    """MAE (He et al., 2022): mask most of an image's patches, encode the
+    visible ones, and reconstruct the masked ones' pixels with a light
+    decoder; the loss is the mean squared error on the masked patches. The
+    MVP and VC-1 representations are this objective on (egocentric) video
+    frames.
+
+    The encoder is the run's ViT in MAE's layout (embedding=vit_s16, vit_b16
+    or vit_l16), whole: no embedding.layer or head. The decoder belongs to
+    the objective, so the saved encoder is the feature extractor (its CLS
+    token after the final norm). Encoder, decoder and loss run the official
+    models_mae.py's own code (src/vision_models/mae.py), so with the same
+    weights and masking noise the loss is the official model's. The input
+    is the view after the encoder's mean/std normalisation, which is also
+    the reconstruction target, as in MAE's training code.
+
+    Defaults are MAE's: mask ratio 0.75, per-patch normalised targets
+    (norm_pix_loss, as its released models), decoder 512 wide, 8 blocks of
+    16 heads.
+    """
+    needs_views = 1
+
+    @classmethod
+    def check_params(cls, mask_ratio=0.75, norm_pix_loss=True, decoder_dim=512, decoder_depth=8,
+                     decoder_heads=16) -> None:
+        if not 0.0 <= mask_ratio < 1.0:
+            raise ValueError(f"mae mask_ratio must be in [0, 1), got {mask_ratio}")
+        for name, v in (("decoder_dim", decoder_dim), ("decoder_depth", decoder_depth),
+                        ("decoder_heads", decoder_heads)):
+            if int(v) != v or v < 1:
+                raise ValueError(f"mae {name} must be a whole number >= 1, got {v}")
+        if decoder_dim % decoder_heads:
+            raise ValueError(f"mae decoder_dim ({decoder_dim}) must be a multiple of decoder_heads ({decoder_heads})")
+
+    def __init__(self, encoder: nn.Module, mask_ratio: float = 0.75, norm_pix_loss: bool = True,
+                 decoder_dim: int = 512, decoder_depth: int = 8, decoder_heads: int = 16):
+        super().__init__(encoder)
+        self.check_params(mask_ratio, norm_pix_loss, decoder_dim, decoder_depth, decoder_heads)
+        from functools import partial
+        from src.vision_models.mae import MAEDecoder
+        vit = getattr(encoder, "embedding", None)
+        spec = getattr(encoder, "build_spec", {})
+        if not hasattr(vit, "forward_encoder") or spec.get("layer") or spec.get("head") \
+                or spec.get("frame_stack", 1) > 1:
+            raise ValueError("mae trains a whole ViT in MAE's layout: embedding=vit_s16, vit_b16 or "
+                             "vit_l16, without embedding.layer, head or frame_stack")
+        self.mask_ratio = float(mask_ratio)
+        self.decoder = MAEDecoder(
+            vit.patch_embed.num_patches, vit.patch_embed.patch_size[0], embed_dim=vit.embed_dim,
+            decoder_embed_dim=int(decoder_dim), decoder_depth=int(decoder_depth),
+            decoder_num_heads=int(decoder_heads), norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            norm_pix_loss=bool(norm_pix_loss))
+
+    def forward(self, batch: AuxBatch):
+        imgs = batch.encoder.normalize(batch.views[0])
+        latent, mask, ids_restore = batch.encoder.embedding.forward_encoder(imgs, self.mask_ratio)
+        pred = self.decoder.forward_decoder(latent, ids_restore)
+        return self.decoder.forward_loss(imgs, pred, mask)
 
 
 # ------------------------------------------------------------------------------

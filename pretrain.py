@@ -140,11 +140,61 @@ def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_b
     from hydra.utils import to_absolute_path
     from src.data.images import ImageDataset
     crop = data.get("train_crop") or {}
+    every = data.get("every") or 1
+    if not train:
+        every = data.get("val_every") or every
     return ImageDataset(
         to_absolute_path(str(data.root)), split, train=train, size=int(data.image_size), views=views,
         scale=tuple(crop.get("scale", (0.08, 1.0))), ratio=tuple(crop.get("ratio", (3 / 4, 4 / 3))),
         resize=int(data.get("eval_resize") or 256), seed=seed, batch_size=int(cfg.batch_size),
-        start_batch=start_batch)
+        start_batch=start_batch, every=int(every), interpolation=str(data.get("interpolation") or "bilinear"))
+
+
+def scale_to_images(epochs: float, sched: dict, n_images: int, train_images: float):
+    """cfg.train_images: stretch an epoch-sized run over n_images images to
+    train_images images in total. Epochs and the lr schedule's lengths in
+    epochs (warmup, milestones, total) scale by the same factor, so the
+    schedule keeps its shape (MAE's warmup stays 2.5% of a 1600-epoch run);
+    validation and snapshot intervals stay as they are. Returns (epochs,
+    schedule)."""
+    factor = float(train_images) / (n_images * float(epochs))
+    sched = dict(sched)
+    for key in ("warmup", "total"):
+        if sched.get(key):
+            sched[key] = float(sched[key]) * factor
+    if sched.get("milestones"):
+        sched["milestones"] = [float(m) * factor for m in sched["milestones"]]
+    return float(epochs) * factor, sched
+
+
+def build_optimizer(cfg, named_params, lr: float):
+    """cfg.optimizer over (name, parameter) pairs: adam | adamw | sgd.
+    no_weight_decay_1d: biases and other 1-D parameters (norm weights) get no
+    weight decay, as in MAE (timm's add_weight_decay)."""
+    named_params = list(named_params)
+    wd = float(cfg.weight_decay)
+    if cfg.get("no_weight_decay_1d") and wd:
+        decay = [p for n, p in named_params if p.ndim > 1 and not n.endswith(".bias")]
+        no_decay = [p for n, p in named_params if p.ndim <= 1 or n.endswith(".bias")]
+        groups = [{"params": no_decay, "weight_decay": 0.0}, {"params": decay, "weight_decay": wd}]
+    else:
+        groups = [{"params": [p for _, p in named_params], "weight_decay": wd}]
+    if cfg.optimizer == "sgd":
+        return torch.optim.SGD(groups, lr=lr, momentum=float(cfg.momentum),
+                               nesterov=bool(cfg.get("nesterov", False)))
+    opt = torch.optim.AdamW if cfg.optimizer == "adamw" else torch.optim.Adam
+    return opt(groups, lr=lr, betas=tuple(cfg.betas))
+
+
+def final_crop(x, spec):
+    """cfg.final_crop on a float (N, C, H, W) batch: resize the shorter side to
+    spec.resize, then center-crop spec.crop (either may be null)."""
+    from torchvision.transforms import v2
+    if spec.get("resize") is not None:
+        x = v2.functional.resize(x, int(spec.resize), antialias=True)
+    if spec.get("crop") is not None:
+        x = v2.functional.center_crop(x, int(spec.crop))
+    return x
 
 
 def lr_factor(sched, step: int, steps_per_epoch=None) -> float:
@@ -156,6 +206,13 @@ def lr_factor(sched, step: int, steps_per_epoch=None) -> float:
     unit = steps_per_epoch or 1
     t = step // unit                                         # epoch (or step) index
     warmup = float(sched.get("warmup", 0) or 0)
+    if name == "warmup_cosine":
+        # MAE's (util/lr_sched.py): updated every step, in fractional epochs;
+        # linear warmup from 0, then a half cosine over the rest of the run.
+        e, total = step / unit, float(sched.total)
+        if e < warmup:
+            return e / warmup
+        return 0.5 * (1.0 + math.cos(math.pi * min(e - warmup, total - warmup) / (total - warmup)))
     if warmup and step < warmup * unit:
         return (step + 1) / (warmup * unit)
     if name == "constant":
@@ -166,7 +223,7 @@ def lr_factor(sched, step: int, steps_per_epoch=None) -> float:
     if name == "step":
         gamma = float(sched.get("gamma", 0.1))
         return gamma ** sum(t >= m for m in sched.milestones)
-    raise ValueError(f"lr_schedule.name={name!r}; expected constant, cosine or step")
+    raise ValueError(f"lr_schedule.name={name!r}; expected constant, cosine, step or warmup_cosine")
 
 
 def as_stored(frames, size: int):
@@ -214,6 +271,9 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("pretrain_data.root must be set (the prepared dataset's folder)")
     if cfg.get("epochs") is not None and not images:
         raise ValueError("epochs applies to image datasets; size clip runs with train_steps")
+    if cfg.get("train_images") is not None and not (images and cfg.get("epochs")):
+        raise ValueError("train_images stretches an epoch-sized image run: it needs image data "
+                         "and epochs (clip runs: size them with train_steps)")
     from src.embeddings import CHECKPOINT_ARCHS
     arch = emb_kwargs.get("arch") or str(cfg.embedding.name)
     if arch not in CHECKPOINT_ARCHS:
@@ -222,8 +282,11 @@ def main(cfg: DictConfig) -> None:
             f"embedding.checkpoint, which supports {sorted(CHECKPOINT_ARCHS)}. To continue from "
             "released weights, name the architecture and the file, e.g. embedding.arch=resnet50 "
             "embedding.checkpoint=~/.r3m/r3m_50/model.pt")
-    if cfg.optimizer not in ("adam", "sgd"):
-        raise ValueError(f"optimizer={cfg.optimizer!r}; expected adam or sgd")
+    if cfg.optimizer not in ("adam", "adamw", "sgd"):
+        raise ValueError(f"optimizer={cfg.optimizer!r}; expected adam, adamw or sgd")
+    if cfg.get("final_crop") is not None and images:
+        raise ValueError("final_crop applies to clip data; image crops are set by pretrain_data "
+                         "(train_crop, eval_resize, image_size)")
     if images:
         from hydra.utils import to_absolute_path
         from src.data.images import load_classes
@@ -255,8 +318,9 @@ def main(cfg: DictConfig) -> None:
     for t in terms:
         t.loss.to(device)
     # Trainable parameters only: objectives may hold frozen copies (MoCo's key encoder).
-    params = [p for p in encoder.parameters() if p.requires_grad] + \
-             [p for t in terms for p in t.loss.parameters() if p.requires_grad]
+    named = [(n, p) for n, p in encoder.named_parameters() if p.requires_grad] + \
+            [(n, p) for t in terms for n, p in t.loss.named_parameters() if p.requires_grad]
+    params = [p for _, p in named]
     n_enc = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
     n_obj = sum(p.numel() for t in terms for p in t.loss.parameters() if p.requires_grad)
     print(f"\nEncoder: {cfg.embedding.name} (arch={encoder.arch}, pretrained="
@@ -266,13 +330,7 @@ def main(cfg: DictConfig) -> None:
     base_lr = float(cfg.lr)
     if cfg.get("lr_reference_batch"):        # linear scaling rule
         base_lr *= cfg.batch_size / float(cfg.lr_reference_batch)
-    if cfg.optimizer == "sgd":
-        optimizer = torch.optim.SGD(params, lr=base_lr, momentum=float(cfg.momentum),
-                                    nesterov=bool(cfg.get("nesterov", False)),
-                                    weight_decay=cfg.weight_decay)
-    else:
-        optimizer = torch.optim.Adam(params, lr=base_lr, betas=tuple(cfg.betas),
-                                     weight_decay=cfg.weight_decay)
+    optimizer = build_optimizer(cfg, named, base_lr)
     grad_clip = float("inf") if cfg.grad_clip is None else float(cfg.grad_clip)
 
     aug = build_augmentation(cfg.augmentation)
@@ -308,9 +366,13 @@ def main(cfg: DictConfig) -> None:
     views = max(t.loss.needs_views for t in terms) if images else 0
     if images:
         train_set = _image_dataset(cfg, data, data.train_split, True, views, cfg.seed, start_batch=step)
+        if any(t.loss.needs_labels for t in terms) and not train_set.labelled:
+            raise ValueError(f"{[t.name for t in terms if t.loss.needs_labels]} need class labels, but "
+                             f"{train_set.dir} has unlabelled images (e.g. video frames)")
         steps_per_epoch = max(1, len(train_set) // cfg.batch_size)
         print(f"  {train_set.dir}: {len(train_set):,} images ({steps_per_epoch:,} steps per epoch), "
-              f"{views} view(s), crop scale {train_set.scale}")
+              f"{views} view(s), crop scale {train_set.scale}"
+              + (f", {train_set.thinning}" if train_set.thinning else ""))
         train_iter = iter(_data_loader(train_set, cfg, int(cfg.num_workers), device))
     else:
         train_iter = _loader(cfg, data, data.train_manifest, _shared_sampler(terms, True),
@@ -323,7 +385,13 @@ def main(cfg: DictConfig) -> None:
         epochs = OmegaConf.select(cfg, epochs_key)
         return round(epochs * steps_per_epoch) if epochs and steps_per_epoch else OmegaConf.select(cfg, steps_key)
 
-    train_steps = int(cfg.epochs * steps_per_epoch) if cfg.get("epochs") else int(cfg.train_steps)
+    epochs = cfg.get("epochs")
+    sched = OmegaConf.to_container(cfg.lr_schedule, resolve=True)
+    if cfg.get("train_images"):
+        epochs, sched = scale_to_images(epochs, sched, len(train_set), cfg.train_images)
+        print(f"  train_images={float(cfg.train_images):,.0f}: {epochs:,.1f} epochs over "
+              f"{len(train_set):,} images (lr schedule stretched with it: {sched})")
+    train_steps = int(epochs * steps_per_epoch) if epochs else int(cfg.train_steps)
     eval_frequency = int(in_steps("eval_every_epochs", "eval_frequency"))
     keep = in_steps("save.keep_every_epochs", "save.keep_every")
     if keep and keep % eval_frequency:
@@ -332,10 +400,12 @@ def main(cfg: DictConfig) -> None:
                          "when checkpoint.pt is saved")
     # The schedule counts epochs only in epoch-sized runs; image runs sized
     # with train_steps count steps, like clip runs.
-    sched_epoch = steps_per_epoch if cfg.get("epochs") else None
-    sched = OmegaConf.to_container(cfg.lr_schedule, resolve=True)
-    if sched.get("name") == "cosine" and sched.get("total") is None:
-        sched["total"] = cfg.epochs if sched_epoch else train_steps
+    sched_epoch = steps_per_epoch if epochs else None
+    if sched.get("name") in ("cosine", "warmup_cosine") and sched.get("total") is None:
+        sched["total"] = epochs if sched_epoch else train_steps
+    if sched.get("name") == "warmup_cosine" and float(sched.get("warmup") or 0) >= float(sched["total"]):
+        raise ValueError(f"lr_schedule: warmup ({sched.get('warmup')}) must be shorter than the "
+                         f"schedule ({sched['total']} {'epochs' if sched_epoch else 'steps'})")
     sched = OmegaConf.create(sched)
 
     names = "+".join(t.name for t in terms)
@@ -397,6 +467,8 @@ def main(cfg: DictConfig) -> None:
                 x = aug(x.reshape(b, t * x.shape[1], *x.shape[2:])).reshape(x.shape)
             else:
                 x = aug(x)
+        if cfg.get("final_crop") is not None:
+            x = final_crop(x, cfg.final_crop)
         with autocast:
             feats = encoder.encode_preprocessed(x)
         return AuxBatch(encoder=encoder, clip_feats=feats.float().reshape(b, t, -1), text=list(texts))

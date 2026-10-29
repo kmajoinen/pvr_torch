@@ -9,5 +9,9 @@ image_size: 224                   # crop size fed to the encoder
 train_crop:                       # RandomResizedCrop per view, in the loader workers
   scale: [0.08, 1.0]
   ratio: [0.75, 1.3333333333333333]
+interpolation: bilinear           # crops and validation resize: bilinear | bicubic (MAE)
+every: 1                          # use every n-th image of the train split (stored order;
+                                  #   video frames: frames 1, 1+n, ... of each video)
+val_every: null                   # the same for validation (null: as `every`)
 eval_resize: 256                  # validation: resize the short side, then center-crop image_size
 eval_batches: null                # null: the whole validation split each time

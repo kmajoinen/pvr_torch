@@ -36,8 +36,13 @@ dependencies:
     - git+https://github.com/openai/CLIP.git
     - open_clip_torch==3.3.0
     - git+https://github.com/facebookresearch/r3m.git
-    - git+https://github.com/facebookresearch/vip.git
     - gdown                         # R3M/VIP pull checkpoints from Google Drive
+    # VIP embedding (and tests/test_vip.py's parity test) — install separately,
+    # WITHOUT its dependencies: its setup.py pins hydra-core==1.1.1,
+    # omegaconf==2.1.1, pillow==9.0.1 and gdown==4.4.0, which would downgrade
+    # Hydra below what every script here needs (version_base):
+    #   pip install gdown
+    #   pip install --no-deps git+https://github.com/facebookresearch/vip.git
     # LIV embedding only — two-step install, doesn't fit a single pip line,
     # install separately if needed:
     #   pip install git+https://github.com/penn-pal-lab/LIV.git

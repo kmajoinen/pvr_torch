@@ -66,6 +66,24 @@ def _plain(node):
     return OmegaConf.to_container(node, resolve=True) if OmegaConf.is_config(node) else node
 
 
+def check_head_is_trained(net, trains: bool) -> None:
+    """A trainable head (embedding.head=linear or fc) on an encoder that
+    doesn't train has to come trained from embedding.checkpoint, or it stays
+    a random projection. Config validation (encoder_settings) only sees that
+    a checkpoint is set; this checks, once the encoder is built, that the
+    file held head weights -- a file saved by this repo with a trained head.
+    Other files (a bare backbone, e.g. an official R3M snapshot) load into
+    the backbone only."""
+    from src.truncation import TRAINABLE_HEADS
+    head = net.build_spec.get("head")
+    if head in TRAINABLE_HEADS and not trains and not net.head_loaded:
+        raise ValueError(
+            f"embedding.head={head} is trainable, but the encoder is frozen and "
+            f"{net.checkpoint!r} has no weights for it, so it would stay a random "
+            "projection. Load an encoder saved with this head (e.g. a pretrain.py VIP "
+            "snapshot), or set encoder.grads / encoder.aux so it trains.")
+
+
 def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     if "finetune" in cfg:
         raise ValueError(_REMOVED_FINETUNE)
@@ -143,17 +161,18 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     trainable = str(enc.get("trainable", "all"))
     if trainable not in ("all", "head"):
         raise ValueError(f"encoder.trainable={trainable!r}; expected all or head")
+    from src.truncation import TRAINABLE_HEADS
     emb_head = cfg.embedding.get("head") if has_embedding else None
-    if emb_head == "linear" and not trains:
+    if emb_head in TRAINABLE_HEADS and not trains and not cfg.embedding.get("checkpoint"):
         raise ValueError(
-            "embedding.head=linear is trainable, but the encoder is frozen "
+            f"embedding.head={emb_head} is trainable, but the encoder is frozen "
             "(encoder.grads=none, encoder.aux empty), so it would stay a random "
             "projection. Set encoder.grads (e.g. critic) or encoder.aux."
         )
-    if trainable == "head" and emb_head != "linear":
+    if trainable == "head" and emb_head not in TRAINABLE_HEADS:
         raise ValueError(
             f"encoder.trainable=head trains only the head, but embedding.head={emb_head} "
-            "has no parameters. Use embedding.head=linear, or encoder.trainable=all."
+            "has no parameters. Use embedding.head=linear (or fc), or encoder.trainable=all."
         )
 
     if not has_embedding:
@@ -253,8 +272,9 @@ def embedding_kwargs(cfg) -> dict:
         kwargs["head"] = str(head)
     head_dim = emb.get("head_dim")
     if head_dim is not None:
-        if head != "linear":
-            raise ValueError("embedding.head_dim only applies to embedding.head=linear")
+        from src.truncation import TRAINABLE_HEADS
+        if head not in TRAINABLE_HEADS:
+            raise ValueError("embedding.head_dim only applies to embedding.head=linear or fc")
         if isinstance(head_dim, bool) or not isinstance(head_dim, int) or head_dim < 1:
             raise ValueError(f"embedding.head_dim={head_dim!r}: expected a positive integer")
         kwargs["head_dim"] = head_dim

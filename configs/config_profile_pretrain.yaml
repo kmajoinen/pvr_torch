@@ -1,0 +1,17 @@
+# profile_pretrain.py: pretrain.py's config plus the profiler's settings.
+defaults:
+  - config_pretrain
+  - _self_
+
+profile:
+  warmup: 30                  # steps before measuring (cudnn autotuning, loader start-up)
+  steps: 200                  # passes 1 and 2: steps timed
+  profile_steps: 10           # pass 3: steps under torch.profiler
+  synthetic: false            # true: random frames and fixed texts instead of
+                              #   pretrain_data (no data needed; no data-loader cost)
+  trace: true                 # pass 3: write trace.json (ui.perfetto.dev)
+  row_limit: 25               # pass 3: rows per op table
+
+hydra:
+  run:
+    dir: outputs/profile_pretrain/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}

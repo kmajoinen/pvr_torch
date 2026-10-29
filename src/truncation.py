@@ -37,6 +37,10 @@ LayerNorm). The RL heads normalise their input anyway.
             encoder.trainable=head trains it on a frozen backbone. Its size
             is (flattened width) x head_dim: ~16M parameters for ResNet18
             layer2 at 84px, ~100M at 224px.
+  fc        flatten, then a plain trainable Linear(-> head_dim), PyTorch's
+            default init, no norm: a torchvision ResNet's fc resized, which
+            is VIP's representation (2048 -> 1024 on ResNet-50). Trainable,
+            like linear.
   null      without `layer`: the model's own output, flattened (unchanged
             behaviour).
 """
@@ -46,7 +50,8 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-HEADS = ("avgpool", "cls", "flatten", "linear")
+HEADS = ("avgpool", "cls", "flatten", "linear", "fc")
+TRAINABLE_HEADS = ("linear", "fc")      # the heads with parameters (and head_dim)
 DEFAULT_HEAD_DIM = 1024
 
 
@@ -179,6 +184,20 @@ class _LinearHead(nn.Module):
         return self.ln(self.fc(x.reshape(x.shape[0], -1)))
 
 
+class _FcHead(nn.Module):
+    """flatten -> Linear, PyTorch's default init (VIP's convnet.fc)."""
+
+    def __init__(self, in_dim: int, out_dim: int, seq_first: bool):
+        super().__init__()
+        self.seq_first = seq_first
+        self.fc = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        if self.seq_first:
+            x = x.transpose(0, 1)
+        return self.fc(x.reshape(x.shape[0], -1))
+
+
 def tokens_seq_first(sample: torch.Tensor, batch: int) -> bool:
     """Is a 3-D (tokens) output (T, N, D), e.g. OpenAI CLIP, rather than
     (N, T, D)? Decided from a dummy batch of known size."""
@@ -216,8 +235,8 @@ def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
     detect it)."""
     if head is not None and head not in HEADS:
         raise ValueError(f"embedding.head={head!r}; expected one of {HEADS}")
-    if head_dim is not None and head != "linear":
-        raise ValueError(f"embedding.head_dim only applies to head=linear (got head={head})")
+    if head_dim is not None and head not in TRAINABLE_HEADS:
+        raise ValueError(f"embedding.head_dim only applies to head={'/'.join(TRAINABLE_HEADS)} (got head={head})")
 
     if sample.ndim == 3:
         if seq_first is None:
@@ -230,9 +249,10 @@ def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
     else:
         raise RuntimeError(f"unsupported encoder output shape {tuple(sample.shape)}")
 
-    if head == "linear":
+    if head in TRAINABLE_HEADS:
         in_dim = sample[:, 0].numel() if seq_first else sample[0].numel()
-        return _LinearHead(in_dim, head_dim or DEFAULT_HEAD_DIM, seq_first)
+        cls = _LinearHead if head == "linear" else _FcHead
+        return cls(in_dim, head_dim or DEFAULT_HEAD_DIM, seq_first)
     if head == "flatten":
         if kind == "vector":
             raise ValueError("embedding.head=flatten: this output is already a vector")
@@ -247,5 +267,5 @@ def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
         return _SpatialAvgPool() if kind == "map" else _TokenPool("mean", seq_first)
     # head=None
     if kind == "tokens":
-        raise ValueError("a transformer layer's tokens need embedding.head (avgpool, cls, flatten or linear)")
+        raise ValueError("a transformer layer's tokens need embedding.head (avgpool, cls, flatten, linear or fc)")
     return _Flatten()

@@ -1,0 +1,60 @@
+# @package _global_
+# MVP (Xiao et al., 2022) for pretrain.py: MAE on video frames, with the
+# paper's recipe (Section 4). MVP's released ViT-S (vits-mae-hoi) is MAE on
+# ~700K frames of hand-object-interaction video, Something-Something among
+# them, sampled at 0.3 fps; trained 1600 epochs, crop scale [0.1, 0.75] (its
+# frames are wide; ours are squashed square, so that reason doesn't carry
+# over directly). Here the frames are SSv2's only, at the same 0.3 fps
+# (pretrain_data=ssv2_frames, every 40th frame).
+#
+# Budget, a toggle between two readings of "MVP's schedule":
+#   epochs (default)  MVP's 1600 epochs, with MAE's 40 warmup epochs: each
+#                     frame is seen as often as in MVP. SSv2 alone at 0.3 fps
+#                     (~0.28M frames, estimate) is smaller than MVP's 700K,
+#                     so this is ~40% of MVP's compute (~1.75M steps of 256);
+#                     it scales with `every`.
+#   images            train_images=1.12e9: MVP's total, 1600 x 700K images,
+#                     whatever the frame count (~4,000 epochs here, ~4.4M
+#                     steps); epochs and warmup stretch to it, so the
+#                     warmup stays 2.5% of the run.
+# Check steps/s on a few hundred steps first: either way this takes days on
+# one GPU.
+#
+# Encoder: MVP's ViT-S/16 with 12 heads, as in its code and released weights
+# (the paper says 6). Decoder: MAE's default (the paper says only "a light
+# decoder"). The rest is MAE's recipe (+experiment=mae).
+#   python pretrain.py +experiment=mvp pretrain_data.root=/path/to/ssv2
+#   python pretrain.py +experiment=mvp pretrain_data.every=10 epochs=400 ...
+defaults:
+  - override /embedding: vit_s16
+  - override /pretrain_data: ssv2_frames
+  - override /augmentation: horizontal_flip
+
+objectives:
+  - {name: mae, weight: 1.0, mask_ratio: 0.75, norm_pix_loss: true,
+     decoder_dim: 512, decoder_depth: 8, decoder_heads: 16}
+
+pretrain_data:
+  every: 40             # 0.3 fps of SSv2's 12 fps, as MVP sampled it
+  train_crop:
+    scale: [0.1, 0.75]  # MVP's for its HOI frames (ImageNet: [0.2, 1.0])
+  interpolation: bicubic
+
+batch_size: 256
+epochs: 1600
+train_images: null      # budget toggle: 1.12e9 = MVP's image count (see above)
+optimizer: adamw
+lr: 1.5e-4
+lr_reference_batch: 256
+betas: [0.9, 0.95]
+weight_decay: 0.05
+no_weight_decay_1d: true
+lr_schedule: {name: warmup_cosine, warmup: 40}
+eval_every_epochs: 10
+save:
+  keep_every: null
+  keep_every_epochs: 200
+num_workers: 16
+log_frequency: 500
+perf:
+  amp_bf16: true

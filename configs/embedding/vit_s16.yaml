@@ -1,0 +1,8 @@
+# ViT-S/16 as MVP defines it (384 wide, 12 blocks, 12 heads),
+# in MAE's layout (src/vision_models/mae.py), random init. Pretrain it
+# (python pretrain.py +experiment=mvp, or mae), or load weights with
+# embedding.checkpoint: a pretrain.py snapshot, or an MAE-format encoder
+# file (MAE, MVP, VC-1). Features: the CLS token after the final norm.
+name: vit_s16
+pretrained: false
+train: false

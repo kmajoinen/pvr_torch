@@ -42,7 +42,8 @@ from torch.utils.data import DataLoader, random_split
 import sys
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from src.encoder_config import embedding_kwargs, encoder_settings, warn_unused_encoder_overrides
+from src.encoder_config import (check_head_is_trained, embedding_kwargs, encoder_settings,
+                                warn_unused_encoder_overrides)
 from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
 from src.models import ContinuousPolicyNet
 from src.views import CollapseMonitor, encode_views
@@ -226,6 +227,7 @@ def main(cfg: DictConfig) -> None:
         # stats -- same reasoning as train_sac.py. Trainability is
         # controlled purely via requires_grad below, never via train()-mode.
         embedding.eval()
+        check_head_is_trained(embedding, encoder_trains)
         trainable = enc.trainable if encoder_trains else "none"
         embedding.set_trainable(trainable)
         if enc.bn_adapt and not embedding.has_batchnorm():

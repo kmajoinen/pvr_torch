@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.optim as optim
 from omegaconf import OmegaConf
 
+from src.encoder_config import check_head_is_trained
 from src.losses import aux_grad_views, build_aux_losses
 
 
@@ -77,6 +78,7 @@ def build_encoder_stack(cfg, enc, emb_kwargs, device, pixels_in_buffer: bool,
     # stats (encoder.bn=adapt switches only the BatchNorm layers, during
     # updates). Trainability is controlled purely via requires_grad.
     net.eval()
+    check_head_is_trained(net, enc.trains)
     trainable = enc.trainable if enc.trains else "none"
     net.set_trainable(trainable)
     bn_ref = None

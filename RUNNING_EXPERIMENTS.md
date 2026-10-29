@@ -15,8 +15,9 @@ training and augmentation work. This complements `README.md` rather than replaci
   option works the same). Config: `configs/config_drqv2.yaml` (=
   `config_sac.yaml` with `algo: drqv2`). See [DrQ-v2](#drq-v2-train_drqv2py).
 - **`pretrain.py`** — trains an encoder with registered objectives, on video
-  (R3M) or images (ImageNet: supervised, MoCo v2), producing a checkpoint the
-  scripts above load as an embedding. Config: `configs/config_pretrain.yaml`. See
+  clips (R3M, VIP) or images (ImageNet: supervised, MoCo v2, MAE; video
+  frames: MAE as in MVP), producing a checkpoint the scripts above load as
+  an embedding. Config: `configs/config_pretrain.yaml`. See
   [Pretraining](#pretraining-pretrainpy).
 - **`train_bc.py`** — behavioral cloning from offline datasets (V-D4RL,
   Minari, pickled trajectories), with the same `encoder.*`/`augmentation`
@@ -53,7 +54,7 @@ Only `configs/env/*.yaml` files that have a `builder:` field work with
 - `adroit_door_pixels.yaml` / `adroit_door_state.yaml`, and the same `_pixels`/`_state` pair for `adroit_hammer`, `adroit_pen`, `adroit_relocate` (`builder: gym`/`state`)
 - `franka_kitchen_pixels.yaml` / `franka_kitchen_state.yaml` (`builder: gym`/`state`)
 
-The old `adroit_*.yaml`/`franka_kitchen.yaml` files (only `id:`, no
+The old `adroit_*.yaml`/`franka_kitchen.yaml`/`dmc_cheetah.yaml` files (only `id:`, no
 `builder:`) are still there, untouched, for `train_sac_sb3.py`'s universal
 env-id dispatch (`src/gym_wrappers.py::make_gym_env`) — the new
 `_pixels`/`_state` variants above are `train_sac.py`-specific siblings, not
@@ -107,6 +108,7 @@ mvp_vitb_mae_egosoup  mvp_vitl256_mae_egosoup
 mae_base
 moco_aug
 dinov2_vits14  dinov2_vitb14  dinov2_vitl14  dinov2_vitg14
+vit_s16  vit_b16  vit_l16      (random init; weights via `checkpoint`)
 custom_checkpoint
 ```
 
@@ -126,7 +128,8 @@ Three optional fields on any embedding config (see `EmbeddingNet` in
   used), including a trained head, or a bare backbone state_dict (a
   pretraining run, or a stock torchvision one). Keys must match exactly; a
   partial or wrong-architecture file is an error, not a warning. Supported
-  for `random`, `resnet18/34/50`, `dinov2_*` and `openclip_*`; the other
+  for `random`, `resnet18/34/50`, `dinov2_*`, `openclip_*` and `vit_s16/b16/l16`
+  (which also take MAE-format files: MAE, MVP, VC-1 encoders); the other
   encoders always load their own default weights first, so they're rejected
   at startup. Relative paths resolve against the directory
   you launch from. `embedding=custom_checkpoint` is a ready-made template
@@ -160,9 +163,13 @@ Two more optional embedding fields (see `src/truncation.py`):
   `layer`; spatial mean, or mean over patch tokens), `cls` (ViT CLS token),
   `flatten` (the whole map, no parameters; the RL heads' first layers do the
   projecting), or `linear` (PIE-G's encoder projection: flatten → trainable
-  Linear(`head_dim`, default 1024) → LayerNorm). A `linear` head needs the
-  encoder to train; with `encoder.trainable=head` it trains on a frozen
-  backbone. PIE-G's actor and critic additionally have their own
+  Linear(`head_dim`, default 1024) → LayerNorm), or `fc` (a plain trainable
+  Linear(`head_dim`), PyTorch's default init, no norm: VIP's representation).
+  A `linear`/`fc` head needs the encoder to train, or trained weights from
+  `checkpoint` (a file saved by this repo with that head: with a frozen
+  encoder, a checkpoint without head weights, e.g. an official R3M
+  snapshot, is rejected at startup rather than leaving the head random);
+  with `encoder.trainable=head` it trains on a frozen backbone. PIE-G's actor and critic additionally have their own
   Linear-LayerNorm-Tanh trunks, which this SAC's networks don't.
 - **Size check**: `flatten` and `linear` scale with the map. ResNet18 layer2
   is 128×11×11 ≈ 15.5k values at 84px but ≈ 100k at 224px, which makes a
@@ -251,7 +258,7 @@ python train_sac.py embedding=resnet50 embedding.name=resnet50_l3
 - `clip_vit` / `clip_rn50` — via `clip.load(...)`, OpenAI's own cache.
 - `openclip_*` — via `open_clip.create_model_and_transforms(...)`, HuggingFace hub cache.
 - `r3m_*` — via `load_r3m(...)`, downloads from Google Drive (`gdown`) to R3M's own cache dir on first use. **No outbound internet on compute nodes** on most clusters — run once on the login node first to warm the cache, or the job will fail trying to download mid-run.
-- `vip_resnet50` — via `load_vip(...)`, same lab/codebase as R3M, same download-cache behavior and caveat.
+- `vip_resnet50` — via `load_vip(...)`, same lab/codebase as R3M, same download-cache behavior and caveat. Install it without its dependencies (`pip install gdown && pip install --no-deps git+https://github.com/facebookresearch/vip.git`): its `setup.py` pins `hydra-core==1.1.1`, `omegaconf==2.1.1`, `pillow==9.0.1` and `gdown==4.4.0`, and Hydra 1.1 has no `version_base`, which every script here uses -- a plain install (or reinstall) stops them all from starting. R3M's `setup.py` only sets minimum versions, so a plain install is fine there.
 - `liv_resnet50` — via `load_liv(...)`, own cache dir/download on first use. Needs a two-step install (`pip install` the repo, then a nested `cd liv/models/clip && pip install -e .`) — not in `requirements.txt`, see the comment there.
 - `mvp_*` (5 variants) — via `mvp.load(...)`, own cache dir/download on first use (Berkeley Box-hosted). Genuinely pip-installable with no version conflicts, unlike VC-1.
 - `random` — freshly initialized, no weights at all.
@@ -339,9 +346,10 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   To add your own, subclass `AuxLoss` in `src/losses.py` and decorate it
   with `@register_aux_loss("name")`; the file's docstring has the contract.
 - **`augmentation`** — picks a file from `configs/augmentation/` (`none`,
-  `random_shift`, `color_jitter`, `gaussian_blur`, `horizontal_flip`,
-  `random_erasing`, `random_overlay`, `shift_jitter` as a pipeline example,
-  and the `pieg` preset with a strong view, see below). Each has a
+  `random_shift`, `random_resized_crop`, `color_jitter`, `random_grayscale`,
+  `gaussian_blur`, `horizontal_flip`, `random_erasing`, `random_overlay`,
+  `shift_jitter` as a pipeline example, the pretraining presets `r3m` and
+  `moco_v2`, and the `pieg` preset with a strong view, see below). Each has a
   `name`, a `stage` and `params`. `stage` decides who sees the augmented
   view (`src/views.py`):
 
@@ -507,8 +515,9 @@ python train_bc.py dataset=vd4rl_cheetah_expert embedding=resnet18 encoder.grads
 
 ## Pretraining (`pretrain.py`)
 
-Trains any encoder this repo builds (`embedding=`, from scratch with
-`embedding.pretrained=false`) on a video or image dataset
+Trains an encoder (`embedding=`, from scratch with
+`embedding.pretrained=false`; any architecture `embedding.checkpoint` can
+load: ResNets, the `random` CNN, DINOv2, OpenCLIP, `vit_*`) on a video or image dataset
 (`pretrain_data.type: clips | images`) with objectives from the same
 registry as the RL aux losses (`src/losses.py`). A method is a preset
 in `configs/experiment/`; everything else (architecture, data, augmentation,
@@ -575,6 +584,35 @@ without internet (`run_pretrain.sh`). Differences from the official code:
   distribution: torchvision's own sampling);
 - one GPU, no DataParallel; logged values are interval averages.
 
+**VIP** (`configs/experiment/vip.yaml`, objective `vip`): the embedding
+distance to a goal frame is trained as a goal-conditioned value function
+(VIP's dual offline-RL objective, reward -1 per step) on a random
+sub-trajectory start..goal and one transition inside it, plus L1/L2 terms.
+A term-for-term port of the official `vip/trainer.py`, frame sampling of its
+`VIPBuffer`; `tests/test_vip.py` compares it with the official code
+(metrics and weights after an Adam step, exactly; runs only when the `vip`
+package is installed -- with `--no-deps`, see `vip_resnet50` above). Same clip data as R3M, no text needed:
+```bash
+python pretrain.py +experiment=vip pretrain_data.root=/path/to/ssv2
+python pretrain.py +experiment=vip embedding=resnet18 train_steps=500_000 ...
+```
+Settings are the released model's (`config_vip_ego4d.yaml`, which the VIP
+README names as its config, and the paper's Appendix D.1): 32 videos × 4
+frames per step, Adam 1e-4, 2M steps, gamma 0.98, L1/L2 weights 1e-3, 3
+negatives (the objective's own default is 0, as in the official model
+class). The
+representation is the ResNet's fc resized to 1024 (`embedding.head=fc`,
+`head_dim: 1024`), saved with the encoder. Frames: one random resized crop
+per video (scale 0.2–1, the same on all four), then the official loader's
+resize to 256 and center crop to 224 (`final_crop`, also at validation);
+validation batches sample like training batches, without the random crop. The
+official loader's reward tensor is float64, so its TD term runs in double
+precision; here it stays float32. Fed float32 rewards, the official trainer
+gives exactly this loss and update; with float64 the losses agree to ~1e-7,
+but weights after one Adam step can differ by up to ~lr (its first step is
+about lr × sign(grad), and rounding flips near-zero gradients). 2M steps at
+batch 32 is long on one GPU -- size runs with `profile_pretrain.py` (below).
+
 **Output and use.** The run directory gets `checkpoint.pt` (latest state for
 resuming; saved with every validation batch, every `eval_frequency` steps),
 encoder-only `encoder_step<N>.pt` every `save.keep_every` steps and at the
@@ -593,7 +631,11 @@ the `snapshot.pt` of an official training run).
 `charts/data_wait_frac` (share of time waiting for the loader). To size a
 full run, train a few hundred steps on a converted subset (`--limit 2000`)
 per architecture and read both; a high `data_wait` means more
-`num_workers`/CPUs, not a bigger GPU.
+`num_workers`/CPUs, not a bigger GPU. `profile_pretrain.py` (same config as
+`pretrain.py`, clip objectives) breaks a step down: steps/s, ms per phase
+(data, encoder, text encoder, reward head, backward, optimizer), GPU busy
+fraction, host-device syncs, and a Chrome trace; `run_profile_pretrain.sh`
+runs it for R3M and a few variants (`profile.synthetic=true` needs no data).
 
 ### ImageNet (supervised, MoCo v2)
 
@@ -647,7 +689,10 @@ scale 0.2–1) to `image_size`; the GPU then applies `augmentation` to each
 view with its own draws. Validation: resize 256, center crop 224, a full
 pass over the split (`pretrain_data.eval_batches` limits it; MoCo validates
 its contrastive loss on random crops). Runs are sized in epochs (`epochs`,
-`eval_every_epochs`, `save.keep_every_epochs`), learning rates scale with
+`eval_every_epochs`, `save.keep_every_epochs`), or by a total image count
+(`train_images`: epochs and the lr schedule's warmup/milestones stretch to
+it, keeping the schedule's shape; for datasets smaller or larger than the
+recipe's), learning rates scale with
 `batch_size / lr_reference_batch`, and `lr_schedule` (step, cosine, warmup)
 changes once per epoch, as in the reference recipes. Resuming continues at
 the exact position in the epoch (same `batch_size` and `num_workers`).
@@ -668,6 +713,70 @@ practical. The supervised classifier and MoCo's heads belong to the
 objective, so the saved encoder is the feature extractor, used in RL with
 the standard ResNet input pipeline.
 
+### MAE and MVP (ViTs on images or video frames)
+
+```bash
+# MAE's official ImageNet recipe: ViT-B/16, 800 epochs
+python pretrain.py +experiment=mae pretrain_data.root=/path/to/imagenet
+# MVP: MAE on video frames -- MVP's ViT-S/16 on SSv2 frames at 0.3 fps
+python pretrain.py +experiment=mvp pretrain_data.root=/path/to/ssv2
+python pretrain.py +experiment=mvp pretrain_data.every=10 epochs=400 ...
+```
+
+**MAE** (objective `mae`): 75% of each image's 16px patches are masked; the
+ViT encodes the rest, a light decoder (512 wide, 8 blocks) reconstructs the
+masked patches' pixels, and the loss is the MSE on those, against per-patch
+normalised targets (`norm_pix_loss`). The encoder, decoder and loss are the
+official `models_mae.py`'s own code, split into `MAEEncoder` / `MAEDecoder`
+(`src/vision_models/mae.py`); `tests/test_mae.py` checks the split gives
+the official model's loss and gradients exactly. The decoder belongs to the
+objective, so the saved encoder is the ViT alone (features: the CLS token
+after the final norm, as MAE/MVP/VC-1 use). The `mae` preset is the official
+ImageNet recipe: AdamW (betas 0.9/0.95), weight decay 0.05 without decay on
+biases and norms (`no_weight_decay_1d`), lr 1.5e-4 per 256 images
+(`lr_reference_batch`), 40 warmup epochs then a half cosine updated every
+step (`lr_schedule.name=warmup_cosine`), 800 epochs, random resized crop
+(scale 0.2–1, bicubic: `pretrain_data.interpolation`) + horizontal flip,
+bf16. The official batch is 4096 across GPUs; here `batch_size` is one
+GPU's (256), with the lr scaled to it.
+
+**Architectures**: `vit_s16`, `vit_b16`, `vit_l16` (`configs/embedding/`),
+MAE's layout as MVP defines it -- MVP's ViT-S has 12 heads of width 32, not
+DeiT's 6. Random init only; weights come from `embedding.checkpoint`: a
+pretraining snapshot, or a released MAE-format file (a whole MAE model's
+decoder keys, or a timm classifier, are dropped). They're built for 224px
+input: 256px models (MVP's `vitl-256-mae-egosoup`, 257 position embeddings)
+don't load this way (use `mvp_vitl256_mae_egosoup`). Truncation works with
+block counts (`embedding.layer=6 embedding.head=cls`). Input pipeline: MAE's
+evaluation transform (bicubic resize 256, center crop 224, ImageNet
+normalisation).
+
+**MVP** (`configs/experiment/mvp.yaml`): MAE on video frames, with the
+MVP paper's recipe (Section 4). Data: `pretrain_data=ssv2_frames` reads the
+SSv2 frame shards `prepare_ssv2.py` wrote for the clip dataset as
+unlabelled images -- no second conversion. `every: 40` keeps frames 1, 41,
+81, ... of each video (so every video contributes at least one), 0.3 fps, the rate MVP sampled SSv2 at (consecutive
+12 fps frames are near-duplicates); `val_every: 50` and `eval_batches: 20`
+keep validation short. Frames are images to the image pipeline (per-view
+crops in the workers, exact resume); objectives that need labels reject
+them. Crop scale [0.1, 0.75], MVP's for its wide HOI frames (ours are
+squashed square, so the reason doesn't carry over directly). Budget: "MVP's schedule" has two readings, and
+`train_images` toggles between them. By default the preset runs MVP's 1600
+epochs (MAE's 40 warmup epochs), so each frame is seen as often as in MVP;
+SSv2 alone at 0.3 fps (~0.28M frames, estimate: each video keeps
+ceil(length / 40)) is smaller than MVP's ~700K, so that's ~40% of MVP's
+compute (~1.75M steps at batch 256), and it scales with `every`.
+`train_images=1.12e9` instead trains on MVP's total image count (1600 ×
+700K), whatever the frame count: ~4,000 epochs here, ~4.4M steps. The run
+prints the real frame count and epochs at startup. Read steps/s from a few
+hundred `pretrain.py` steps first (`profile_pretrain.py` handles clip
+objectives only): either way this takes days on one GPU, and much longer
+for the `mae` preset's ViT-B. ViT-S has 12 heads as in MVP's
+code and released weights (the paper says 6); the decoder is MAE's
+default (the paper says only "a light decoder"). Any image objective can
+use `ssv2_frames` (e.g. MoCo on video frames:
+`+experiment=moco_v2 pretrain_data=ssv2_frames`).
+
 **Adding an objective**: register it in `src/losses.py`. Clip objectives:
 `needs_clips = True` and a `clip_sampler()` that returns a `FrameSampler`
 (which frames of each video it reads); `forward()` gets `batch.clip_feats`
@@ -681,11 +790,14 @@ multi-view images.
 ## Cluster job scripts
 
 `run_pretrain.sh` is the R3M-on-SSv2 template for `pretrain.py` (with the
-one-time data and DistilBERT steps in its header); `run_imagenet.sh` the
-ImageNet one (supervised or MoCo v2). `run_sac.sh` (full run)
-and `debug_sac.sh` (quick smoke test) are the
+one-time data and DistilBERT steps in its header; for VIP or MVP change
+`+experiment=` and the run directory), `debug_pretrain.sh` its smoke test,
+`run_prepare_ssv2.sh` the one-time SSv2 conversion, and `run_imagenet.sh`
+the ImageNet one (supervised, MoCo v2 or MAE). `run_sac.sh` (full run),
+`run_ft_sac.sh` (fine-tuning) and `debug_sac.sh` (quick smoke test) are the
 current SLURM templates for `train_sac.py` — copy and adjust
-`embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed. `sac_train.sh` /
-`sac_debug.sh` are the equivalents for `train_sac_sb3.py`. `run_ft_bc.sh`
-is the template for `train_bc.py` (ResNet-18 finetuning on cheetah_run;
-`run_bc.sh` is a legacy script for a different cluster).
+`embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed.
+`run_ft_bc.sh` is the template for `train_bc.py` (ResNet-18 finetuning on
+cheetah_run; `run_bc.sh` is a legacy script for a different cluster). `*.sh`
+files are gitignored, so scripts not yet tracked (e.g. `run_ft_bc.sh`) need
+`git add -f`.

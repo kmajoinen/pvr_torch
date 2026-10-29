@@ -11,20 +11,30 @@ objectives: []                # [{name: r3m, weight: 1.0, ...params}], see src/l
 trainable: all                # all | head (a linear head on a frozen backbone)
 clip_augmentation: shared     # shared: one augmentation draw per video, the same on
                               #   all its frames (R3M's rctraj) | per_frame
+final_crop: null              # clips: {resize, crop} after augmentation, in validation
+                              #   too: resize the shorter side, then center-crop (VIP's
+                              #   loader: {resize: 256, crop: 224})
 
 batch_size: 16                # videos / images per step
 train_steps: 1_000_000
 epochs: null                  # image data: train this many epochs instead (overrides train_steps)
-optimizer: adam               # adam | sgd -- encoder and objective heads alike
+train_images: null            # image data with epochs: train on this many images in total
+                              #   instead -- epochs and the lr schedule (warmup, milestones)
+                              #   stretch to it, whatever the dataset size (MVP's budget:
+                              #   1600 epochs x 700K images = 1.12e9)
+optimizer: adam               # adam | adamw | sgd -- encoder and objective heads alike
 lr: 1.0e-4
 lr_reference_batch: null      # set (e.g. 256): lr is scaled by batch_size / this (linear scaling)
-betas: [0.9, 0.999]           # adam
+betas: [0.9, 0.999]           # adam, adamw
 momentum: 0.9                 # sgd
 nesterov: false               # sgd
 weight_decay: 0.0
+no_weight_decay_1d: false     # true: no weight decay on biases and norm weights (MAE)
 lr_schedule:
   name: constant              # constant | cosine | step; with epochs, in epochs and changed
-                              #   once per epoch (torchvision, MoCo), else in steps
+                              #   once per epoch (torchvision, MoCo), else in steps.
+                              #   warmup_cosine: MAE's -- every step, linear warmup from 0,
+                              #   then a half cosine over the rest
   warmup: 0                   # linear warmup over this many epochs/steps
   milestones: []              # step: multiply by gamma at each
   gamma: 0.1

@@ -1,0 +1,23 @@
+# Something-Something v2's frames as an image dataset (MAE/MVP, MoCo): the
+# frame shards src/data/prepare_ssv2.py wrote for the clip dataset
+# (pretrain_data=ssv2), read as unlabelled images -- no separate conversion.
+# Consecutive frames (12 fps) are near-duplicates, so only every `every`-th
+# frame of each video is used: every 40th is 0.3 fps, the rate MVP sampled
+# SSv2 at. Each video keeps ceil(length / 40) frames -- roughly 0.28M
+# training frames for SSv2's 2-6 s clips (estimate; the training run prints
+# the count).
+name: ssv2_frames
+type: images
+root: ???                         # the --out folder of prepare_ssv2.py (as for pretrain_data=ssv2)
+train_split: train
+val_split: validation
+image_size: 224                   # crop size fed to the encoder (frames are stored at 224)
+every: 40                         # frames 1, 41, 81, ... of each training video (0.3 fps;
+                                  #   every video keeps at least its first frame)
+val_every: 50                     # validation: every 50th
+train_crop:                       # RandomResizedCrop per view, in the loader workers
+  scale: [0.2, 1.0]
+  ratio: [0.75, 1.3333333333333333]
+interpolation: bilinear           # bilinear | bicubic (MAE)
+eval_resize: 256                  # validation: resize the short side, then center-crop image_size
+eval_batches: 20                  # validation batches (null: the whole thinned split)

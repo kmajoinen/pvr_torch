@@ -192,6 +192,9 @@ from src.vision_models.mae import (
         mae_vit_base_patch16,
         mae_vit_large_patch16,
         mae_vit_huge_patch14,
+        vit_s16,
+        vit_b16,
+        vit_l16,
 )
 from src.vision_models.rl3d import rl3d_resnet18_backbone
 
@@ -272,13 +275,19 @@ R3M_ARCHS = {
 # 1536 dims.
 DINOV2_ARCHS = ('dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14')
 
+# ViTs in MAE's layout (src/vision_models/mae.py's MAEEncoder; ViT-S/B/L
+# with 16px patches as MVP defines them), random-init only: weights come from
+# embedding.checkpoint -- a pretrain.py run (objective `mae`), or a released
+# MAE-format file (MAE, MVP, VC-1 encoders).
+VIT_ARCHS = {'vit_s16': vit_s16, 'vit_b16': vit_b16, 'vit_l16': vit_l16}
+
 # Architectures cfg.embedding.checkpoint can load into: their branches build
 # the model without touching any default weights when pretrained=False. The
 # others (R3M, VIP, LIV, MVP, MAE, VC-1, MoCo, places, RL3D, demy, OpenAI
 # CLIP) always load or download their own weights first.
 CHECKPOINT_ARCHS = frozenset(
     ('random', 'resnet18', 'resnet34', 'resnet50')
-    + DINOV2_ARCHS + tuple(OPENCLIP_CONFIGS)
+    + DINOV2_ARCHS + tuple(OPENCLIP_CONFIGS) + tuple(VIT_ARCHS)
 )
 
 # embedding_name -> (this file's matching MAE-architecture builder, VC-1's
@@ -491,6 +500,23 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
         checkpoint = torch.load(_ckpt('mae_pretrain_vit_huge.pth'), map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=False)
         forward_fn = _forward_mae
+
+    # ViT-S/B/L-16 in MAE's layout, from scratch (VIT_ARCHS). Features: the
+    # CLS token after the final norm, as MAE/MVP/VC-1 use. Input pipeline:
+    # MAE's evaluation transform (bicubic resize to 256, center crop 224,
+    # ImageNet mean/std).
+    elif embedding_name in VIT_ARCHS:
+        if pretrained:
+            raise ValueError(
+                f"{embedding_name} has no default weights: set embedding.pretrained=false "
+                "(random init, e.g. for pretrain.py) or embedding.checkpoint=<file>")
+        model = VIT_ARCHS[embedding_name]()
+        transforms = nn.Sequential(
+            T.Resize(256, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(224),
+            T.ConvertImageDtype(torch.float),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        )
 
     # VC-1 (facebookresearch/eai-vc) -- MAE pretraining (egocentric video +
     # ImageNet + iNav) on the exact same ViT-B/16 / ViT-L/16 architecture as
@@ -709,7 +735,10 @@ def _get_embedding(embedding_name='random', in_channels=3, pretrained=True, trai
     # load_vip() takes no size argument.
     elif embedding_name == 'vip_resnet50':
         if not _HAS_VIP:
-            raise ImportError("vip requires: pip install git+https://github.com/facebookresearch/vip.git")
+            raise ImportError(
+                "vip requires (without its dependencies -- its setup.py pins hydra-core 1.1.1, "
+                "which breaks this repo): pip install gdown && "
+                "pip install --no-deps git+https://github.com/facebookresearch/vip.git")
         if not pretrained:
             raise NotImplementedError("VIP has no random-init path -- load_vip() always loads its pretrained checkpoint.")
         model = load_vip()
@@ -1068,8 +1097,8 @@ class EmbeddingNet(nn.Module):
 
       layer       stop the backbone at this module; see src/truncation.py.
       head        turn its output into a vector: avgpool (default with
-                  `layer`), cls, flatten, or linear (trainable); head_dim
-                  sizes a linear head.
+                  `layer`), cls, flatten, or linear / fc (trainable);
+                  head_dim sizes those.
 
     input_size: side length of the frames that will be encoded. Only matters
     when the pipeline doesn't resize (a `preprocess` without resize/crop),
@@ -1136,10 +1165,10 @@ class EmbeddingNet(nn.Module):
             head = head or "avgpool"
         # How this encoder was built, beyond its weights; compared against a
         # loaded checkpoint's record of the same (_load_checkpoint).
-        from src.truncation import DEFAULT_HEAD_DIM
+        from src.truncation import DEFAULT_HEAD_DIM, TRAINABLE_HEADS
         self.build_spec = {
             "arch": self.arch, "layer": layer, "head": head,
-            "head_dim": (head_dim or DEFAULT_HEAD_DIM) if head == "linear" else None,
+            "head_dim": (head_dim or DEFAULT_HEAD_DIM) if head in TRAINABLE_HEADS else None,
             "preprocess": _canonical_preprocess(preprocess),
             "frame_stack": self.frame_stack,
             "frame_fusion": self.frame_fusion,
@@ -1164,6 +1193,10 @@ class EmbeddingNet(nn.Module):
                                   seq_first=False if self._per_frame else None)
             self.out_size = int(np.prod(self.head(dummy_raw).shape[1:]))
 
+        # Whether the head's weights came from `checkpoint` (only a file saved
+        # by this repo with head.* keys); a trainable head on a frozen encoder
+        # needs them (encoder_config.check_head_is_trained).
+        self.head_loaded = False
         if checkpoint is not None:
             self._load_checkpoint(checkpoint)
 
@@ -1207,6 +1240,12 @@ class EmbeddingNet(nn.Module):
         extractor).
         """
         return self.encode_preprocessed(self.preprocess(observation))
+
+    def normalize(self, x):
+        """preprocess() output (maybe augmented) -> the backbone's input: the
+        mean/std normalisation (or [0, 255] rescale) encode_preprocessed()
+        applies itself. For objectives that run the backbone directly (MAE)."""
+        return self._normalize(x)
 
     def preprocess(self, observation):
         """(N, C, H, W) frames [channels-first, as returned by gym_wrappers]
@@ -1304,15 +1343,21 @@ class EmbeddingNet(nn.Module):
                     f"unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''} "
                     "(a head mismatch means embedding.head/head_dim differ from the saved run)"
                 )
+            self.head_loaded = file_has_head
             if missing:
                 print(f"[embeddings] {path!r} has no head weights; the head starts fresh.")
             return
         dropped = [n for n, m in self.embedding.named_modules() if n and isinstance(m, nn.Identity)]
         sd = {k: v for k, v in sd.items() if not any(k.startswith(d + '.') for d in dropped)}
+        if self.arch in VIT_ARCHS:
+            # A whole MAE model (encoder + decoder, e.g. MAE's visualisation
+            # checkpoints) or a timm ViT with its classifier: keep the encoder.
+            sd = {k: v for k, v in sd.items()
+                  if not k.startswith(('decoder_', 'mask_token', 'head.', 'fc_norm.'))}
         _load_custom_state_dict(self.embedding, sd, self.embedding_name, strict=True)
 
     def _warn_on_build_differences(self, path, record):
-        from src.truncation import DEFAULT_HEAD_DIM
+        from src.truncation import DEFAULT_HEAD_DIM, TRAINABLE_HEADS
         meta = record['embedding']
         layer = meta.get('layer')
         head = meta.get('head') or ('avgpool' if layer is not None else None)
@@ -1322,7 +1367,7 @@ class EmbeddingNet(nn.Module):
             'arch': arch,
             'layer': layer,
             'head': head,
-            'head_dim': (meta.get('head_dim') or DEFAULT_HEAD_DIM) if head == 'linear' else None,
+            'head_dim': (meta.get('head_dim') or DEFAULT_HEAD_DIM) if head in TRAINABLE_HEADS else None,
             'preprocess': _canonical_preprocess(meta.get('preprocess')),
             'frame_stack': frame_stack,
             'frame_fusion': (meta.get('frame_fusion') or ('channels' if arch == 'random' else 'concat'))

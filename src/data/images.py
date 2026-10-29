@@ -24,7 +24,15 @@ views.
 
 Training order is by epoch: each epoch is a fresh permutation of all images
 (without replacement), split across workers. Each item is
-(uint8 tensor (views, 3, size, size), label).
+(uint8 tensor (views, 3, size, size), label); label -1 for unlabelled data.
+
+Video frames as images: a clip dataset's frame shards
+(src/data/prepare_ssv2.py, `<root>/<split>/index.npz`) are image shards
+without labels, so they load here as they are. `every` thins a split out:
+video frames (keys <video>/<frame number>.<ext>, as prepare_ssv2.py writes
+them) keep frames 1, 1 + every, 1 + 2 * every, ... of each video, so every
+video keeps at least its first frame (consecutive frames are
+near-duplicates); other images keep every n-th in stored order.
 """
 
 import math
@@ -71,6 +79,17 @@ def _folder_index(root: str, split: str) -> dict:
     return {"key": np.array(paths, dtype=np.bytes_), "label": np.array(labels, dtype=np.int32)}
 
 
+def _frame_numbers(keys) -> Optional[np.ndarray]:
+    """Each key's frame number if every key is <video>/<number>.<ext> (video
+    frames), else None."""
+    keys = np.asarray(keys, dtype=np.bytes_)
+    _, slash, name = np.char.rpartition(keys, b"/").T
+    stem = np.char.partition(name, b".")[:, 0]
+    if not len(keys) or not (slash == b"/").all() or not np.char.isdigit(stem).all():
+        return None
+    return stem.astype(np.int64)
+
+
 def decode(data: bytes) -> torch.Tensor:
     """JPEG/PNG bytes -> uint8 (3, H, W) RGB (grayscale and CMYK converted)."""
     from torchvision.io import ImageReadMode, decode_image
@@ -90,30 +109,57 @@ class ImageDataset(IterableDataset):
 
     def __init__(self, root: str, split: str, train: bool, size: int = 224, views: int = 1,
                  scale=(0.08, 1.0), ratio=(3 / 4, 4 / 3), resize: int = 256, seed: int = 0,
-                 batch_size: int = 1, start_batch: int = 0, limit: Optional[int] = None):
+                 batch_size: int = 1, start_batch: int = 0, limit: Optional[int] = None,
+                 every: int = 1, interpolation: str = "bilinear"):
         self.dir = os.path.join(root, split)
         self.sharded = os.path.isfile(os.path.join(self.dir, "index.npz"))
+        if int(every) != every or every < 1:
+            raise ValueError(f"every must be a whole number >= 1, got {every}")
+        every = int(every)
         if self.sharded:
-            self.index, self.reader = load_index(self.dir), ShardReader(self.dir)
+            # Keys aren't needed to read shards (a frame index has millions);
+            # `every` reads them once, to find frame numbers.
+            fields = ("shard", "offset", "size", "label") + (("key",) if every > 1 else ())
+            self.index = load_index(self.dir, fields=fields)
+            self.reader = ShardReader(self.dir)
         elif os.path.isdir(self.dir):
             self.index, self.reader = _folder_index(root, split), None
         else:
             raise FileNotFoundError(f"{self.dir!r}: neither shards (index.npz) nor class folders")
+        # How `every` thinned the split, for the startup printout: a change to
+        # the key format would otherwise fall back to stored order silently.
+        self.thinning = None
+        if every > 1:
+            frames = _frame_numbers(self.index["key"])
+            keep = (frames - 1) % every == 0 if frames is not None else np.arange(len(self.index["key"])) % every == 0
+            self.index = {k: v[keep] for k, v in self.index.items()}
+            self.thinning = f"every={every}: " + ("per video" if frames is not None else "stored order")
+        if self.sharded:
+            self.index.pop("key", None)
         if limit is not None:
             self.index = {k: v[:limit] for k, v in self.index.items()}
+        if str(interpolation).upper() not in ("BILINEAR", "BICUBIC"):
+            raise ValueError(f"interpolation={interpolation!r}; expected bilinear or bicubic")
         self.train, self.size, self.views = train, size, views
         self.scale, self.ratio, self.resize = tuple(scale), tuple(ratio), resize
+        self.interpolation = str(interpolation).upper()
         self.seed, self.batch_size, self.start_batch = seed, batch_size, start_batch
 
     def __len__(self):
-        return len(self.index["key"])
+        return len(self.index["label"])
+
+    @property
+    def labelled(self) -> bool:
+        return bool(len(self)) and bool((self.index["label"] >= 0).all())
 
     def _crops(self, img):
-        from torchvision.transforms import v2
+        from torchvision.transforms import InterpolationMode, v2
+        mode = InterpolationMode[self.interpolation]
         if self.train or self.views > 1:
-            crop = v2.RandomResizedCrop(self.size, scale=self.scale, ratio=self.ratio, antialias=True)
+            crop = v2.RandomResizedCrop(self.size, scale=self.scale, ratio=self.ratio,
+                                        interpolation=mode, antialias=True)
             return torch.stack([crop(img) for _ in range(self.views)])
-        img = v2.functional.resize(img, self.resize, antialias=True)
+        img = v2.functional.resize(img, self.resize, interpolation=mode, antialias=True)
         return v2.functional.center_crop(img, self.size).unsqueeze(0)
 
     def _read(self, i) -> bytes:

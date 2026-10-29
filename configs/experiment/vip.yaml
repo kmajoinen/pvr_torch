@@ -1,0 +1,37 @@
+# @package _global_
+# VIP (Ma et al., 2023) for pretrain.py: a ResNet trained from scratch with
+# VIP's objective (src/losses.py) and its released model's settings
+# (config_vip_ego4d.yaml, which the VIP README names as the released model's
+# config, and the paper's Appendix D.1): batch 32 videos x 4 frames, Adam
+# 1e-4, 2M steps, gamma 0.98, L1/L2 weights 1e-3, 3 negatives; the
+# representation is the ResNet's fc resized to 1024 (embedding.head=fc); one
+# random resized crop (scale 0.2-1) per video, the same on all its frames,
+# then the official loader's resize to 256 and center crop to 224
+# (final_crop, also at validation); fp32. Same clip data as R3M; VIP reads
+# no text. 2M steps at batch 32 is a long single-GPU run: lower train_steps
+# for a shorter one.
+#   python pretrain.py +experiment=vip pretrain_data.root=/path/to/ssv2
+#   python pretrain.py +experiment=vip embedding=resnet18 ...    # smaller encoder
+defaults:
+  - override /embedding: resnet50
+  - override /augmentation: r3m          # R3M's and VIP's crop are the same (rctraj)
+
+embedding:
+  pretrained: false
+  head: fc
+  head_dim: 1024
+
+objectives:
+  - name: vip
+    weight: 1.0
+    gamma: 0.98
+    l1_weight: 1.0e-3
+    l2_weight: 1.0e-3
+    num_negatives: 3
+
+clip_augmentation: shared
+final_crop: {resize: 256, crop: 224}
+batch_size: 32
+train_steps: 2_000_000
+lr: 1.0e-4
+eval_frequency: 20_000

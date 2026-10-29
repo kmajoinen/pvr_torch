@@ -1,0 +1,8 @@
+# ViT-L/16 (1024 wide, 24 blocks, 16 heads),
+# in MAE's layout (src/vision_models/mae.py), random init. Pretrain it
+# (python pretrain.py +experiment=mvp, or mae), or load weights with
+# embedding.checkpoint: a pretrain.py snapshot, or an MAE-format encoder
+# file (MAE, MVP, VC-1). Features: the CLS token after the final norm.
+name: vit_l16
+pretrained: false
+train: false
