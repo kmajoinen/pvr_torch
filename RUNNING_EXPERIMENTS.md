@@ -392,9 +392,17 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   frames take ~30–40 GB instead of 151 GB. Sampled batches are decompressed
   in background threads (`algo.buffer_decode_threads`) while the previous
   update runs, so each update trains on a batch drawn one update earlier.
-  `algo.buffer_max_gb` caps the compressed size (the buffer stops growing
-  there), and `charts/buffer_gb` / `charts/buffer_compression_ratio` log
-  it as it fills. Leave headroom in `--mem` beyond the buffer.
+  Compressed frames live in one preallocated byte block used as a ring, so
+  the buffer's memory is the bytes it stores; `algo.buffer_max_gb` sizes
+  that block (a hard cap: the buffer then keeps the newest frames that fit).
+  `charts/buffer_gb` / `charts/buffer_compression_ratio` log the stored
+  size, and every run logs the process's memory (`charts/rss_gb`, `rss=` on
+  stdout) next to it -- memory growing faster than the buffer points
+  elsewhere. Leave headroom in `--mem` beyond the buffer.
+  `python -m src.rl.buffer_stress --env adroit_hammer_pixels --image-size 224
+  --compression zstd` fills a buffer with real frames while sampling, without
+  training, and prints memory against stored bytes plus decode throughput
+  (batches/s, which should stay above the run's SPS).
 - **BatchNorm**: the encoder stays in `eval()` even while it trains, so
   BatchNorm running statistics never update (trainable BN affine params
   only), unless `encoder.bn=adapt` (see PIE-G options above).
@@ -556,7 +564,9 @@ template). Expect on the order of 100 GB for the training split.
 is converted again); `--format folders` is, skipping videos finished with
 the same settings. `run_pretrain.sh` copies the shards to the node's local
 disk at job start. Other datasets need only a script that writes the same
-layout, plus a `configs/pretrain_data/<name>.yaml` (`text_strip: 2`
+layout (`DATASETS.md` has the formats and an example; `python -m
+src.data.check <root>` checks the result and prints a config), plus a
+`configs/pretrain_data/<name>.yaml` (`text_strip: 2`
 reproduces R3M's cut of Ego4D's "C " narration prefix).
 
 **R3M** (`configs/experiment/r3m.yaml`, objective `r3m`): time-contrastive,

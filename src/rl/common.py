@@ -422,10 +422,18 @@ def buffer_options(algo_cfg, pixels_in_buffer: bool) -> dict:
 
 
 def buffer_status(rb):
-    """(stdout fragment, wandb metrics) for a compressed buffer's size; empty otherwise."""
-    if getattr(rb, "compression", "none") == "none":
-        return "", {}
-    gb, ratio = rb.stored_bytes / 1e9, rb.compression_ratio()
-    return (f"  buffer={gb:.1f}GB({ratio:.1f}x)",
-            {"charts/buffer_gb": gb, "charts/buffer_compression_ratio": ratio, "charts/buffer_size": len(rb)})
+    """(stdout fragment, wandb metrics): the process's resident memory, and a
+    compressed buffer's stored size -- side by side, so memory that grows
+    faster than the buffer shows up in the run itself."""
+    from src.rl.buffer import rss_gb
+    rss = rss_gb()
+    text, metrics = f"  rss={rss:.1f}GB", {"charts/rss_gb": rss}
+    if getattr(rb, "compression", "none") != "none":
+        gb, ratio = rb.stored_bytes / 1e9, rb.compression_ratio()
+        text = f"  buffer={gb:.1f}GB({ratio:.1f}x)" + text
+        metrics.update({"charts/buffer_gb": gb, "charts/buffer_compression_ratio": ratio,
+                        "charts/buffer_size": len(rb),
+                        # arena bytes ever written: the buffer's actual memory
+                        "charts/buffer_arena_gb": rb.high_water / 1e9})
+    return text, metrics
 
