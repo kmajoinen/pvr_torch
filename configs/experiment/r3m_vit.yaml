@@ -1,0 +1,24 @@
+# @package _global_
+# R3M's objective on MVP's ViT-S/16, from scratch: everything of +experiment=r3m
+# (frame sampling, losses and weights, the per-video crop, SSv2 clips), with
+# ViT training settings instead of R3M's ResNet ones -- AdamW with decoupled
+# weight decay (none on biases and norm weights), a linear warmup then a
+# cosine decay, a larger batch, gradient clipping, bf16. With
+# +experiment=mvp on the same vit_s16, R3M vs MAE differ only in the objective.
+# These are starting values to tune (lr, weight_decay, the r3m l1/l2 weights
+# for a 384-dim output, the warmup), not a published recipe: R3M released no ViT.
+#   python pretrain.py +experiment=r3m_vit pretrain_data.root=/path/to/ssv2
+defaults:
+  - r3m
+  - override /embedding: vit_s16
+
+batch_size: 64              # videos per step (x 5 frames); R3M's ResNets used 16
+optimizer: adamw
+lr: 3.0e-4                  # at batch_size 64; scales linearly with batch_size
+lr_reference_batch: 64
+weight_decay: 0.05
+no_weight_decay_1d: true
+lr_schedule: {name: warmup_cosine, warmup: 10_000}    # steps; cosine over the rest of train_steps
+grad_clip: 1.0
+perf:
+  amp_bf16: true
