@@ -1390,7 +1390,11 @@ class EmbeddingNet(nn.Module):
                   + "; ".join(diffs))
 
     def _batchnorms(self):
-        return [m for m in self.embedding.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+        """The BatchNorm layers encoder.bn=adapt switches: the whole backbone's,
+        or with encoder.trainable=[modules] only those in the listed modules,
+        so frozen modules really stay fixed (their running statistics too)."""
+        roots = getattr(self, "_trainable_roots", None) or [self.embedding]
+        return [m for r in roots for m in r.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
 
     def has_batchnorm(self) -> bool:
         return bool(self._batchnorms())
@@ -1399,7 +1403,8 @@ class EmbeddingNet(nn.Module):
         """BatchNorm layers only: train mode normalises with each batch's own
         statistics and updates the running ones (encoder.bn=adapt, as in
         PIE-G); eval mode uses the running statistics. Everything else
-        (e.g. a ViT's dropout) stays in eval mode either way."""
+        (e.g. a ViT's dropout) stays in eval mode either way. With a module
+        selection (set_trainable([...])), only the selected modules' layers."""
         for m in self._batchnorms():
             m.train(train)
 
@@ -1415,17 +1420,92 @@ class EmbeddingNet(nn.Module):
         return float(torch.sqrt(sum(((current[n] - reference[n]) ** 2).sum() for n in reference)
                                 + torch.zeros(())))
 
-    def set_trainable(self, mode: str) -> None:
-        """Which parameters get requires_grad: 'none', 'all' (backbone and
-        head), or 'head' (a linear head on a frozen backbone, as in PIE-G).
-        Separate from train()/eval(): the training scripts keep the encoder
-        in eval() so BatchNorm statistics stay frozen either way."""
-        if mode not in ("none", "all", "head"):
-            raise ValueError(f"trainable mode {mode!r}; expected none, all or head")
-        for p in self.embedding.parameters():
-            p.requires_grad_(mode == "all")
-        for p in self.head.parameters():
-            p.requires_grad_(mode != "none")
+    def set_trainable(self, mode) -> None:
+        """Which parameters get requires_grad:
+          'none' / 'all'  nothing / backbone and head
+          'head'          only a trainable head, on a frozen backbone (PIE-G)
+          [names]         only these modules, e.g. [layer3] or [blocks.6, head]:
+                          names resolve as embedding.layer's do (a stage, a
+                          ViT block, an exact module path; src/truncation.py),
+                          and 'head' is the output head
+        A listed module must have parameters and must get gradient from the
+        encoder's output: one dummy forward/backward pass checks it, so a
+        module after an embedding.layer cut, or off the image path (e.g. a
+        CLIP text tower), fails here instead of silently never training.
+        trainable_modules records what a list selected ({name: parameter
+        count}; None otherwise). Separate from train()/eval(): the training
+        scripts keep the encoder in eval() so BatchNorm statistics stay frozen
+        either way."""
+        self.trainable_modules = None
+        self._trainable_roots = None
+        if isinstance(mode, str):
+            if mode not in ("none", "all", "head"):
+                raise ValueError(f"trainable mode {mode!r}; expected none, all, head or a list of modules")
+            for p in self.embedding.parameters():
+                p.requires_grad_(mode == "all")
+            for p in self.head.parameters():
+                p.requires_grad_(mode != "none")
+            return
+        from src.truncation import resolve_layer
+        names = list(mode)
+        if not names or not all(isinstance(n, str) and n for n in names):
+            raise ValueError(f"encoder.trainable as a list needs module names, e.g. [layer3] or "
+                             f"[blocks.6] (a ViT's 7th block), got {names!r}")
+        self.requires_grad_(False)
+        try:
+            selected, roots = {}, []
+            for name in names:
+                if name == "head":
+                    qual, module = "head", self.head
+                    params = list(module.parameters())
+                    if not params:
+                        raise ValueError("encoder.trainable lists head, but this encoder's head has no "
+                                         "parameters (embedding.head=linear or fc has)")
+                else:
+                    try:
+                        qual, module = resolve_layer(self.embedding, name)
+                    except ValueError as e:
+                        raise ValueError(str(e).replace(f"embedding.layer={name!r}",
+                                                        f"encoder.trainable entry {name!r}")) from e
+                    params = list(module.parameters())
+                    if not params:
+                        raise ValueError(f"encoder.trainable: {name!r} ({qual}) has no parameters to train")
+                overlap = [q for q in selected if q == qual or qual.startswith(q + ".") or q.startswith(qual + ".")]
+                if overlap:
+                    raise ValueError(f"encoder.trainable: {name!r} ({qual}) overlaps {overlap[0]!r}, also listed; "
+                                     "list each module once (a stage already includes its blocks)")
+                for p in params:
+                    p.requires_grad_(True)
+                selected[qual] = params
+                roots.append(module)
+            self._check_gradient_reaches(selected)
+            self._trainable_roots = roots
+        except Exception:
+            self.requires_grad_(False)       # nothing half-applied, whatever fails (incl. the dummy pass)
+            raise
+        self.trainable_modules = {q: sum(p.numel() for p in ps) for q, ps in selected.items()}
+
+    def _check_gradient_reaches(self, selected) -> None:
+        """One forward/backward pass on a dummy batch, in eval mode (no
+        BatchNorm statistics change): every selected module gets gradient."""
+        modes = {m: m.training for m in self.modules()}
+        self.eval()
+        try:
+            with torch.enable_grad():
+                out = self.encode_preprocessed(torch.zeros(2, *self.in_shape, device=self.device))
+                if out.requires_grad:
+                    out.float().sum().backward()
+            missing = [q for q, ps in selected.items() if all(p.grad is None for p in ps)]
+        finally:
+            for ps in selected.values():
+                for p in ps:
+                    p.grad = None
+            for m, training in modes.items():
+                m.training = training
+        if missing:
+            cut = f" (the encoder stops at embedding.layer={self.layer})" if self.layer else ""
+            raise ValueError(f"encoder.trainable: {missing} get no gradient from the encoder's output{cut}, "
+                             "so they would never train")
 
     def forward(self, observation):
         if self.embedding_name == 'true_state':

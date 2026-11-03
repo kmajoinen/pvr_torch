@@ -7,6 +7,7 @@ look elsewhere in the training run.
 
     MUJOCO_GL=egl python -m src.rl.buffer_stress --env adroit_hammer_pixels \
         --image-size 224 --frames 300000 --compression zstd
+    ... --storage disk --dir /tmp/$SLURM_JOB_ID      # the buffer on the node's local disk
 
 --env is a configs/env/*.yaml name (pixel builders). A pool of frames is
 rendered once with random actions; every added frame is one of them with a
@@ -28,6 +29,8 @@ def main(argv=None):
     p.add_argument("--capacity", type=int, default=1_000_000)
     p.add_argument("--compression", default="zstd")
     p.add_argument("--max-gb", type=float, default=None)
+    p.add_argument("--storage", default="ram", help="ram | disk")
+    p.add_argument("--dir", default=None, help="disk: the buffer's folder (default: /tmp/$SLURM_JOB_ID)")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--sample-every", type=int, default=1, help="sample a batch every N adds (SAC: 1)")
     p.add_argument("--decode-threads", type=int, default=8)
@@ -36,7 +39,7 @@ def main(argv=None):
     a = p.parse_args(argv)
 
     from omegaconf import OmegaConf
-    from src.rl.buffer import ReplayBuffer, rss_gb
+    from src.rl.buffer import ReplayBuffer, cgroup_memory_gb, process_memory_gb, rss_gb
     from src.sac_utils import ENV_BUILDERS
 
     env_cfg = OmegaConf.load(os.path.join(os.path.dirname(__file__), "..", "..", "configs", "env", f"{a.env}.yaml"))
@@ -54,7 +57,7 @@ def main(argv=None):
 
     rng = np.random.default_rng(0)
     rb = ReplayBuffer(a.capacity, shape, 1, "cpu", obs_dtype=np.uint8, compression=a.compression,
-                      decode_threads=a.decode_threads, max_gb=a.max_gb)
+                      decode_threads=a.decode_threads, max_gb=a.max_gb, storage=a.storage, storage_dir=a.dir)
     base = rss_gb()
     print(f"start: rss {base:.2f} GB")
     t0, n_samples = time.time(), 0
@@ -67,11 +70,13 @@ def main(argv=None):
             rb.sample(a.batch_size)
             n_samples += 1
         if t % a.report_every == 0 or t == a.frames:
-            rss, stored = rss_gb(), rb.stored_bytes / 1e9
+            rss, parts, tm = rss_gb(), process_memory_gb(), rb.timings()
+            stored = (rb.stored_bytes if rb.compression != "none" else len(rb) * rb._raw_frame_bytes) / 1e9
             print(f"{t:9,} frames  stored {stored:6.2f} GB ({rb.compression_ratio():.1f}x)  "
-                  f"rss {rss:6.2f} GB  rss - start - stored {rss - base - stored:6.2f} GB  "
-                  f"{t / (time.time() - t0):.0f} adds/s  {n_samples / (time.time() - t0):.1f} batches/s",
-                  flush=True)
+                  f"rss {rss:6.2f} GB (anon {parts['rss_anon']:.2f}, file {parts['rss_file']:.2f})  "
+                  f"cgroup {cgroup_memory_gb():6.2f} GB  "
+                  f"{t / (time.time() - t0):.0f} adds/s  {n_samples / (time.time() - t0):.1f} batches/s  "
+                  f"sample {tm['sample_ms']:.1f} ms  add {tm['add_ms']:.2f} ms", flush=True)
 
 
 if __name__ == "__main__":

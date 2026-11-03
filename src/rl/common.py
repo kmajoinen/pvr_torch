@@ -33,7 +33,7 @@ class EncoderStack:
     strong: Optional[nn.Module]        # augmentation.strong
     pixels_in_buffer: bool             # final decision, after the memory guard
     buffer_reason: str
-    trainable: str                     # 'none' | 'all' | 'head'
+    trainable: object                  # 'none' | 'all' | 'head' | tuple of module names
     bn_ref: Optional[dict]             # BatchNorm statistics as loaded (bn=adapt)
 
 
@@ -78,17 +78,20 @@ def build_encoder_stack(cfg, enc, emb_kwargs, device, pixels_in_buffer: bool,
     # stats (encoder.bn=adapt switches only the BatchNorm layers, during
     # updates). Trainability is controlled purely via requires_grad.
     net.eval()
-    check_head_is_trained(net, enc.trains)
+    check_head_is_trained(net, enc.trains, enc.trainable)
     trainable = enc.trainable if enc.trains else "none"
     net.set_trainable(trainable)
+    if net.trainable_modules:
+        print("Trainable modules: " + ", ".join(f"{q} ({n / 1e6:.2f}M)" for q, n in net.trainable_modules.items()))
     bn_ref = None
     if enc.bn_adapt:
         if not net.has_batchnorm():
-            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers")
+            where = " in encoder.trainable's modules" if net.trainable_modules else ""
+            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers{where}")
         bn_ref = net.bn_stats()   # as loaded; for train/bn_stat_drift
     print(
         f"\nEmbedding: {emb_name}  →  obs_size: {net.out_size}"
-        f"  (trainable={trainable})"
+        f"  (trainable={trainable if isinstance(trainable, str) else '[' + ', '.join(trainable) + ']'})"
         + "".join(f"  {k}={v}" for k, v in emb_kwargs.items())
     )
     head_params = sum(p.numel() for p in net.head.parameters())
@@ -351,6 +354,9 @@ def init_wandb(cfg, algo: str, enc, stack: EncoderStack):
     the logged metric names, which stay fixed for continuity."""
     if not cfg.wandb.enabled:
         return None
+    if (cfg.get("timing") or {}).get("benchmark_steps"):
+        print("wandb: off in benchmark mode (the measurements go to stdout and timing_benchmark.json)")
+        return None
     import wandb
 
     net = stack.net
@@ -365,6 +371,8 @@ def init_wandb(cfg, algo: str, enc, stack: EncoderStack):
     tags = ""
     if enc.trains:
         tags += "_ft-" + "-".join([enc.grads] + enc.aux_names)
+        if not isinstance(enc.trainable, str):          # a module selection (head-only runs keep their names)
+            tags += "_train-" + "+".join(enc.trainable)
     if enc.bn_adapt:
         tags += "_bnadapt"
     if enc.aug_name is not None:
@@ -379,6 +387,8 @@ def init_wandb(cfg, algo: str, enc, stack: EncoderStack):
     config = OmegaConf.to_container(cfg, resolve=True)
     config["buffer_obs_resolved"] = "pixels" if stack.pixels_in_buffer else "features"
     config["buffer_obs_reason"] = stack.buffer_reason
+    if net is not None:
+        config["encoder_trainable_params"] = sum(p.numel() for p in net.parameters() if p.requires_grad)
     if net is not None and net.build_warnings:
         # Printed during construction, before wandb started; log them so a
         # reloaded encoder built differently is visible in the run too.
@@ -409,31 +419,49 @@ def encoder_record(cfg, net) -> dict:
 
 def buffer_options(algo_cfg, pixels_in_buffer: bool) -> dict:
     """ReplayBuffer storage options from algo.buffer_* (compression applies
-    to pixel buffers only: feature vectors barely compress)."""
+    to pixel buffers only: feature vectors barely compress; disk storage
+    applies to any buffer)."""
     compression = str(algo_cfg.get("buffer_compression") or "none")
     if compression != "none" and not pixels_in_buffer:
         print(f"Note: algo.buffer_compression={compression} ignored: the buffer stores features, not pixels")
         compression = "none"
-    if compression == "none":
-        return {}
-    return {"compression": compression, "compression_level": algo_cfg.get("buffer_compression_level"),
-            "decode_threads": int(algo_cfg.get("buffer_decode_threads") or 8),
-            "max_gb": algo_cfg.get("buffer_max_gb")}
+    storage = str(algo_cfg.get("buffer_storage") or "ram")
+    opts = {}
+    if storage != "ram":
+        opts.update(storage=storage, storage_dir=algo_cfg.get("buffer_dir"))
+    if compression != "none":
+        opts.update(compression=compression, compression_level=algo_cfg.get("buffer_compression_level"),
+                    max_gb=algo_cfg.get("buffer_max_gb"))
+    if opts:      # threads that read/decompress sampled batches in the background
+        opts["decode_threads"] = int(algo_cfg.get("buffer_decode_threads") or 8)
+    return opts
 
 
 def buffer_status(rb):
-    """(stdout fragment, wandb metrics): the process's resident memory, and a
-    compressed buffer's stored size -- side by side, so memory that grows
-    faster than the buffer shows up in the run itself."""
-    from src.rl.buffer import rss_gb
-    rss = rss_gb()
-    text, metrics = f"  rss={rss:.1f}GB", {"charts/rss_gb": rss}
+    """(stdout fragment, wandb metrics): the process's resident memory (and
+    its anon/file split), the job's cgroup memory (what the OOM killer
+    counts, page cache included), the mean time per sample()/add() since the
+    last report, and a compressed or disk buffer's size -- side by side, so
+    memory that grows faster than the buffer, or a slow buffer, shows up in
+    the run itself."""
+    from src.rl.buffer import cgroup_memory_gb, process_memory_gb, rss_gb
+    rss, parts, cg = rss_gb(), process_memory_gb(), cgroup_memory_gb()
+    t = rb.timings() if hasattr(rb, "timings") else {}
+    text = f"  rss={rss:.1f}GB"
+    metrics = {"charts/rss_gb": rss, "charts/rss_anon_gb": parts["rss_anon"],
+               "charts/rss_file_gb": parts["rss_file"], "charts/cgroup_mem_gb": cg}
+    if t:
+        text += f"  sample={t['sample_ms']:.1f}ms"
+        metrics.update({"charts/sample_ms": t["sample_ms"], "charts/add_ms": t["add_ms"]})
     if getattr(rb, "compression", "none") != "none":
         gb, ratio = rb.stored_bytes / 1e9, rb.compression_ratio()
         text = f"  buffer={gb:.1f}GB({ratio:.1f}x)" + text
         metrics.update({"charts/buffer_gb": gb, "charts/buffer_compression_ratio": ratio,
                         "charts/buffer_size": len(rb),
-                        # arena bytes ever written: the buffer's actual memory
+                        # arena bytes ever written: the buffer's actual memory (or disk)
                         "charts/buffer_arena_gb": rb.high_water / 1e9})
+    if getattr(rb, "storage", "ram") == "disk":
+        written = rb.high_water if rb.compression != "none" else len(rb) * rb._raw_frame_bytes
+        text += f"  disk={written / 1e9:.1f}GB"
+        metrics["charts/buffer_disk_gb"] = written / 1e9
     return text, metrics
-

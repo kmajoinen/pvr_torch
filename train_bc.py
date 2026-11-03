@@ -227,19 +227,27 @@ def main(cfg: DictConfig) -> None:
         # stats -- same reasoning as train_sac.py. Trainability is
         # controlled purely via requires_grad below, never via train()-mode.
         embedding.eval()
-        check_head_is_trained(embedding, encoder_trains)
+        check_head_is_trained(embedding, encoder_trains, enc.trainable)
         trainable = enc.trainable if encoder_trains else "none"
         embedding.set_trainable(trainable)
+        if embedding.trainable_modules:
+            print("Trainable modules: " + ", ".join(f"{q} ({n / 1e6:.2f}M)"
+                                                    for q, n in embedding.trainable_modules.items()))
         if enc.bn_adapt and not embedding.has_batchnorm():
-            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers")
+            where = " in encoder.trainable's modules" if embedding.trainable_modules else ""
+            raise ValueError(f"encoder.bn=adapt, but {emb_name!r} has no BatchNorm layers{where}")
         if enc.bn_adapt:
             bn_ref = embedding.bn_stats()   # as loaded; for train/bn_stat_drift
         obs_size = embedding.out_size
-        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={trainable})"
+        shown = trainable if isinstance(trainable, str) else "[" + ", ".join(trainable) + "]"
+        print(f"\nEmbedding: {emb_name}  →  obs_size: {obs_size}  (trainable={shown})"
               + "".join(f"  {k}={v}" for k, v in emb_kwargs.items()))
         head_params = sum(p.numel() for p in embedding.head.parameters())
         if head_params:
             print(f"Encoder head: {head_params / 1e6:.1f}M parameters")
+        if use_wandb:
+            wandb.config.update({"encoder_trainable_params":
+                                 sum(p.numel() for p in embedding.parameters() if p.requires_grad)})
         if use_wandb and embedding.build_warnings:
             wandb.config.update({"encoder_build_warnings": embedding.build_warnings})
 

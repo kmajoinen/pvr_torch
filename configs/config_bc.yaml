@@ -27,8 +27,10 @@ encoder:
   betas: [0.9, 0.999]      # Adam (beta1, beta2) for the encoder optimizer
   grad_clip: 1.0           # clip norm on encoder gradients before each step
                            #   (null: no clipping)
-  trainable: all           # all | head -- head trains only embedding.head=linear,
-                           #   on a frozen backbone
+  trainable: all           # all | head | [modules] -- head trains only embedding.head=linear,
+                           #   on a frozen backbone; a list trains only those modules, e.g.
+                           #   [layer3], [layer3, layer4], [blocks.6] (names as for
+                           #   embedding.layer; `head` is the output head)
   bn: frozen               # frozen | adapt -- adapt: BatchNorm uses each training
                            #   batch's statistics and updates its running ones;
                            #   validation/eval use the running ones

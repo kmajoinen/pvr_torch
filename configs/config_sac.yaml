@@ -15,8 +15,10 @@ encoder:
   betas: [0.9, 0.999]      # Adam (beta1, beta2) for the encoder optimizer
   grad_clip: 10.0          # clip norm on encoder gradients before each step
                            #   (null: no clipping)
-  trainable: all           # all | head -- head trains only embedding.head=linear,
-                           #   on a frozen backbone (PIE-G)
+  trainable: all           # all | head | [modules] -- head trains only embedding.head=linear,
+                           #   on a frozen backbone (PIE-G); a list trains only those modules, e.g.
+                           #   [layer3], [layer3, layer4], [blocks.6] (names as for
+                           #   embedding.layer; `head` is the output head)
   bn: frozen               # frozen | adapt -- adapt: BatchNorm uses each replay
                            #   batch's statistics and updates its running ones
                            #   during updates, running ones when acting (PIE-G)
@@ -51,6 +53,11 @@ model_dir: null          # if set, embedding checkpoints are looked up here
 
 save:
   enabled: true          # best_actor.pt on new best eval + final_checkpoint.pt
+
+timing:                  # run-time estimate (src/timing.py): eta in the logs + timing.json
+  enabled: true          # costs nothing per step (clock reads at log/eval points only)
+  benchmark_steps: null  # N: train N steps past the warm-up, time one evaluation, print the
+                         #   predicted total for the configured run, and stop (saves nothing)
 
 wandb:
   enabled: false

@@ -21,7 +21,7 @@ The encoder trains (gets an optimizer) iff grads != none or aux is non-empty.
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from src.losses import aux_loss_classes
 
@@ -46,7 +46,8 @@ class EncoderSettings:
     grads: str
     aux_specs: List[dict]
     trains: bool
-    trainable: str          # 'all' | 'head' (encoder.trainable); see EmbeddingNet.set_trainable
+    trainable: Union[str, Tuple[str, ...]]   # 'all' | 'head' | module names (encoder.trainable);
+                                             #   see EmbeddingNet.set_trainable
     aug_name: Optional[str]
     aug_stage: str
     task_aug: bool          # the task loss sees augmented observations
@@ -66,22 +67,27 @@ def _plain(node):
     return OmegaConf.to_container(node, resolve=True) if OmegaConf.is_config(node) else node
 
 
-def check_head_is_trained(net, trains: bool) -> None:
-    """A trainable head (embedding.head=linear or fc) on an encoder that
-    doesn't train has to come trained from embedding.checkpoint, or it stays
-    a random projection. Config validation (encoder_settings) only sees that
-    a checkpoint is set; this checks, once the encoder is built, that the
-    file held head weights -- a file saved by this repo with a trained head.
-    Other files (a bare backbone, e.g. an official R3M snapshot) load into
-    the backbone only."""
+def head_trains(trains: bool, trainable) -> bool:
+    """Does the encoder's head train, given encoder.trainable?"""
+    return trains and (trainable in ("all", "head") if isinstance(trainable, str) else "head" in trainable)
+
+
+def check_head_is_trained(net, trains: bool, trainable="all") -> None:
+    """A trainable head (embedding.head=linear or fc) that doesn't train --
+    the encoder is frozen, or encoder.trainable leaves the head out -- has to
+    come trained from embedding.checkpoint, or it stays a random projection.
+    Config validation (encoder_settings) only sees that a checkpoint is set;
+    this checks, once the encoder is built, that the file held head weights
+    -- a file saved by this repo with a trained head. Other files (a bare
+    backbone, e.g. an official R3M snapshot) load into the backbone only."""
     from src.truncation import TRAINABLE_HEADS
     head = net.build_spec.get("head")
-    if head in TRAINABLE_HEADS and not trains and not net.head_loaded:
+    if head in TRAINABLE_HEADS and not head_trains(trains, trainable) and not net.head_loaded:
+        why = "the encoder is frozen" if not trains else f"encoder.trainable={list(trainable)} leaves it out"
         raise ValueError(
-            f"embedding.head={head} is trainable, but the encoder is frozen and "
-            f"{net.checkpoint!r} has no weights for it, so it would stay a random "
-            "projection. Load an encoder saved with this head (e.g. a pretrain.py VIP "
-            "snapshot), or set encoder.grads / encoder.aux so it trains.")
+            f"embedding.head={head} is trainable, but {why} and {net.checkpoint!r} has no "
+            "weights for it, so it would stay a random projection. Load an encoder saved "
+            "with this head (e.g. a pretrain.py VIP snapshot), or let the head train.")
 
 
 def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
@@ -158,9 +164,17 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
 
     trains = grads != "none" or bool(aux_specs)
 
-    trainable = str(enc.get("trainable", "all"))
-    if trainable not in ("all", "head"):
-        raise ValueError(f"encoder.trainable={trainable!r}; expected all or head")
+    trainable = _plain(enc.get("trainable", "all"))
+    if isinstance(trainable, (list, tuple)):
+        if not trainable or not all(isinstance(n, str) and n for n in trainable):
+            raise ValueError(f"encoder.trainable as a list needs module names, e.g. [layer3] or "
+                             f"[blocks.6] (a ViT's 7th block), got {trainable!r}")
+        trainable = tuple(trainable)
+    elif str(trainable) not in ("all", "head"):
+        raise ValueError(f"encoder.trainable={trainable!r}; expected all, head, or a list of modules "
+                         "(e.g. [layer3])")
+    else:
+        trainable = str(trainable)
     from src.truncation import TRAINABLE_HEADS
     emb_head = cfg.embedding.get("head") if has_embedding else None
     if emb_head in TRAINABLE_HEADS and not trains and not cfg.embedding.get("checkpoint"):
@@ -169,10 +183,18 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
             "(encoder.grads=none, encoder.aux empty), so it would stay a random "
             "projection. Set encoder.grads (e.g. critic) or encoder.aux."
         )
-    if trainable == "head" and emb_head not in TRAINABLE_HEADS:
+    if emb_head in TRAINABLE_HEADS and trains and not head_trains(trains, trainable) \
+            and not cfg.embedding.get("checkpoint"):
         raise ValueError(
-            f"encoder.trainable=head trains only the head, but embedding.head={emb_head} "
-            "has no parameters. Use embedding.head=linear (or fc), or encoder.trainable=all."
+            f"embedding.head={emb_head} is trainable, but encoder.trainable={list(trainable)} "
+            "leaves it out, so it would stay a random projection: add head to the list"
+        )
+    lists_head = isinstance(trainable, tuple) and "head" in trainable
+    if (trainable == "head" or lists_head) and emb_head not in TRAINABLE_HEADS:
+        raise ValueError(
+            f"encoder.trainable={trainable if isinstance(trainable, str) else list(trainable)} "
+            f"trains the head, but embedding.head={emb_head} has no parameters. Use "
+            "embedding.head=linear (or fc), or train other modules."
         )
 
     if not has_embedding:

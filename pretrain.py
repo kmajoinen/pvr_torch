@@ -54,6 +54,11 @@ charts/data_wait_frac (share of wall time spent waiting for the data
 loader: near 1 means the loader is the bottleneck); eval/* for validation.
 """
 
+import time as _time
+# Before the heavy imports, counted in startup_seconds. A list, taken once:
+# Hydra's -m runs later jobs in this same process, which start their clock in main().
+_T_START = [_time.time()]
+
 import math
 import os
 import random
@@ -69,6 +74,7 @@ from src.data.clips import ClipDataset, ClipManifest
 from src.encoder_config import embedding_kwargs
 from src.losses import AuxBatch, aux_loss_classes, build_aux_losses, objective_terms
 from src.rl.common import encoder_record
+from src.timing import timer_from_config
 
 
 def _plain(node):
@@ -244,6 +250,7 @@ def _save(obj, path):
 
 @hydra.main(config_path="configs", config_name="config_pretrain", version_base=None)
 def main(cfg: DictConfig) -> None:
+    t_script = _T_START.pop() if _T_START else time.time()
     print(OmegaConf.to_yaml(cfg))
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -411,7 +418,9 @@ def main(cfg: DictConfig) -> None:
     names = "+".join(t.name for t in terms)
     label = f"{names}_{data.name}_{cfg.embedding.name}"
     wandb = None
-    if cfg.wandb.enabled:
+    if cfg.wandb.enabled and (cfg.get("timing") or {}).get("benchmark_steps"):
+        print("wandb: off in benchmark mode (the measurements go to stdout and timing_benchmark.json)")
+    elif cfg.wandb.enabled:
         import wandb
         aug_tag = f"_aug-{cfg.augmentation.name}" if aug is not None else ""
         wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity,
@@ -432,14 +441,18 @@ def main(cfg: DictConfig) -> None:
                     f"# then: python train_sac.py embedding={label}\n")
             f.write(OmegaConf.to_yaml(OmegaConf.create(emb_cfg)))
 
+    def checkpoint(step):
+        record = encoder_record(cfg, encoder)
+        record["step"] = step
+        return record, {**record, "objectives": {t.name: t.loss.state_dict() for t in terms},
+                        "optimizer": optimizer.state_dict(), "wandb_id": wandb_id,
+                        "config": OmegaConf.to_container(cfg, resolve=True)}
+
     def save(step, final=False):
         if not cfg.save.enabled:
             return
-        record = encoder_record(cfg, encoder)
-        record["step"] = step
-        _save({**record, "objectives": {t.name: t.loss.state_dict() for t in terms},
-               "optimizer": optimizer.state_dict(), "wandb_id": wandb_id,
-               "config": OmegaConf.to_container(cfg, resolve=True)}, ckpt_path)
+        record, full = checkpoint(step)
+        _save(full, ckpt_path)
         if final or (keep and step % keep == 0):
             snapshot = os.path.join(run_dir, f"encoder_step{step:07d}.pt")
             _save(record, snapshot)
@@ -525,6 +538,15 @@ def main(cfg: DictConfig) -> None:
           + (f" ({train_steps / steps_per_epoch:.1f} epochs)" if steps_per_epoch else "")
           + (f" (from step {step:,})" if step else "")
           + f", validating every {eval_frequency:,} steps")
+    # Run-time estimate (src/timing.py): eta in the logs, timing.json, benchmark mode.
+    timer, bench_steps = timer_from_config(
+        cfg, train_steps, eval_frequency, 0, run_dir,
+        {"script": "pretrain", "objectives": names, "data": data.name, "embedding": cfg.embedding.name,
+         "batch_size": cfg.batch_size, "image_size": int(data.image_size),
+         "num_workers": int(cfg.num_workers), "amp_bf16": bool(cfg.perf.amp_bf16)},
+        t_script, start_step=step, final_eval=True, save_per_eval=bool(cfg.save.enabled),
+        log_frequency=int(cfg.log_frequency))
+    bench_from = step
     sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
     while step < train_steps:
         lr = base_lr * lr_factor(sched, step, sched_epoch)
@@ -550,32 +572,58 @@ def main(cfg: DictConfig) -> None:
             elapsed = time.time() - t_log
             avg = {k: float(v) / n_sum for k, v in sums.items()}
             sps, wait = n_sum / elapsed, data_time / elapsed
+            timer.mark(step)
+            timing_text, timing_metrics = timer.status(step)
+            timer.write(step)
             epoch = f"  epoch={step / steps_per_epoch:.2f}" if steps_per_epoch else ""
             print(f"  step {step:>9,}{epoch}  loss={avg['loss']:.4f}  "
                   f"{fmt(avg, sorted(k for k in avg if '/' in k))}  lr={lr:.3g}"
-                  f"  steps/s={sps:.1f}  data_wait={wait:.0%}")
+                  f"  steps/s={sps:.1f}  data_wait={wait:.0%}{timing_text}")
             if wandb is not None:
                 log = {f"train/{k}": v for k, v in avg.items()}
                 log.update({"train/lr": lr, "charts/steps_per_sec": sps, "charts/data_wait_frac": wait,
-                            "global_step": step})
+                            **timing_metrics, "global_step": step})
                 if steps_per_epoch:
                     log["train/epoch"] = step / steps_per_epoch
                 wandb.log(log, step=step)
             sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
 
-        if step % eval_frequency == 0 or step == train_steps:
+        bench_now = (bench_steps and step % cfg.log_frequency == 0 and timer.rate() is not None
+                     and step - bench_from >= bench_steps)
+        scheduled = step % eval_frequency == 0 or step == train_steps
+        if scheduled or (bench_now and timer.mean_excluded("eval") is None):
             t_eval = time.time()
-            ev = evaluate()
-            print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
-            if wandb is not None:
-                wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
-            save(step, final=step == train_steps)
+            with timer.exclude("eval", timing_only=not scheduled):
+                ev = evaluate()
+                print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
+                if wandb is not None:
+                    wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
+            if cfg.save.enabled and not bench_steps:
+                with timer.exclude("save"):
+                    save(step, final=step == train_steps)
+            elif cfg.save.enabled and (scheduled or timer.mean_excluded("save") is None):
+                # Benchmark: time one checkpoint write (to a scratch name -- a
+                # checkpoint.pt here would be resumed by the next run).
+                test_path = os.path.join(run_dir, ".timing_save_test.pt")
+                with timer.exclude("save", timing_only=not scheduled):
+                    _save(checkpoint(step)[1], test_path)
+                os.remove(test_path)
             t_log += time.time() - t_eval      # keep steps/s about training
 
-    if cfg.save.enabled:
+        if bench_now:                          # benchmark mode: measured; predict and stop
+            timer.write(step)
+            print("\n" + timer.benchmark_report(step))
+            break
+
+    if cfg.save.enabled and not bench_steps:
         print(f"\nSaved to: {run_dir}  (embedding.yaml: how to use the encoder)")
     if wandb is not None:
         wandb.finish()
+    if not bench_steps and step > timer.start_step:
+        # The final record: the job's whole time, final validation and save
+        # included. Not for a job resumed after the run had already finished
+        # (chained jobs): it trained nothing, and would replace the record.
+        timer.write(step)
 
 
 if __name__ == "__main__":

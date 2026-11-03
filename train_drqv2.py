@@ -32,6 +32,11 @@ Logged metrics reuse train_sac.py's keys where they mean the same thing
 grad norms, encoder metrics, eval/*); DrQ-v2 adds train/actor_stddev.
 """
 
+import time as _time
+# Before the heavy imports, counted in startup_seconds. A list, taken once:
+# Hydra's -m runs later jobs in this same process, which start their clock in main().
+_T_START = [_time.time()]
+
 import os
 
 # Must be set before dm_control's C extension loads; EGL = GPU offscreen
@@ -73,11 +78,13 @@ from src.rl.common import (
 )
 from src.rl.drqv2 import Actor, Critic, stddev_schedule
 from src.sac_utils import _success_fn_for, evaluate, make_env
+from src.timing import timer_from_config
 from src.views import CollapseMonitor
 
 
 @hydra.main(config_path="configs", config_name="config_drqv2", version_base=None)
 def main(cfg: DictConfig) -> None:
+    t_script = _T_START.pop() if _T_START else time.time()
     print(OmegaConf.to_yaml(cfg))
 
     # ── Reproducibility / perf ────────────────────────────────────────────────
@@ -164,6 +171,45 @@ def main(cfg: DictConfig) -> None:
     enc_gnorm_critic = float("nan")
     enc_gnorm_actor = float("nan")
     collapse = CollapseMonitor()
+    # Run-time estimate (src/timing.py): eta in the logs, timing.json, benchmark mode.
+    timer, bench_steps = timer_from_config(
+        cfg, a.total_timesteps, a.eval_frequency, a.learning_starts, save_dir,
+        {"script": "train_drqv2", "env": cfg.env.id, "image_size": cfg.env.get("image_size"),
+         "embedding": cfg.embedding.get("name"), "encoder_grads": enc.grads,
+         "pixels_in_buffer": pixels_in_buffer, "batch_size": a.batch_size,
+         "action_repeat": action_repeat, "buffer_compression": a.get("buffer_compression", "none")},
+        t_script, log_frequency=a.log_frequency)
+    benchmark_done = False
+
+    def final_checkpoint():
+        ckpt = {
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        if save_encoder:
+            ckpt.update(encoder_record(cfg, embedding_net))
+        return ckpt
+
+    def run_eval(global_step, std, timing_only=False):
+        nonlocal best_eval_return
+        with timer.exclude("eval", timing_only=timing_only):
+            stats = evaluate(
+                lambda o: to_env(actor(o, std).mean),
+                eval_env,
+                a.n_episodes_test,
+                device,
+                encode_fn=E.encode_single if pixels_in_buffer else None,
+                success_fn=_success_fn_for(cfg.env.id),
+            )
+            log_eval(stats, global_step, wandb)
+            if stats["return_mean"] > best_eval_return and not bench_steps:
+                best_eval_return = stats["return_mean"]
+                if cfg.save.enabled:
+                    torch.save(actor.state_dict(), os.path.join(save_dir, "best_actor.pt"))
+                    if save_encoder:
+                        torch.save(encoder_record(cfg, embedding_net),
+                                   os.path.join(save_dir, "best_encoder.pt"))
 
     for global_step in range(1, a.total_timesteps + 1):
         std = stddev_schedule(a.stddev_schedule, global_step)
@@ -190,6 +236,9 @@ def main(cfg: DictConfig) -> None:
         else:
             obs = next_obs
 
+        if global_step <= a.learning_starts and (global_step % a.log_frequency == 0
+                                                 or global_step == a.learning_starts):
+            timer.mark(global_step)            # the warm-up's own rate
         if global_step <= a.learning_starts or global_step % a.update_every_steps != 0:
             continue
 
@@ -287,19 +336,24 @@ def main(cfg: DictConfig) -> None:
         # against update_every_steps above).
         if global_step % a.log_frequency == 0:
             sps = int(global_step / (time.time() - t0))
+            timer.mark(global_step)
+            timing_text, timing_metrics = timer.status(global_step)
+            timer.write(global_step)
+            buffer_text, buffer_metrics = buffer_status(rb)     # once: it resets the buffer's timings
             print(
                 f"  step {global_step:>8,}  qf_loss={qf_loss.item():8.3f}"
                 f"  q1={qf1_a_values.mean().item():7.2f}"
                 f"  actor_loss={actor_loss.item():8.3f}"
                 f"  std={std:.3f}  SPS={sps}"
                 f"  gnorm(q/actor)={q_gnorm:.2f}/{actor_gnorm:.2f}"
-                + buffer_status(rb)[0]
+                + buffer_text
                 + (
                     f"  enc_gnorm(c/a)={enc_gnorm_critic:.2f}/{enc_gnorm_actor:.2f}"
                     f"  emb_std_ratio={collapse.ratio:.2f}"
                     if encoder_trains
                     else ""
                 )
+                + timing_text
             )
             if wandb is not None:
                 log = {
@@ -314,7 +368,8 @@ def main(cfg: DictConfig) -> None:
                     "train/q_grad_norm": q_gnorm,
                     "train/actor_grad_norm": actor_gnorm,
                     "charts/SPS": sps,
-                    **buffer_status(rb)[1],
+                    **buffer_metrics,
+                    **timing_metrics,
                     "charts/frames": global_step * action_repeat,
                     "global_step": global_step,
                 }
@@ -326,40 +381,38 @@ def main(cfg: DictConfig) -> None:
 
         # ---- periodic evaluation ----------------------------------------------------
         if global_step % a.eval_frequency == 0:
-            stats = evaluate(
-                lambda o: to_env(actor(o, std).mean),
-                eval_env,
-                a.n_episodes_test,
-                device,
-                encode_fn=E.encode_single if pixels_in_buffer else None,
-                success_fn=_success_fn_for(cfg.env.id),
-            )
-            log_eval(stats, global_step, wandb)
-            if stats["return_mean"] > best_eval_return:
-                best_eval_return = stats["return_mean"]
-                if cfg.save.enabled:
-                    torch.save(actor.state_dict(), os.path.join(save_dir, "best_actor.pt"))
-                    if save_encoder:
-                        torch.save(encoder_record(cfg, embedding_net),
-                                   os.path.join(save_dir, "best_encoder.pt"))
+            run_eval(global_step, std)
+
+        # ---- benchmark mode: measure, predict, stop ------------------------------------
+        if (bench_steps and global_step % a.log_frequency == 0 and timer.rate() is not None
+                and global_step - a.learning_starts >= bench_steps):
+            if timer.mean_excluded("eval") is None:
+                run_eval(global_step, std, timing_only=True)   # one evaluation, to time it
+            if cfg.save.enabled:
+                # Time the final checkpoint's write (to a scratch name).
+                test_path = os.path.join(save_dir, ".timing_save_test.pt")
+                with timer.exclude("save", timing_only=True):
+                    torch.save(final_checkpoint(), test_path)
+                os.remove(test_path)
+            timer.write(global_step)
+            print("\n" + timer.benchmark_report(global_step))
+            benchmark_done = True
+            break
 
     # ── Final save ────────────────────────────────────────────────────────────
-    if cfg.save.enabled:
-        ckpt = {
-            "actor": actor.state_dict(),
-            "critic": critic.state_dict(),
-            "config": OmegaConf.to_container(cfg, resolve=True),
-        }
-        if save_encoder:
-            ckpt.update(encoder_record(cfg, embedding_net))
-        torch.save(ckpt, os.path.join(save_dir, "final_checkpoint.pt"))
+    if cfg.save.enabled and not benchmark_done:
+        with timer.exclude("save"):
+            torch.save(final_checkpoint(), os.path.join(save_dir, "final_checkpoint.pt"))
         print(f"\nSaved to: {save_dir}")
-    print(f"Best eval return: {best_eval_return:.1f}")
+    if not benchmark_done:
+        print(f"Best eval return: {best_eval_return:.1f}")
 
     env.close()
     eval_env.close()
     if wandb is not None:
         wandb.finish()
+    if not benchmark_done:
+        timer.write(global_step)       # the final record: the job's whole time, final save included
 
 
 if __name__ == "__main__":

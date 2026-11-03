@@ -8,7 +8,8 @@ defaults:
   - _self_
 
 objectives: []                # [{name: r3m, weight: 1.0, ...params}], see src/losses.py
-trainable: all                # all | head (a linear head on a frozen backbone)
+trainable: all                # all | head (a linear head on a frozen backbone) | [modules]
+                              #   (only those train, e.g. [layer4]; see config_sac.yaml)
 clip_augmentation: shared     # shared: one augmentation draw per video, the same on
                               #   all its frames (R3M's rctraj) | per_frame
 final_crop: null              # clips: {resize, crop} after augmentation, in validation
@@ -52,6 +53,11 @@ save:
   keep_every_epochs: null     # image data: every N epochs instead
 resume: true                  # continue from <run dir>/checkpoint.pt if it exists
                               #   (rerun with the same hydra.run.dir)
+
+timing:                       # run-time estimate (src/timing.py): eta in the logs + timing.json
+  enabled: true               # costs nothing per step (clock reads at log/eval points only)
+  benchmark_steps: null       # N: train N steps, time one validation, print the predicted
+                              #   total for the configured run, and stop (saves nothing)
 
 seed: 1
 device: cuda
