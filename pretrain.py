@@ -18,12 +18,22 @@ Two kinds of data (pretrain_data.type), each with its own objectives:
           resized crop per view the objective needs) -> [0, 1] ->
           augmented, each view with its own draws -> the objectives, which
           encode the views themselves
-Then one optimizer step (optimizer: adam | sgd, lr_schedule) over the
-encoder and the objectives' own heads. The encoder is in train() mode while
-training (BatchNorm uses and updates batch statistics) and eval() mode for
-validation. Image runs can be sized in epochs (epochs, eval_every_epochs,
-save.keep_every_epochs); validation is then a full pass over the validation
-split (pretrain_data.eval_batches limits it).
+Then schedule.updates_per_batch optimizer steps on that batch (optimizer:
+adam | adamw | sgd, lr_schedule) over the encoder and the objectives' own
+heads, each with fresh augmentation draws unless schedule.reaugment is
+false. The encoder is in train() mode while training (BatchNorm uses and
+updates batch statistics) and eval() mode for validation.
+
+Schedule (schedule.*, src/data/order.py), for either data type:
+  sampling  sweep: each item once per epoch, fresh order (clips: each video
+            clips_per_video times) | random: uniform with replacement, an
+            epoch being epoch_batches batches. Defaults: clips random (R3M),
+            images sweep (ImageNet training)
+  length    epochs, or train_steps updates, or train_images samples drawn
+            (with epochs: epochs and lr schedule stretched to that count)
+Frequencies can be given in epochs (eval_every_epochs,
+save.keep_every_epochs); image validation is a full pass over the
+validation split (pretrain_data.eval_batches limits it).
 
 Outputs, in the run directory:
   checkpoint.pt         latest state, saved after every validation:
@@ -42,9 +52,14 @@ the released weights get here, so they compare under identical RL
 preprocessing.
 
 Resuming: rerun with the same hydra.run.dir; checkpoint.pt is picked up
-(resume=true). Clip data is reseeded from (seed, step) so the stream
-continues instead of repeating; image data continues at the exact position
-in its epoch (same batch_size and num_workers). wandb continues the run.
+(resume=true). Checkpoints fall between batches (validation intervals must
+be multiples of updates_per_batch). Random clip streams are reseeded from
+(seed, step) so they continue instead of repeating; sweep streams and random
+image streams continue at the exact item (same batch_size and num_workers).
+What's drawn from each item (a clip's frames, crops, augmentation, negatives)
+comes from RNGs reseeded on resume, so a resumed run is statistically
+equivalent to an uninterrupted one, not bit-identical, and never replays the
+same draws. wandb continues the run.
 
 Logged (wandb and stdout), averaged over each log_frequency interval:
 train/loss, train/<objective> (unweighted), train/<objective>/<metric>
@@ -131,7 +146,8 @@ def _data_loader(dataset, cfg, num_workers, device, persistent=True):
     )
 
 
-def _loader(cfg, data, manifest_file, sampler, num_workers, device, seed):
+def _clip_dataset(cfg, data, manifest_file, sampler, seed, **order):
+    """A ClipDataset over a manifest; `order`: ClipDataset's sampling options."""
     from hydra.utils import to_absolute_path
     root = to_absolute_path(str(data.root))
     manifest = ClipManifest(root, manifest_file, min_length=sampler.min_length,
@@ -139,10 +155,46 @@ def _loader(cfg, data, manifest_file, sampler, num_workers, device, seed):
     print(f"  {manifest.source}: {len(manifest):,} videos"
           + (f" ({manifest.skipped:,} shorter than {sampler.min_length} frames skipped)"
              if manifest.skipped else ""))
-    return iter(_data_loader(ClipDataset(manifest, sampler, seed=seed), cfg, num_workers, device))
+    return ClipDataset(manifest, sampler, seed=seed, **order)
 
 
-def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_batch: int = 0):
+def _loader(cfg, data, manifest_file, sampler, num_workers, device, seed, **order):
+    return iter(_data_loader(_clip_dataset(cfg, data, manifest_file, sampler, seed, **order),
+                             cfg, num_workers, device))
+
+
+def schedule_settings(cfg, images: bool) -> dict:
+    """cfg.schedule, validated, with the data type's default sampling (clips:
+    random, as R3M; images: sweep, as ImageNet training)."""
+    sch = cfg.get("schedule") or {}
+    sampling = sch.get("sampling") or ("sweep" if images else "random")
+    if sampling not in ("sweep", "random"):
+        raise ValueError(f"schedule.sampling={sampling!r}; expected sweep or random")
+    def given(key):                                   # 0 is a value (and rejected), unset is 1
+        v = sch.get(key)
+        return 1 if v is None else v
+    out = {"sampling": sampling, "epoch_batches": sch.get("epoch_batches"),
+           "clips_per_video": given("clips_per_video"), "updates_per_batch": given("updates_per_batch"),
+           "reaugment": sch.get("reaugment", True)}
+    checked = ("clips_per_video", "updates_per_batch") + (("epoch_batches",) if out["epoch_batches"] is not None else ())
+    for key in checked:
+        v = out[key]
+        if isinstance(v, bool) or int(v) != v or v < 1:
+            raise ValueError(f"schedule.{key} must be a whole number >= 1, got {v!r}")
+        out[key] = int(v)
+    if out["clips_per_video"] != 1 and (images or sampling != "sweep"):
+        raise ValueError("schedule.clips_per_video applies to clip data with sampling=sweep (draws per "
+                         "video per epoch)")
+    if out["epoch_batches"] is not None and sampling != "random":
+        raise ValueError("schedule.epoch_batches sets the length of a random-sampling epoch; with "
+                         "sampling=sweep an epoch is the whole dataset")
+    if not isinstance(out["reaugment"], bool):
+        raise ValueError(f"schedule.reaugment must be true or false, got {out['reaugment']!r}")
+    return out
+
+
+def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_batch: int = 0,
+                   order: str = "sweep"):
     from hydra.utils import to_absolute_path
     from src.data.images import ImageDataset
     crop = data.get("train_crop") or {}
@@ -153,7 +205,8 @@ def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_b
         to_absolute_path(str(data.root)), split, train=train, size=int(data.image_size), views=views,
         scale=tuple(crop.get("scale", (0.08, 1.0))), ratio=tuple(crop.get("ratio", (3 / 4, 4 / 3))),
         resize=int(data.get("eval_resize") or 256), seed=seed, batch_size=int(cfg.batch_size),
-        start_batch=start_batch, every=int(every), interpolation=str(data.get("interpolation") or "bilinear"))
+        start_batch=start_batch, every=int(every), interpolation=str(data.get("interpolation") or "bilinear"),
+        order=order)
 
 
 def scale_to_images(epochs: float, sched: dict, n_images: int, train_images: float):
@@ -171,6 +224,60 @@ def scale_to_images(epochs: float, sched: dict, n_images: int, train_images: flo
     if sched.get("milestones"):
         sched["milestones"] = [float(m) * factor for m in sched["milestones"]]
     return float(epochs) * factor, sched
+
+
+def resume_changes(old_config, cfg, sch: dict, images: bool) -> dict:
+    """What differs from a checkpoint's config in a way that moves the data
+    stream, as {name: (checkpoint, now)}. Compares resolved schedules, so a
+    checkpoint from before schedule.* existed, or `sampling: sweep` written
+    out where it was the default, doesn't count as a change. A random clip
+    stream has no position to lose: it only cares if the sampling changed."""
+    if not old_config:
+        return {}
+    old_sch = schedule_settings(old_config, images)
+    # Only a sweep splits its order by worker; a random batch's items don't depend on the worker count.
+    keys = ("batch_size",) if sch["sampling"] == old_sch["sampling"] == "random" else ("batch_size", "num_workers")
+    changed = {k: (old_config.get(k), cfg[k]) for k in keys if old_config.get(k) != cfg[k]}
+    changed.update({f"schedule.{k}": (old_sch[k], v) for k, v in sch.items() if old_sch[k] != v})
+    keeps_position = images or sch["sampling"] == "sweep" or "schedule.sampling" in changed
+    return changed if keeps_position else {}
+
+
+def epochs_to_steps(epochs: float, steps_per_epoch: int, updates_per_batch: int) -> int:
+    """A frequency in epochs as steps: the nearest whole number of batches, so
+    it falls between batches however fractional the epoch count."""
+    return max(updates_per_batch, round(epochs * steps_per_epoch / updates_per_batch) * updates_per_batch)
+
+
+def plan_run(cfg, sch: dict, n_items: int) -> dict:
+    """The run's length from cfg and the schedule (schedule_settings), for a
+    training set of n_items samples per sweep (images, or clips: videos x
+    clips_per_video):
+      batches_per_epoch  a sweep's whole dataset, or schedule.epoch_batches
+                         random batches (default: the same number of samples)
+      steps_per_epoch    batches_per_epoch x updates_per_batch
+      train_steps        epochs x steps_per_epoch; else train_images samples
+                         drawn (ceil(train_images / batch_size) batches x
+                         updates_per_batch); else train_steps
+      epochs, lr_schedule  with train_images and epochs, both stretched to
+                         the image count (scale_to_images)
+      samples_per_epoch  what train_images counts against"""
+    B, K = int(cfg.batch_size), sch["updates_per_batch"]
+    batches_per_epoch = sch["epoch_batches"] if sch["epoch_batches"] else max(1, n_items // B)
+    samples_per_epoch = batches_per_epoch * B if sch["epoch_batches"] else n_items
+    epochs = cfg.get("epochs")
+    sched = OmegaConf.to_container(cfg.lr_schedule, resolve=True)
+    if cfg.get("train_images") and epochs:
+        epochs, sched = scale_to_images(epochs, sched, samples_per_epoch, cfg.train_images)
+    if epochs:
+        train_steps = int(epochs * batches_per_epoch * K)
+    elif cfg.get("train_images"):
+        train_steps = math.ceil(float(cfg.train_images) / B) * K
+    else:
+        train_steps = int(cfg.train_steps)
+    return {"batches_per_epoch": batches_per_epoch, "steps_per_epoch": batches_per_epoch * K,
+            "samples_per_epoch": samples_per_epoch, "epochs": epochs, "train_steps": train_steps,
+            "lr_schedule": sched}
 
 
 def build_optimizer(cfg, named_params, lr: float):
@@ -276,11 +383,10 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(f"clip_augmentation={cfg.clip_augmentation!r}; expected shared or per_frame")
     if OmegaConf.is_missing(data, "root"):
         raise ValueError("pretrain_data.root must be set (the prepared dataset's folder)")
-    if cfg.get("epochs") is not None and not images:
-        raise ValueError("epochs applies to image datasets; size clip runs with train_steps")
-    if cfg.get("train_images") is not None and not (images and cfg.get("epochs")):
-        raise ValueError("train_images stretches an epoch-sized image run: it needs image data "
-                         "and epochs (clip runs: size them with train_steps)")
+    sch = schedule_settings(cfg, images)
+    K = sch["updates_per_batch"]
+    if cfg.get("train_images") is not None and not float(cfg.train_images) > 0:
+        raise ValueError(f"train_images must be > 0, got {cfg.train_images!r}")
     from src.embeddings import CHECKPOINT_ARCHS
     arch = emb_kwargs.get("arch") or str(cfg.embedding.name)
     if arch not in CHECKPOINT_ARCHS:
@@ -358,55 +464,72 @@ def main(cfg: DictConfig) -> None:
         optimizer.load_state_dict(ckpt["optimizer"])
         step, wandb_id = int(ckpt["step"]), ckpt.get("wandb_id")
         print(f"Resumed from {ckpt_path} at step {step:,}")
-        if images:
-            old = ckpt.get("config") or {}
-            changed = {k: (old.get(k), cfg[k]) for k in ("batch_size", "num_workers") if old.get(k) != cfg[k]}
-            if changed:
-                print(f"WARNING: {changed} (checkpoint, now) differ: the image stream won't continue "
-                      "exactly where it stopped")
+        changed = resume_changes(ckpt.get("config"), cfg, sch, images)
+        if changed:
+            print(f"WARNING: {changed} (checkpoint, now) differ: the run won't continue at the item "
+                  "it stopped at")
 
-    # Data after resuming: clip streams are seeded from the step; image
-    # streams skip to the step's position in their epoch.
+    # Data after resuming. A checkpoint lies on a batch boundary (validation
+    # runs only there), so step // K batches have been drawn. Random clip
+    # streams are reseeded from the step; sweep streams and random image
+    # streams skip to the exact item (per-item draws are reseeded either way).
     seed = reseed(cfg.seed, step)
+    start_batch = step // K
     print("Data:")
-    steps_per_epoch = None
     views = max(t.loss.needs_views for t in terms) if images else 0
     if images:
-        train_set = _image_dataset(cfg, data, data.train_split, True, views, cfg.seed, start_batch=step)
+        train_set = _image_dataset(cfg, data, data.train_split, True, views, cfg.seed,
+                                   start_batch=start_batch, order=sch["sampling"])
         if any(t.loss.needs_labels for t in terms) and not train_set.labelled:
             raise ValueError(f"{[t.name for t in terms if t.loss.needs_labels]} need class labels, but "
                              f"{train_set.dir} has unlabelled images (e.g. video frames)")
-        steps_per_epoch = max(1, len(train_set) // cfg.batch_size)
-        print(f"  {train_set.dir}: {len(train_set):,} images ({steps_per_epoch:,} steps per epoch), "
-              f"{views} view(s), crop scale {train_set.scale}"
+        n_items = len(train_set)
+        print(f"  {train_set.dir}: {len(train_set):,} images, {views} view(s), crop scale {train_set.scale}"
               + (f", {train_set.thinning}" if train_set.thinning else ""))
         train_iter = iter(_data_loader(train_set, cfg, int(cfg.num_workers), device))
     else:
-        train_iter = _loader(cfg, data, data.train_manifest, _shared_sampler(terms, True),
-                             int(cfg.num_workers), device, seed)
+        clips = _clip_dataset(cfg, data, data.train_manifest, _shared_sampler(terms, True), seed,
+                              order=sch["sampling"], clips_per_video=sch["clips_per_video"],
+                              order_seed=int(cfg.seed), batch_size=int(cfg.batch_size), start_batch=start_batch)
+        n_items = clips.items_per_epoch
+        train_iter = iter(_data_loader(clips, cfg, int(cfg.num_workers), device))
         val_iter = _loader(cfg, data, data.get("val_manifest") or data.train_manifest,
                            _shared_sampler(terms, False), min(2, int(cfg.num_workers)), device, seed + 1)
 
-    def in_steps(epochs_key, steps_key):
-        """A frequency given in epochs (image runs) or steps."""
-        epochs = OmegaConf.select(cfg, epochs_key)
-        return round(epochs * steps_per_epoch) if epochs and steps_per_epoch else OmegaConf.select(cfg, steps_key)
+    plan = plan_run(cfg, sch, n_items)
+    batches_per_epoch, steps_per_epoch = plan["batches_per_epoch"], plan["steps_per_epoch"]
+    epochs, train_steps, sched = plan["epochs"], plan["train_steps"], plan["lr_schedule"]
+    item = "images" if images else ("clips" if sch["sampling"] == "sweep" else "videos")
+    print(f"  schedule: {sch['sampling']} sampling, an epoch = {batches_per_epoch:,} batches of "
+          f"{cfg.batch_size} {item}, {K} update{'s' if K > 1 else ''} per batch"
+          + (" (fresh augmentation each)" if K > 1 and sch["reaugment"] else
+             " (the same augmented views)" if K > 1 else ""))
+    if cfg.get("train_images") and cfg.get("epochs"):
+        print(f"  train_images={float(cfg.train_images):,.0f}: {epochs:,.1f} epochs of "
+              f"{plan['samples_per_epoch']:,} {item} (lr schedule stretched with it: {sched})")
+    if K > 1:
+        reused = [t.name for t in terms if getattr(t.loss, "assumes_fresh_batches", False)]
+        if reused:
+            print(f"WARNING: {reused} assume each batch is used once (schedule.updates_per_batch={K}); see "
+                  "their docstrings")
 
-    epochs = cfg.get("epochs")
-    sched = OmegaConf.to_container(cfg.lr_schedule, resolve=True)
-    if cfg.get("train_images"):
-        epochs, sched = scale_to_images(epochs, sched, len(train_set), cfg.train_images)
-        print(f"  train_images={float(cfg.train_images):,.0f}: {epochs:,.1f} epochs over "
-              f"{len(train_set):,} images (lr schedule stretched with it: {sched})")
-    train_steps = int(epochs * steps_per_epoch) if epochs else int(cfg.train_steps)
+    def in_steps(epochs_key, steps_key):
+        """A frequency given in epochs or steps."""
+        epochs = OmegaConf.select(cfg, epochs_key)
+        return epochs_to_steps(epochs, steps_per_epoch, K) if epochs else OmegaConf.select(cfg, steps_key)
+
     eval_frequency = int(in_steps("eval_every_epochs", "eval_frequency"))
     keep = in_steps("save.keep_every_epochs", "save.keep_every")
     if keep and keep % eval_frequency:
         raise ValueError(f"snapshots every {keep} steps (save.keep_every / keep_every_epochs) must be a "
                          f"multiple of the validation interval ({eval_frequency} steps): they're taken "
                          "when checkpoint.pt is saved")
-    # The schedule counts epochs only in epoch-sized runs; image runs sized
-    # with train_steps count steps, like clip runs.
+    if eval_frequency % K:
+        raise ValueError(f"validation every {eval_frequency} steps isn't a multiple of "
+                         f"schedule.updates_per_batch={K}: checkpoints are saved at validation and must "
+                         "fall between batches, so a resumed run continues at the exact item")
+    # The schedule counts epochs only in epoch-sized runs; runs sized in
+    # steps or images (without epochs) count steps.
     sched_epoch = steps_per_epoch if epochs else None
     if sched.get("name") in ("cosine", "warmup_cosine") and sched.get("total") is None:
         sched["total"] = epochs if sched_epoch else train_steps
@@ -462,19 +585,29 @@ def main(cfg: DictConfig) -> None:
     autocast = torch.autocast(device.type, dtype=torch.bfloat16, enabled=bool(cfg.perf.amp_bf16))
     size = int(data.image_size)
 
-    def to_input(x, augment):
-        """uint8 (N, 3, H, W) on the CPU -> float [0, 1] encoder input, augmented."""
-        x = x.to(device, non_blocking=True)
-        x = as_stored(x, size) if frames_as_stored else encoder.preprocess(x)
-        return aug(x) if augment and aug is not None else x
-
-    def clip_batch(raw, augment):
+    def stage(raw):
+        """A loader batch on the device as [0, 1] encoder input, before
+        augmentation: the part an update reusing the batch doesn't redo."""
+        if images:
+            imgs, labels = raw                                  # (B, V, 3, S, S), (B,)
+            return [as_stored(imgs[:, v].to(device, non_blocking=True), size) for v in range(imgs.shape[1])], \
+                labels.to(device, non_blocking=True)
         frames, texts = raw
         b, t = frames.shape[:2]
         x = frames.reshape(b * t, *frames.shape[2:]).to(device, non_blocking=True)
         # As stored: only the encoder's normalisation applies (in
         # encode_preprocessed); /255 is what its ConvertImageDtype step does.
         x = as_stored(x, size) if frames_as_stored else encoder.preprocess(x)
+        return x, (b, t, list(texts))
+
+    def augmented(staged, augment):
+        """Images: each view its own draws. Clips: one draw per video
+        (clip_augmentation=shared) or per frame, then final_crop."""
+        if images:
+            views_in, labels = staged
+            return [aug(v) if augment and aug is not None else v for v in views_in], labels
+        x, meta = staged
+        b, t, _ = meta
         if augment and aug is not None:
             if cfg.clip_augmentation == "shared":
                 x = aug(x.reshape(b, t * x.shape[1], *x.shape[2:])).reshape(x.shape)
@@ -482,23 +615,21 @@ def main(cfg: DictConfig) -> None:
                 x = aug(x)
         if cfg.get("final_crop") is not None:
             x = final_crop(x, cfg.final_crop)
+        return x, meta
+
+    def objectives_on(inputs):
+        if images:                     # image objectives encode their views themselves
+            views_in, labels = inputs
+            with autocast:
+                return objective_terms(terms, AuxBatch(encoder=encoder, views=views_in, labels=labels))
+        x, (b, t, texts) = inputs
         with autocast:
             feats = encoder.encode_preprocessed(x)
-        return AuxBatch(encoder=encoder, clip_feats=feats.float().reshape(b, t, -1), text=list(texts))
-
-    def image_batch(raw, augment):
-        imgs, labels = raw                                  # (B, V, 3, S, S), (B,)
-        views_in = [to_input(imgs[:, v], augment) for v in range(imgs.shape[1])]
-        return AuxBatch(encoder=encoder, views=views_in, labels=labels.to(device, non_blocking=True))
-
-    make_batch = image_batch if images else clip_batch
+        return objective_terms(terms, AuxBatch(encoder=encoder, clip_feats=feats.float().reshape(b, t, -1),
+                                               text=texts))
 
     def run_objectives(raw, augment):
-        batch = make_batch(raw, augment)
-        if not images:                 # clip features were encoded under autocast already
-            return objective_terms(terms, batch)
-        with autocast:                 # image objectives encode their views themselves
-            return objective_terms(terms, batch)
+        return objectives_on(augmented(stage(raw), augment))
 
     def set_mode(train):
         encoder.train(train)
@@ -533,8 +664,7 @@ def main(cfg: DictConfig) -> None:
     def fmt(values, keys):
         return "  ".join(f"{k.split('/')[-1]}={values[k]:.4f}" for k in keys if k in values)
 
-    unit = "images" if images else "videos"
-    print(f"\nTraining {train_steps:,} steps of {cfg.batch_size} {unit}"
+    print(f"\nTraining {train_steps:,} steps of {cfg.batch_size} {item}"
           + (f" ({train_steps / steps_per_epoch:.1f} epochs)" if steps_per_epoch else "")
           + (f" (from step {step:,})" if step else "")
           + f", validating every {eval_frequency:,} steps")
@@ -548,72 +678,82 @@ def main(cfg: DictConfig) -> None:
         log_frequency=int(cfg.log_frequency))
     bench_from = step
     sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
-    while step < train_steps:
-        lr = base_lr * lr_factor(sched, step, sched_epoch)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+    # The loop: draw a batch, then K updates on it (schedule.updates_per_batch),
+    # each with fresh augmentation draws unless schedule.reaugment is false.
+    stop = False
+    while step < train_steps and not stop:
         set_mode(True)
         t0 = time.time()
         raw = next(train_iter)
         data_time += time.time() - t0
+        staged, inputs = stage(raw), None
+        for _ in range(K):
+            if step >= train_steps:
+                break
+            lr = base_lr * lr_factor(sched, step, sched_epoch)
+            for g in optimizer.param_groups:
+                g["lr"] = lr
+            set_mode(True)
+            if inputs is None or sch["reaugment"]:
+                inputs = augmented(staged, augment=True)
+            total, values = objectives_on(inputs)
+            optimizer.zero_grad(set_to_none=True)
+            total.backward()
+            values["grad_norm"] = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+            optimizer.step()
+            values["loss"] = total.detach()
+            step += 1
+            for k, v in values.items():
+                sums[k] = sums.get(k, 0.0) + v
+            n_sum += 1
 
-        total, values = run_objectives(raw, augment=True)
-        optimizer.zero_grad(set_to_none=True)
-        total.backward()
-        values["grad_norm"] = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
-        optimizer.step()
-        values["loss"] = total.detach()
-        step += 1
-        for k, v in values.items():
-            sums[k] = sums.get(k, 0.0) + v
-        n_sum += 1
-
-        if step % cfg.log_frequency == 0 or step == train_steps:
-            elapsed = time.time() - t_log
-            avg = {k: float(v) / n_sum for k, v in sums.items()}
-            sps, wait = n_sum / elapsed, data_time / elapsed
-            timer.mark(step)
-            timing_text, timing_metrics = timer.status(step)
-            timer.write(step)
-            epoch = f"  epoch={step / steps_per_epoch:.2f}" if steps_per_epoch else ""
-            print(f"  step {step:>9,}{epoch}  loss={avg['loss']:.4f}  "
-                  f"{fmt(avg, sorted(k for k in avg if '/' in k))}  lr={lr:.3g}"
-                  f"  steps/s={sps:.1f}  data_wait={wait:.0%}{timing_text}")
-            if wandb is not None:
-                log = {f"train/{k}": v for k, v in avg.items()}
-                log.update({"train/lr": lr, "charts/steps_per_sec": sps, "charts/data_wait_frac": wait,
-                            **timing_metrics, "global_step": step})
-                if steps_per_epoch:
-                    log["train/epoch"] = step / steps_per_epoch
-                wandb.log(log, step=step)
-            sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
-
-        bench_now = (bench_steps and step % cfg.log_frequency == 0 and timer.rate() is not None
-                     and step - bench_from >= bench_steps)
-        scheduled = step % eval_frequency == 0 or step == train_steps
-        if scheduled or (bench_now and timer.mean_excluded("eval") is None):
-            t_eval = time.time()
-            with timer.exclude("eval", timing_only=not scheduled):
-                ev = evaluate()
-                print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
+            if step % cfg.log_frequency == 0 or step == train_steps:
+                elapsed = time.time() - t_log
+                avg = {k: float(v) / n_sum for k, v in sums.items()}
+                sps, wait = n_sum / elapsed, data_time / elapsed
+                timer.mark(step)
+                timing_text, timing_metrics = timer.status(step)
+                timer.write(step)
+                epoch = f"  epoch={step / steps_per_epoch:.2f}" if steps_per_epoch else ""
+                print(f"  step {step:>9,}{epoch}  loss={avg['loss']:.4f}  "
+                      f"{fmt(avg, sorted(k for k in avg if '/' in k))}  lr={lr:.3g}"
+                      f"  steps/s={sps:.1f}  data_wait={wait:.0%}{timing_text}")
                 if wandb is not None:
-                    wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
-            if cfg.save.enabled and not bench_steps:
-                with timer.exclude("save"):
-                    save(step, final=step == train_steps)
-            elif cfg.save.enabled and (scheduled or timer.mean_excluded("save") is None):
-                # Benchmark: time one checkpoint write (to a scratch name -- a
-                # checkpoint.pt here would be resumed by the next run).
-                test_path = os.path.join(run_dir, ".timing_save_test.pt")
-                with timer.exclude("save", timing_only=not scheduled):
-                    _save(checkpoint(step)[1], test_path)
-                os.remove(test_path)
-            t_log += time.time() - t_eval      # keep steps/s about training
+                    log = {f"train/{k}": v for k, v in avg.items()}
+                    log.update({"train/lr": lr, "charts/steps_per_sec": sps, "charts/data_wait_frac": wait,
+                                **timing_metrics, "global_step": step})
+                    if steps_per_epoch:
+                        log["train/epoch"] = step / steps_per_epoch
+                    wandb.log(log, step=step)
+                sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
 
-        if bench_now:                          # benchmark mode: measured; predict and stop
-            timer.write(step)
-            print("\n" + timer.benchmark_report(step))
-            break
+            bench_now = (bench_steps and step % cfg.log_frequency == 0 and timer.rate() is not None
+                         and step - bench_from >= bench_steps)
+            scheduled = step % eval_frequency == 0 or step == train_steps
+            if scheduled or (bench_now and timer.mean_excluded("eval") is None):
+                t_eval = time.time()
+                with timer.exclude("eval", timing_only=not scheduled):
+                    ev = evaluate()
+                    print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
+                    if wandb is not None:
+                        wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
+                if cfg.save.enabled and not bench_steps:
+                    with timer.exclude("save"):
+                        save(step, final=step == train_steps)
+                elif cfg.save.enabled and (scheduled or timer.mean_excluded("save") is None):
+                    # Benchmark: time one checkpoint write (to a scratch name -- a
+                    # checkpoint.pt here would be resumed by the next run).
+                    test_path = os.path.join(run_dir, ".timing_save_test.pt")
+                    with timer.exclude("save", timing_only=not scheduled):
+                        _save(checkpoint(step)[1], test_path)
+                    os.remove(test_path)
+                t_log += time.time() - t_eval      # keep steps/s about training
+
+            if bench_now:                          # benchmark mode: measured; predict and stop
+                timer.write(step)
+                print("\n" + timer.benchmark_report(step))
+                stop = True
+                break
 
     if cfg.save.enabled and not bench_steps:
         print(f"\nSaved to: {run_dir}  (embedding.yaml: how to use the encoder)")

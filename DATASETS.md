@@ -68,10 +68,12 @@ Ego4D's and EPIC-Kitchens' narrations are given.
 
 ### How they're read
 
-`src/data/clips.py` streams videos at random, with replacement; each sample
-is one video and the frames the method picks from it (R3M: 5, VIP: 4). The
-run length is a number of steps (`train_steps`), not epochs. Validation is
-one batch from the validation manifest.
+`src/data/clips.py`: each sample is one video and the frames the method
+picks from it (R3M: 5, VIP: 4). By default videos are drawn at random, with
+replacement (R3M's sampling), and the run is a number of steps; with
+`schedule.sampling=sweep` each video comes up `schedule.clips_per_video`
+times per epoch instead (see `RUNNING_EXPERIMENTS.md`, "Schedules").
+Validation is one batch from the validation manifest.
 
 ## 3. Images
 
@@ -103,9 +105,9 @@ for other keys).
 
 ### How they're read
 
-`src/data/images.py`: true epochs (every image once per epoch, a fresh
-order each epoch), so runs are sized in `epochs` (or a total image count,
-`train_images`). Validation is a pass over the validation split, or its
+`src/data/images.py`: by default true epochs (every image once per epoch,
+a fresh order each epoch), sized in `epochs` (or a total image count,
+`train_images`); `schedule.sampling=random` draws with replacement instead. Validation is a pass over the validation split, or its
 first `eval_batches` batches.
 
 ## 4. The config

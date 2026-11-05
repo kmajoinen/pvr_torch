@@ -16,11 +16,20 @@ final_crop: null              # clips: {resize, crop} after augmentation, in val
                               #   too: resize the shorter side, then center-crop (VIP's
                               #   loader: {resize: 256, crop: 224})
 
-batch_size: 16                # videos / images per step
-train_steps: 1_000_000
-epochs: null                  # image data: train this many epochs instead (overrides train_steps)
-train_images: null            # image data with epochs: train on this many images in total
-                              #   instead -- epochs and the lr schedule (warmup, milestones)
+batch_size: 16                # videos / images per batch
+schedule:                     # how batches are drawn and used:
+  sampling: null              #   sweep: each item once per epoch, fresh order | random: uniform,
+                              #   with replacement (null: clips random, as R3M; images sweep)
+  epoch_batches: null         #   random: batches per epoch (null: the dataset's size / batch_size)
+  clips_per_video: 1          #   clips + sweep: frame draws per video per epoch
+  updates_per_batch: 1        #   gradient steps on each batch before drawing the next
+  reaugment: true             #   updates_per_batch > 1: fresh augmentation draws per update
+                              #   (crops cut in the loader stay); false: the same views
+# Run length, one of (epochs wins over train_steps):
+train_steps: 1_000_000        # updates (optimizer steps)
+epochs: null                  # epochs (see schedule: a sweep, or epoch_batches random batches)
+train_images: null            # samples drawn (a batch's repeated updates count once). With
+                              #   epochs: epochs and the lr schedule (warmup, milestones)
                               #   stretch to it, whatever the dataset size (MVP's budget:
                               #   1600 epochs x 700K images = 1.12e9)
 optimizer: adam               # adam | adamw | sgd -- encoder and objective heads alike
@@ -46,11 +55,11 @@ num_workers: 10               # data-loader processes (JPEG decoding)
 log_frequency: 100            # steps; logged values are averages over the interval
 eval_frequency: 20_000        # steps between validations (clips: one batch; images: the
                               #   validation split), after each checkpoint.pt is saved
-eval_every_epochs: null       # image data: validate every N epochs instead
+eval_every_epochs: null       # validate every N epochs instead
 save:
   enabled: true
   keep_every: 100_000         # also keep encoder_step<N>.pt every N steps (null: never)
-  keep_every_epochs: null     # image data: every N epochs instead
+  keep_every_epochs: null     # every N epochs instead
 resume: true                  # continue from <run dir>/checkpoint.pt if it exists
                               #   (rerun with the same hydra.run.dir)
 

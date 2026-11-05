@@ -648,8 +648,14 @@ class MoCo(AuxLoss):
 
     Defaults are MoCo v2's: 128-dim MLP head, queue 65536, momentum 0.999,
     temperature 0.2. Metric: acc1, how often the positive key scores
-    highest (the official code's training accuracy)."""
+    highest (the official code's training accuracy).
+
+    Uses each batch once: with pretrain.py's schedule.updates_per_batch > 1
+    the same keys enter the queue (and the momentum encoder steps) once per
+    update, so the queue holds duplicates -- pretrain.py warns.
+    """
     needs_views = 2
+    assumes_fresh_batches = True
 
     @classmethod
     def check_params(cls, dim=128, queue_size=65536, momentum=0.999, temperature=0.2, mlp=True,

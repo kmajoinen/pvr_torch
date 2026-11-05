@@ -22,8 +22,10 @@ Evaluation: resize the short side to `resize`, center-crop to `size`
 (torchvision's 256 -> 224), or random crops when an objective needs several
 views.
 
-Training order is by epoch: each epoch is a fresh permutation of all images
-(without replacement), split across workers. Each item is
+Training order (`order`, src/data/order.py): sweep -- by epoch, each epoch
+a fresh permutation of all images (without replacement) -- or random --
+uniform with replacement, batch by batch. Both are split across workers and
+resume at the exact image (crops are redrawn). Each item is
 (uint8 tensor (views, 3, size, size), label); label -1 for unlabelled data.
 
 Video frames as images: a clip dataset's frame shards
@@ -35,7 +37,6 @@ video keeps at least its first frame (consecutive frames are
 near-duplicates); other images keep every n-th in stored order.
 """
 
-import math
 import os
 from typing import Optional
 
@@ -100,8 +101,8 @@ class ImageDataset(IterableDataset):
     """train=True: endless, epoch by epoch; train=False: one ordered pass.
 
     start_batch (training): batches already consumed (a resumed run). With
-    the same batch size and worker count, the stream continues exactly where
-    it stopped: data-loader workers hand out whole batches in turn, starting
+    the same batch size and worker count, the stream continues at the image
+    it stopped at: data-loader workers hand out whole batches in turn, starting
     with worker 0, so the batch after start_batch belongs to role
     start_batch % workers -- a fresh loader's worker i takes role
     (i + start_batch) % workers, and role r had produced
@@ -110,7 +111,10 @@ class ImageDataset(IterableDataset):
     def __init__(self, root: str, split: str, train: bool, size: int = 224, views: int = 1,
                  scale=(0.08, 1.0), ratio=(3 / 4, 4 / 3), resize: int = 256, seed: int = 0,
                  batch_size: int = 1, start_batch: int = 0, limit: Optional[int] = None,
-                 every: int = 1, interpolation: str = "bilinear"):
+                 every: int = 1, interpolation: str = "bilinear", order: str = "sweep"):
+        if order not in ("sweep", "random"):
+            raise ValueError(f"order={order!r}; expected sweep or random")
+        self.order = order
         self.dir = os.path.join(root, split)
         self.sharded = os.path.isfile(os.path.join(self.dir, "index.npz"))
         if int(every) != every or every < 1:
@@ -171,9 +175,6 @@ class ImageDataset(IterableDataset):
     def _item(self, i):
         return self._crops(decode(self._read(i))), int(self.index["label"][i])
 
-    def _order(self, epoch):
-        return np.random.default_rng([self.seed, epoch]).permutation(len(self))
-
     def __iter__(self):
         info = get_worker_info()
         wid, workers = (info.id, info.num_workers) if info is not None else (0, 1)
@@ -181,18 +182,7 @@ class ImageDataset(IterableDataset):
             for i in range(wid, len(self), workers):
                 yield self._item(i)
             return
-        # This worker's stream: its share of every epoch's permutation, in order.
-        wid = (wid + self.start_batch) % workers
-        skip = math.ceil(max(self.start_batch - wid, 0) / workers) * self.batch_size
-        n = len(self)
-        epoch = 0
-        while True:
-            share = len(range(wid, n, workers))
-            if skip >= share:
-                skip -= share
-                epoch += 1
-                continue
-            for i in self._order(epoch)[wid::workers][skip:]:
-                yield self._item(int(i))
-            skip = 0
-            epoch += 1
+        from src.data.order import epoch_stream, random_stream
+        stream = epoch_stream if self.order == "sweep" else random_stream
+        for _, i in stream(len(self), self.seed, wid, workers, self.start_batch, self.batch_size):
+            yield self._item(i)

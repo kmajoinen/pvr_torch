@@ -67,6 +67,13 @@ the same settings.
 **Resuming.** Rerun `pretrain.py` with the same `hydra.run.dir`; it picks up
 `checkpoint.pt`, and wandb continues the same run.
 
+**Training format (`pretrain.py`).** Either data type can run in epochs or
+in steps, and sample in either way: `schedule.sampling=sweep` (each item once
+per epoch) or `random` (uniform with replacement, an epoch being
+`schedule.epoch_batches` batches), plus `schedule.updates_per_batch` gradient
+steps per batch. E.g. `schedule.sampling=random schedule.epoch_batches=1000
+epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
+
 **On the cluster.** Job scripts are templates to copy: `run_pretrain.sh`
 (clip pretraining, copies the data shards to the node's local disk),
 `run_imagenet.sh` (image pretraining), `run_sac.sh` / `run_ft_sac.sh`

@@ -38,7 +38,7 @@ python pretrain.py +experiment=<x> pretrain_data=<y> embedding=<z> augmentation=
 | **data** (*y*) | `pretrain_data=` | Something-Something v2 as video clips + text, SSv2 frames as images, ImageNet-1k, any ImageFolder-layout image set | Ego4D-style data (needs a prep script) |
 | **architecture** (*z*) | `embedding=` | ResNet-18/34/50; small 5-layer CNN; ViT-S/16, ViT-B/16, ViT-L/16 (MAE layout); DINOv2 and OpenCLIP ViTs experimental | — |
 | **augmentation** (*k*) | `augmentation=` | 9 transforms, combinable into pipelines; presets for R3M/VIP and MoCo v2 | — |
-| supporting options | optimizer, schedule, precision | Adam, AdamW, SGD; constant / cosine / step with warmup, MAE's warmup-cosine; bf16; run length in epochs, steps or total images (`train_images`) | multi-GPU (DDP) |
+| supporting options | optimizer, schedule, precision | Adam, AdamW, SGD; constant / cosine / step with warmup, MAE's warmup-cosine; bf16; gradient clipping; sweep or random sampling, several updates per batch (`schedule.*`); run length in epochs, steps or total images (`train_images`); run-time estimates and a benchmark mode (`timing.*`) | multi-GPU (DDP) |
 
 ## 3. Which algorithm accepts which data
 
@@ -101,11 +101,17 @@ output becomes a vector (`avgpool`, `cls`, `flatten`, or a trainable
 | other image sets | new yaml | images (+ labels) | — | ImageFolder layout, or shards via `prepare_imagenet.py` | ready |
 | other video sets | new yaml | clips (+ text) | — | needs a prep script writing the same manifest + shards | ready (format), none prepared |
 
-How the data is consumed:
-- **Clips:** an endless stream, each sample a random video and the frames
-  the algorithm asks for. The budget is a number of updates (`train_steps`).
-- **Images and frames:** true epochs: every image once per epoch, in a
-  fresh random order. The budget is `epochs` (or `train_steps`).
+How the data is consumed (`schedule`, either data type):
+- **Sampling:** `sweep` (every item once per epoch, fresh order; clips:
+  each video `clips_per_video` times) or `random` (uniform, with
+  replacement; an epoch is `epoch_batches` batches). Defaults: random for
+  clips (R3M), sweep for images (ImageNet training).
+- **Updates per batch:** `updates_per_batch` gradient steps on each batch,
+  with fresh augmentation each (`reaugment`) or the same views.
+- **Run length:** `epochs`, `train_steps` (updates) or `train_images`
+  (samples drawn). Resuming continues at the exact item (random clip
+  streams are reseeded); what's drawn from each item is reseeded too, so a
+  resumed run is statistically equivalent, not bit-identical.
 
 ## 7. Augmentation
 

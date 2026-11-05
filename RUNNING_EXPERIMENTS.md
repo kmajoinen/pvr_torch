@@ -647,6 +647,54 @@ per architecture and read both; a high `data_wait` means more
 fraction, host-device syncs, and a Chrome trace; `run_profile_pretrain.sh`
 runs it for R3M and a few variants (`profile.synthetic=true` needs no data).
 
+### Schedules: how batches are drawn and used
+
+The training loop is up to three nested levels, each optional:
+```
+for epoch:                                  # schedule.sampling: sweep or random
+    for batch in the epoch's batches:       # sweep: each item once; random: epoch_batches draws
+        for _ in range(updates_per_batch):  # gradient steps on the same batch
+            update(augment(batch))          # fresh draws unless reaugment=false
+```
+```yaml
+schedule:
+  sampling: null          # sweep | random (null: clips random, images sweep)
+  epoch_batches: null     # random: batches per epoch (null: dataset size / batch_size)
+  clips_per_video: 1      # clips + sweep: draws per video per epoch
+  updates_per_batch: 1
+  reaugment: true
+epochs / train_steps / train_images   # run length: epochs, updates, or samples drawn
+```
+
+| setup | settings |
+|---|---|
+| R3M / VIP as published | the default: random clips, `train_steps` |
+| ImageNet supervised / MoCo / MAE | the default: sweep, `epochs` |
+| R3M in epochs over videos | `schedule.sampling=sweep schedule.clips_per_video=4 epochs=50` |
+| an epoch of N random batches | `schedule.sampling=random schedule.epoch_batches=N epochs=...` |
+| each batch used for K updates | `schedule.updates_per_batch=K` (fresh augmentation; `reaugment=false` for the same views) |
+
+- **Sweep over clips** shuffles every video's `clips_per_video` draws over
+  the epoch, so one video's clips rarely share a batch (R3M and VIP take the
+  batch's other samples as negatives; their own random negatives pair a
+  sample with itself far more often than this happens). Every video counts
+  once per epoch, whatever its length, as in R3M's own sampling.
+- **Counting:** `train_steps`, `log_frequency` and `eval_frequency` are in
+  updates; `train_images` counts samples drawn (a batch reused K times
+  counts once). `eval_frequency` must be a multiple of `updates_per_batch`,
+  so checkpoints fall between batches (`eval_every_epochs` rounds to one).
+- **Resuming** continues at the exact item in sweep streams and random image
+  streams (same `batch_size` and `num_workers`). What's drawn from each item
+  (a clip's frames, crops, augmentation, negatives) is reseeded, so a resumed
+  run is statistically equivalent to an uninterrupted one, not bit-identical,
+  and never replays the same draws. Random clip streams are reseeded too.
+- **Reused batches and crops:** image crops are cut in the loader, so with
+  `reaugment` they stay fixed for the batch; GPU augmentations are redrawn.
+  MoCo assumes each batch is used once (its queue would get the same keys K
+  times); `pretrain.py` warns.
+- The startup log prints the schedule: sampling, batches per epoch, updates
+  per batch.
+
 ### ImageNet (supervised, MoCo v2)
 
 ```bash
@@ -768,7 +816,7 @@ unlabelled images -- no second conversion. `every: 40` keeps frames 1, 41,
 81, ... of each video (so every video contributes at least one), 0.3 fps, the rate MVP sampled SSv2 at (consecutive
 12 fps frames are near-duplicates); `val_every: 50` and `eval_batches: 20`
 keep validation short. Frames are images to the image pipeline (per-view
-crops in the workers, exact resume); objectives that need labels reject
+crops in the workers, resume at the exact image); objectives that need labels reject
 them. Crop scale [0.1, 0.75], MVP's for its wide HOI frames (ours are
 squashed square, so the reason doesn't carry over directly). Budget: "MVP's schedule" has two readings, and
 `train_images` toggles between them. By default the preset runs MVP's 1600

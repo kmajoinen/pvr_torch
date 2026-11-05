@@ -18,9 +18,15 @@ On disk, a manifest plus the frames, in either of two layouts:
 writes either for Something-Something v2; any other video source only needs
 a script that writes the same.
 
-ClipDataset samples forever, with replacement: each item is one uniformly
-drawn video and the frames its FrameSampler picks (src/losses.py), as
-(uint8 tensor (T, 3, H, W), text) -- the same sampling as R3M's R3MBuffer.
+ClipDataset samples forever. Each item is one video and the frames its
+FrameSampler picks (src/losses.py), as (uint8 tensor (T, 3, H, W), text).
+Which video (`order`, pretrain.py's schedule.sampling):
+  random  uniformly, with replacement -- R3M's R3MBuffer sampling
+  sweep   epoch by epoch, each video clips_per_video times per epoch, in a
+          fresh shuffled order: a video's clips spread over the epoch, so
+          rarely in one batch; resumes at the exact video (src/data/order.py;
+          which frames each clip uses comes from the worker's RNG, reseeded
+          on resume)
 """
 
 import os
@@ -72,10 +78,17 @@ class ClipDataset(IterableDataset):
     own numpy Generator, seeded from the worker's torch seed, so workers
     don't repeat each other and a run is reproducible from torch.manual_seed."""
 
-    def __init__(self, manifest: ClipManifest, sampler, seed: Optional[int] = None):
+    def __init__(self, manifest: ClipManifest, sampler, seed: Optional[int] = None, order: str = "random",
+                 clips_per_video: int = 1, order_seed: int = 0, batch_size: int = 1, start_batch: int = 0):
+        if order not in ("random", "sweep"):
+            raise ValueError(f"order={order!r}; expected random or sweep")
         self.manifest = manifest
         self.sampler = sampler
         self.seed = seed
+        self.order, self.clips_per_video = order, int(clips_per_video)
+        # sweep: the epoch permutations come from order_seed (the run's seed),
+        # so they're the same after a resume; frame draws use the worker's RNG.
+        self.order_seed, self.batch_size, self.start_batch = order_seed, batch_size, start_batch
         self._shards = {}             # shard folder -> (index, reader), loaded on first use
 
     def _frame(self, i: int, idx: int) -> torch.Tensor:
@@ -95,13 +108,26 @@ class ClipDataset(IterableDataset):
         seed = info.seed if info is not None else (self.seed if self.seed is not None else torch.initial_seed())
         return np.random.default_rng(seed)
 
-    def sample(self, rng):
+    @property
+    def items_per_epoch(self) -> int:
+        """Samples in one sweep epoch: every video, clips_per_video times."""
+        return len(self.manifest) * self.clips_per_video
+
+    def sample(self, rng, video: Optional[int] = None):
         m = self.manifest
-        i = int(rng.integers(0, len(m)))
+        i = int(rng.integers(0, len(m))) if video is None else video
         frames = [self._frame(i, idx) for idx in self.sampler(int(m.lengths[i]), rng)]
         return torch.stack(frames), m.texts[i]
 
     def __iter__(self):
         rng = self._rng()
-        while True:
-            yield self.sample(rng)
+        if self.order == "random":
+            while True:
+                yield self.sample(rng)
+        from src.data.order import epoch_stream
+        info = get_worker_info()
+        wid, workers = (info.id, info.num_workers) if info is not None else (0, 1)
+        n = len(self.manifest)
+        for _, j in epoch_stream(self.items_per_epoch, self.order_seed, wid, workers,
+                                 self.start_batch, self.batch_size):
+            yield self.sample(rng, video=j % n)
