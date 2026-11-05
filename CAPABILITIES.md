@@ -1,6 +1,6 @@
 # What the repo can do: pretraining
 
-State as of 2026-10-29. This covers the pretraining side (`pretrain.py`);
+State as of 2026-11-05. This covers the pretraining side (`pretrain.py`);
 the RL/BC side that uses the trained encoders is summarised at the end.
 Commands and options in detail: `RUNNING_EXPERIMENTS.md`.
 
@@ -34,10 +34,10 @@ python pretrain.py +experiment=<x> pretrain_data=<y> embedding=<z> augmentation=
 
 | choice | option | available now | planned |
 |---|---|---|---|
-| **algorithm** (*x*) | `+experiment=` preset, or `objectives=[...]` | R3M, VIP, supervised classification, MoCo v2, MAE (MVP-style on video frames) | DINO, DynaMo, LIV |
+| **algorithm** (*x*) | `+experiment=` preset, or `objectives=[...]` | R3M (also on a ViT, experimental), VIP, supervised classification, MoCo v2, MAE (MVP-style on video frames) | DINO, DynaMo, LIV |
 | **data** (*y*) | `pretrain_data=` | Something-Something v2 as video clips + text, SSv2 frames as images, ImageNet-1k, any ImageFolder-layout image set | Ego4D-style data (needs a prep script) |
 | **architecture** (*z*) | `embedding=` | ResNet-18/34/50; small 5-layer CNN; ViT-S/16, ViT-B/16, ViT-L/16 (MAE layout); DINOv2 and OpenCLIP ViTs experimental | — |
-| **augmentation** (*k*) | `augmentation=` | 9 transforms, combinable into pipelines; presets for R3M/VIP and MoCo v2 | — |
+| **augmentation** (*k*) | `augmentation=` | 8 transforms (plus `none`), combinable into pipelines; presets for R3M/VIP and MoCo v2 | — |
 | supporting options | optimizer, schedule, precision | Adam, AdamW, SGD; constant / cosine / step with warmup, MAE's warmup-cosine; bf16; gradient clipping; sweep or random sampling, several updates per batch (`schedule.*`); run length in epochs, steps or total images (`train_images`); run-time estimates and a benchmark mode (`timing.*`) | multi-GPU (DDP) |
 
 ## 3. Which algorithm accepts which data
@@ -72,8 +72,20 @@ Several objectives can be trained together as a weighted sum
 | **ablations built in** | `lang_weight=0` (time-contrastive only), `tcn_weight=0` (language only), negatives, frame window | `num_negatives`, gamma, L1/L2 weights | label smoothing | crop only (`augmentation=none`), queue size, temperature | mask ratio, decoder size, `norm_pix_loss`, frame thinning (`pretrain_data.every`) |
 | **completed runs** | ResNet-50, SSv2, 1M steps (~23 h at ~12 steps/s) | none yet | ResNet-18, ImageNet, 90 epochs (450k steps, 10 h 20 min) | none yet | none yet |
 
-Not pretraining objectives, but in the same registry: `l2sp` and
-`aug_consistency`, auxiliary losses for fine-tuning an encoder during RL/BC.
+**R3M on a ViT** (`+experiment=r3m_vit`, experimental): everything of the
+`r3m` preset (objective, frame sampling, per-video crop, SSv2 clips) on
+MVP's ViT-S/16 from scratch, with ViT optimiser settings instead of R3M's:
+AdamW 3e-4 at 64 videos per step (scaled with `batch_size`), weight decay
+0.05 (none on biases and norms), 10k warmup steps then cosine, gradient
+clipping at 1, bf16. These are starting values to tune, not a published
+recipe (R3M released no ViT); a 10-step smoke run works, no full run yet.
+Next to `+experiment=mvp` on the same ViT-S, R3M and MAE differ only in the
+objective.
+
+Not pretraining objectives, but in the same registry: `l2sp`,
+`aug_consistency`, `ema_consistency` and `reconstruction`, auxiliary losses
+for fine-tuning an encoder during RL/BC (section 10). MoCo and MAE also work
+there, on replay frames.
 
 ## 5. Architectures
 
@@ -143,6 +155,7 @@ Each line reads as "pretrain with *x*, on *y*, with *z*, and *k*". Data paths
 | x / y / z / k | command | status |
 |---|---|---|
 | R3M / SSv2 / ResNet-50 / R3M crop (the completed run) | `+experiment=r3m` | done |
+| R3M / SSv2 / ViT-S/16 / R3M crop, ViT optimiser settings | `+experiment=r3m_vit` | experimental |
 | R3M without language (time-contrastive only) / SSv2 / ResNet-18 / R3M crop | `+experiment=r3m embedding=resnet18 objectives.0.lang_weight=0` | ready |
 | VIP / SSv2 / ResNet-50 + fc / VIP crop | `+experiment=vip` | ready |
 | VIP with 3 negatives / SSv2 / ResNet-18 / VIP crop | `+experiment=vip embedding=resnet18 objectives.0.num_negatives=3` | ready |
@@ -176,6 +189,8 @@ run's `embedding.yaml` lists every field.)
 - A preset's recipe is tuned for its default architecture. Swapping the
   architecture doesn't change the optimizer or learning rate (e.g. MoCo's
   SGD recipe on a ViT composes, but isn't a sensible ViT recipe).
+  `r3m_vit` is the one preset that retunes for another architecture, and
+  its values are untuned starting points.
 - Only ResNets, the small CNN, the `vit_*` ViTs, DINOv2 and OpenCLIP can be
   trained. The other models in the repo (R3M, VIP, LIV, MVP, VC-1, MAE,
   OpenAI CLIP) are load-only baselines (MAE-format files also load into
@@ -206,8 +221,9 @@ run's `embedding.yaml` lists every field.)
   batch 32 longer), and MoCo's multi-GPU BatchNorm shuffle is emulated.
 - Validation during clip pretraining is one batch, so the curves are noisy.
   Image runs validate on the validation split (or a fixed number of batches).
-- The quality of an encoder is only measured downstream (RL/BC). No
-  linear probe or reconstruction probe yet (proposed in `TODO.md`).
+- The quality of an encoder is only measured downstream (RL/BC), where
+  `reconstruction` with `grad: false` probes what its features keep. No
+  linear probe yet (proposed in `TODO.md`).
 - Loading your own encoder downstream needs `custom_checkpoint` plus `arch`
   and `checkpoint` (simplification tabled in `TODO.md`).
 
@@ -216,8 +232,10 @@ run's `embedding.yaml` lists every field.)
 | | options |
 |---|---|
 | agents | SAC (`train_sac.py`), DrQ-v2 (`train_drqv2.py`), behavioural cloning (`train_bc.py`) |
-| environments | DeepMind Control (any domain/task), Adroit (door, hammer, pen, relocate), FrankaKitchen, Pendulum; pixels or state; CarRacing configured but missing its dependency |
+| environments | DeepMind Control (any domain/task), Adroit (door, hammer, pen, relocate), FrankaKitchen, Pendulum; pixels or state; CarRacing configured (its `box2d-py` is in `environment.yml`, not yet tested on the cluster) |
 | BC datasets | V-D4RL, Minari, pickled trajectories |
-| encoder use | frozen (features cached in the buffer), or fine-tuned from the critic, actor, both, or the BC loss; auxiliary losses; BatchNorm adaptation; frame stacking |
+| encoder use | frozen (features cached in the buffer), or fine-tuned from the critic, actor, both, or the BC loss -- the whole encoder, its head, or chosen modules only (`encoder.trainable=[layer3]`); BatchNorm adaptation; frame stacking. How it connects and which gradients reach it: `GUIDE.md`, section 3 |
+| auxiliary losses | `l2sp`, `aug_consistency`; **ready, no full run yet:** `ema_consistency` (distance to an EMA copy of the encoder), `reconstruction` (SAC-AE, or a probe with `grad: false`), `moco` (CURL-style), `mae` |
 | augmentation | the same transforms, plus a SVEA/PIE-G "strong view" loss; `+experiment=pieg` preset |
+| replay buffer | in RAM or on a node-local SSD (memory-mapped), optionally with lossless compression (zstd, lz4, zlib); n-step returns with correct episode boundaries |
 | embeddings | every architecture above plus about 30 released models (section 5) |

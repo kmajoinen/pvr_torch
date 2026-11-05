@@ -2,7 +2,8 @@
 
 Practical reference for launching training runs: which script, which envs,
 which embeddings (and where their weights come from), and how encoder
-training and augmentation work. This complements `README.md` rather than replacing it.
+training and augmentation work. What exists is summarised in `CAPABILITIES.md`;
+how to extend the repo is in `GUIDE.md`.
 
 ## Which script
 
@@ -257,7 +258,7 @@ python train_sac.py embedding=resnet50 embedding.name=resnet50_l3
 - `resnet18` / `resnet34` / `resnet50` — torchvision, `ImageNet1K` weights.
 - `clip_vit` / `clip_rn50` — via `clip.load(...)`, OpenAI's own cache.
 - `openclip_*` — via `open_clip.create_model_and_transforms(...)`, HuggingFace hub cache.
-- `r3m_*` — via `load_r3m(...)`, downloads from Google Drive (`gdown`) to R3M's own cache dir on first use. **No outbound internet on compute nodes** on most clusters — run once on the login node first to warm the cache, or the job will fail trying to download mid-run.
+- `r3m_*` — via `load_r3m(...)`, downloads from Google Drive (`gdown`) to R3M's own cache dir on first use. On clusters whose compute nodes have no outbound internet (Triton's do have it), run once on the login node first to warm the cache, or the job will fail trying to download mid-run.
 - `vip_resnet50` — via `load_vip(...)`, same lab/codebase as R3M, same download-cache behavior and caveat. Install it without its dependencies (`pip install gdown && pip install --no-deps git+https://github.com/facebookresearch/vip.git`): its `setup.py` pins `hydra-core==1.1.1`, `omegaconf==2.1.1`, `pillow==9.0.1` and `gdown==4.4.0`, and Hydra 1.1 has no `version_base`, which every script here uses -- a plain install (or reinstall) stops them all from starting. R3M's `setup.py` only sets minimum versions, so a plain install is fine there.
 - `liv_resnet50` — via `load_liv(...)`, own cache dir/download on first use. Needs a two-step install (`pip install` the repo, then a nested `cd liv/models/clip && pip install -e .`) — not in `requirements.txt`, see the comment there.
 - `mvp_*` (5 variants) — via `mvp.load(...)`, own cache dir/download on first use (Berkeley Box-hosted). Genuinely pip-installable with no version conflicts, unlike VC-1.
@@ -316,8 +317,10 @@ encoder:
   grads: none        # which task losses backprop into the encoder
                      #   SAC: none | critic | actor | both    BC: none | policy
   lr: 1.0e-5         # separate optimizer/LR from the policy/critic
+  aux_lr: null       # aux losses' own parameters (decoders, heads); null: lr
   betas: [0.9, 0.999]
-  grad_clip: 10.0    # SAC default; BC defaults to 1.0
+  grad_clip: 10.0    # SAC default; BC defaults to 1.0. Aux losses' own parameters
+                     #   are clipped separately, and left out of the logged norm
   aux: []            # auxiliary losses, e.g. [{name: l2sp, weight: 1.0}]
 augmentation: none   # Hydra group: configs/augmentation/*.yaml
 buffer_obs: auto     # SAC only: auto | features | pixels
@@ -329,6 +332,32 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   default), `actor`, `both` (sequential Adam steps, not one combined
   gradient — see the module docstring in `train_sac.py`), or `none`. For BC,
   `policy` lets the BC loss backprop into the encoder.
+- **`encoder.trainable`** — which parts of a training encoder update: `all`
+  (default), `head` (only a trainable `embedding.head`), or a list of
+  modules, everything else frozen: `'encoder.trainable=[layer3]'` (one
+  ResNet stage), `[layer3, layer4]`, `[layer3.1.conv2]` (an exact module),
+  `[blocks.6]` (one ViT block), `[layer4, head]`. Names resolve as for
+  `embedding.layer`; `head` is the output head. Each listed module must have
+  parameters and get gradient from the encoder's output (checked at startup
+  with one dummy pass, so e.g. a module after an `embedding.layer` cut is
+  rejected), and a trainable `linear`/`fc` head left out of the list must
+  come trained from `embedding.checkpoint`. Entries may not overlap (a
+  stage and one of its blocks). The startup log prints the selected modules
+  and their sizes, wandb's config gets `encoder_trainable_params`, and runs
+  get a `_train-<modules>` tag. Training a middle layer still
+  backpropagates through the layers after it (that's how its gradient
+  arrives), but not through the ones before.
+  - **ViTs:** timm-style ViTs apply a final LayerNorm (`norm`) after the
+    last block, so "the last two blocks" as usually fine-tuned is
+    `[blocks.10, blocks.11, norm]` (ViT-S/B, 12 blocks).
+  - **`encoder.bn=adapt` with a list** adapts only the listed modules'
+    BatchNorm statistics, so frozen modules stay fixed entirely; frozen
+    weights with every statistic adapting is `encoder.grads=none` with
+    `encoder.bn=adapt`. A selection without BatchNorm (e.g.
+    `[layer3.1.conv2]`) is rejected with `bn=adapt`.
+  - Not yet: layer-wise learning rates (LLRD). The natural extension is a
+    mapping, `{layer3: 0.1, layer4: 1.0}`, one optimizer group per entry at
+    `encoder.lr` × its multiplier (the list being the all-1.0 case).
 - **`encoder.aux`** — a list of auxiliary losses from `src/losses.py`, each
   `{name, weight, ...params}`:
   - `l2sp` anchors the backbone to its pretrained values (`||θ - θ₀||²`).
@@ -342,6 +371,35 @@ buffer_obs: auto     # SAC only: auto | features | pixels
     `target` branch is detached. Needs an augmentation with `stage: aux` or
     `both`. On its own it has a degenerate optimum (every input mapped to
     the same embedding), so pair it with `l2sp` or `grads != none`.
+  - `ema_consistency` (`momentum`, default 0.99; `distance: mse | cosine`) is
+    the distance between the encoder's features of the clean view and those
+    of a target encoder whose weights are an EMA of the encoder's, updated
+    every update. It starts at zero and only pulls toward the encoder's own
+    recent past, so like `l2sp` it can't train alone. It keeps a second copy
+    of the encoder in GPU memory and costs one more encoder pass per update.
+    `encoder.bn=adapt` is rejected: the encoder would normalise with batch
+    statistics and the target with running ones, and the loss would measure
+    that difference.
+    Logs `train/aux/ema_consistency/cos`.
+  - `reconstruction` (`size`, default 64, a power of 2; `grad`; `latent_l2`,
+    default 1e-6; `channels`, default 256) is SAC-AE's: a deconvolutional
+    decoder rebuilds the clean frames, downsampled to `size`, from the
+    features (MSE; all frames of a stack). `grad: true` trains the encoder.
+    `grad: false` detaches the features, so only the decoder learns: a probe
+    of what a frozen or RL-trained encoder keeps, which leaves training
+    unchanged. Logs `train/aux/reconstruction/psnr`. Set `encoder.aux_lr`
+    (SAC-AE: 1e-3); at the default `encoder.lr` the decoder barely learns.
+    Reconstructed images aren't logged yet.
+  - `moco` and `mae` run on replay or dataset frames as well as in
+    `pretrain.py`. Their views are independent draws of the run's augmentation
+    with `stage: aux` or `both`, otherwise the clean frames. `moco` compares
+    two views, so it needs such an augmentation (rejected otherwise), and
+    `encoder.bn=adapt` is rejected with it. Replayed frames can appear as
+    their own negatives in its queue, so use a smaller `queue_size` (e.g.
+    4096), and set `encoder.aux_lr` for its head. `mae` needs a whole `vit_*`
+    encoder (no `layer`, `head` or `frame_stack`); `decoder_depth=2` or so
+    makes it cheaper per update. `supervised`, `r3m` and `vip` stay
+    `pretrain.py`-only: replay buffers have no labels or clips.
 
   To add your own, subclass `AuxLoss` in `src/losses.py` and decorate it
   with `@register_aux_loss("name")`; the file's docstring has the contract.
@@ -402,7 +460,43 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   `python -m src.rl.buffer_stress --env adroit_hammer_pixels --image-size 224
   --compression zstd` fills a buffer with real frames while sampling, without
   training, and prints memory against stored bytes plus decode throughput
-  (batches/s, which should stay above the run's SPS).
+  (batches/s, which should stay above the run's SPS); `--storage disk` tests
+  a disk buffer.
+- **Buffer on a local disk**: `algo.buffer_storage=disk` keeps the frames
+  (or, with compression, the compressed arena) in a memory-mapped file in
+  `algo.buffer_dir` (default `/tmp/$SLURM_JOB_ID`: request a node-local
+  disk with `--tmp=<size>` and `--constraint=localdisk`). The file is
+  unlinked as soon as it's mapped (freed when the run ends, even after a
+  crash) and sparse (disk space is used as frames arrive). At startup the
+  folder must not be RAM-backed (tmpfs/ramfs: that would count against the
+  job's memory, unreclaimable) and must have room for the whole file, since
+  a full disk mid-run kills the process; a compressed arena is sized
+  uncompressed unless `algo.buffer_max_gb` caps it (a 1M-frame 224px
+  buffer: ~150 GB of `--tmp` without a cap). Recently used pages stay in the page cache, which the
+  kernel reclaims under the job's limit, so a small `--mem` holds only the
+  hot part. Batches are read (and decompressed) in background threads and
+  prefetched; `add()` waits for those reads before it writes. Works with or
+  without compression, for SAC and DrQ-v2.
+- **Memory check at startup**: a RAM buffer that can't fit the job's memory
+  (its cgroup limit, else `--mem`) stops the run before training: the
+  uncompressed size, or `algo.buffer_max_gb` with compression. Under 8 GB
+  left for everything else gives a warning; an uncapped compressed buffer
+  bigger than the job gets a note suggesting a `buffer_max_gb`.
+  `PVR_SKIP_BUFFER_CHECK=1` skips it. Disk buffers aren't checked against
+  memory.
+- **Buffer metrics** (stdout and wandb, every log): `charts/sample_ms` (mean
+  wait per batch, incl. the copy to the GPU) and `charts/add_ms`;
+  `charts/rss_anon_gb` / `charts/rss_file_gb` (heap and arrays vs mapped
+  files, e.g. a disk buffer's cached pages) next to `charts/rss_gb`;
+  `charts/cgroup_mem_gb` (what the OOM killer counts, page cache included);
+  `charts/buffer_disk_gb` for disk buffers. In disk mode `add()` waits for
+  the prefetched reads, so a slow disk shows in `add_ms`: the buffer's cost
+  per step is `sample_ms + add_ms`. sacct's MaxRSS includes a disk buffer's
+  cached pages (reclaimable); `rss_anon_gb` and `cgroup_mem_gb` are the
+  honest numbers. `run_buffer_ram.sh` (array: none / zstd / lz4, 24G) and
+  `run_buffer_ssd.sh` (array: none / zstd on the local disk, 8G) compare the
+  storage options on one SAC setup; compare `charts/steps_per_sec_recent`
+  and `sample_ms + add_ms` once the buffer is full.
 - **BatchNorm**: the encoder stays in `eval()` even while it trains, so
   BatchNorm running statistics never update (trainable BN affine params
   only), unless `encoder.bn=adapt` (see PIE-G options above).
@@ -585,14 +679,30 @@ fp32, and DistilBERT's dropout on while training with the text re-encoded at
 every reward call, as in the official code (`text_dropout: false`: encode
 once per step without dropout -- cheaper, but a deviation). 1M steps by default (the paper's experiments; the
 released models ran 1.5M). The language term needs `transformers` and
-DistilBERT (`distilbert-base-uncased`), cached beforehand on clusters
-without internet (`run_pretrain.sh`). Differences from the official code:
+DistilBERT (`distilbert-base-uncased`), downloaded on first use into
+`HF_HOME` (the job scripts set `$WRKDIR/hf`; on a cluster without internet on
+its compute nodes, load it once on a login node). Differences from the
+official code:
 - validation batches come from the SSv2 validation split; the official code
   draws them from the training manifest (`pretrain_data.val_manifest=null`
   does that too). Validation doesn't affect training.
 - the crop runs on the GPU per batch instead of in loader workers (same crop
   distribution: torchvision's own sampling);
 - one GPU, no DataParallel; logged values are interval averages.
+
+**R3M on a ViT** (`configs/experiment/r3m_vit.yaml`): the `r3m` preset
+(objective, weights, frame sampling, per-video crop, SSv2 clips) on MVP's
+ViT-S/16 from scratch, with ViT training settings instead of R3M's ResNet
+ones: 64 videos per step, AdamW 3e-4 (`lr_reference_batch: 64`, so the lr
+scales with `batch_size`), weight decay 0.05 without decay on biases and
+norms, `warmup_cosine` with 10k warmup steps over `train_steps`,
+`grad_clip: 1.0`, bf16. Starting values to tune (lr, weight decay, the
+L1/L2 weights for a 384-dim output, the warmup), not a published recipe:
+R3M released no ViT. With `+experiment=mvp` on the same `vit_s16`, R3M and
+MAE differ only in the objective. `run_r3m_vit.sh` is its job script.
+```bash
+python pretrain.py +experiment=r3m_vit pretrain_data.root=/path/to/ssv2
+```
 
 **VIP** (`configs/experiment/vip.yaml`, objective `vip`): the embedding
 distance to a goal frame is trained as a goal-conditioned value function
@@ -751,8 +861,9 @@ its contrastive loss on random crops). Runs are sized in epochs (`epochs`,
 (`train_images`: epochs and the lr schedule's warmup/milestones stretch to
 it, keeping the schedule's shape; for datasets smaller or larger than the
 recipe's), learning rates scale with
-`batch_size / lr_reference_batch`, and `lr_schedule` (step, cosine, warmup)
-changes once per epoch, as in the reference recipes. Resuming continues at
+`batch_size / lr_reference_batch`, and `lr_schedule`'s step and cosine
+decay change once per epoch, as in the reference recipes (a linear warmup,
+and MAE's `warmup_cosine`, change every step). Resuming continues at
 the exact position in the epoch (same `batch_size` and `num_workers`).
 
 **MoCo v2** (objective `moco`): query view through the encoder and an MLP
@@ -763,9 +874,9 @@ both views encoded in chunks of 32, the keys after a random permutation).
 Implemented from the papers, not the official code (its license is
 non-commercial).
 
-**Compute.** One GPU for now (multi-GPU DDP is a planned follow-up). On one
-A100, a ResNet-18 at 90 epochs is roughly a day if the loader keeps up,
-ResNet-50 several times that -- watch `data_wait`; `perf.amp_bf16=true` and
+**Compute.** One GPU for now (multi-GPU DDP is a planned follow-up). The
+supervised ResNet-18 run (90 epochs, 450k steps, bf16, `run_imagenet.sh`)
+took 10 h 20 min; ResNet-50 is several times that -- watch `data_wait`; `perf.amp_bf16=true` and
 `--short-side 256` help. ImageNet-100 or fewer epochs make quick runs
 practical. The supervised classifier and MoCo's heads belong to the
 objective, so the saved encoder is the feature extractor, used in RL with
@@ -841,21 +952,86 @@ use `ssv2_frames` (e.g. MoCo on video frames:
 (B, T, D) and `batch.text`. Image objectives: `needs_views = <n>` (and
 `needs_labels`); `forward()` gets `batch.views` (n augmented views,
 preprocessed but not normalised) and encodes them itself with
-`batch.encoder.encode_preprocessed`. Both kinds are rejected in
-`encoder.aux`, since replay buffers hold neither clips nor labelled
-multi-view images.
+`batch.encoder.encode_preprocessed`. Objectives that read clips, text or
+labels are rejected in `encoder.aux`, since replay buffers hold none of them;
+image objectives without labels also work there (`moco`, `mae`), on views
+made from the frames.
+
+## Estimating run time
+
+`train_sac.py`, `train_drqv2.py` and `pretrain.py` estimate their remaining
+time as they run (`src/timing.py`; `timing.enabled`, on by default, costs
+nothing per step):
+
+- **In the logs:** `elapsed=` and `eta=` on every log line; in wandb
+  `charts/eta_hours`, `charts/elapsed_hours` and
+  `charts/steps_per_sec_recent`. The estimate uses the training rate over
+  the last few log intervals (not since the start, so it follows the current
+  speed), with evaluation and checkpoint time measured separately and added
+  for the evaluations still to come (counted as each script runs them: none
+  during SAC/DrQ-v2's warm-up; `pretrain.py` also validates at the last step
+  and saves `checkpoint.pt` with every validation; the RL scripts save once,
+  at the end). The warm-up (random actions, no updates) is a separate,
+  faster phase; the estimate appears once training proper has a measured
+  rate. In a resumed run `elapsed=` includes the earlier jobs.
+  `charts/SPS` is unchanged (steps since the start / total time, so it's
+  inflated by the warm-up early on).
+- **`timing.json`** in the run directory: the measured rates, evaluation
+  cost, GPU and the settings that drive the cost, rewritten at every log.
+- **Before a long run: benchmark mode.** `timing.benchmark_steps=N` trains N
+  steps past the warm-up, times one evaluation and one checkpoint write (to a
+  scratch file it deletes, never `checkpoint.pt`), prints the predicted time
+  for the job and a suggested `--time` in sbatch's format, and stops without
+  saving. It runs with wandb off and writes `timing_benchmark.json`, not
+  `timing.json` (so a later real run in the same folder doesn't count it as
+  earlier time); N must end before the run's total steps. The prediction is the time measured so far -- which contains the
+  one-time costs (start-up, data-loader workers, the first CUDA steps) --
+  plus the estimated rest, minus the evaluation and save done only for
+  timing:
+  ```bash
+  python train_sac.py ...your settings... timing.benchmark_steps=2000
+  python pretrain.py +experiment=r3m_vit ... timing.benchmark_steps=500
+  ```
+  Run it on the node type the real job will use: rendering, data loading
+  and the GPU all set the rate.
+- **From earlier runs:** `python -m src.timing summary <folders>` lists the
+  measured runs; `python -m src.timing predict <run dir> --steps N
+  [--eval-every M]` predicts a run with the same setup but another length,
+  including that run's one-time costs (`one_time_seconds` in timing.json;
+  a benchmark's folder works too, through its `timing_benchmark.json`).
+
+The rate depends on the whole setup -- encoder, image size, batch size,
+environment, GPU -- so a measurement only carries over to runs that match.
 
 ## Cluster job scripts
 
-`run_pretrain.sh` is the R3M-on-SSv2 template for `pretrain.py` (with the
-one-time data and DistilBERT steps in its header; for VIP or MVP change
-`+experiment=` and the run directory), `debug_pretrain.sh` its smoke test,
-`run_prepare_ssv2.sh` the one-time SSv2 conversion, and `run_imagenet.sh`
-the ImageNet one (supervised, MoCo v2 or MAE). `run_sac.sh` (full run),
-`run_ft_sac.sh` (fine-tuning) and `debug_sac.sh` (quick smoke test) are the
-current SLURM templates for `train_sac.py` — copy and adjust
-`embedding=`/`env=`/`encoder.*`/`augmentation=` overrides as needed.
-`run_ft_bc.sh` is the template for `train_bc.py` (ResNet-18 finetuning on
-cheetah_run; `run_bc.sh` is a legacy script for a different cluster). `*.sh`
-files are gitignored, so scripts not yet tracked (e.g. `run_ft_bc.sh`) need
-`git add -f`.
+Templates to copy and adjust (Triton partitions, `$WRKDIR` paths). The
+pretraining ones copy (or extract) their data to the node's local disk at
+job start and resume from `checkpoint.pt` when resubmitted with the same
+`RUN_DIR` (chain jobs with `sbatch --dependency=afterany:<jobid>`).
+
+- **Data:** `run_prepare_ssv2.sh`, the one-time SSv2 conversion to shards
+  (CPU job).
+- **Pretraining:** `run_pretrain.sh` (R3M, ResNet-50 on SSv2),
+  `run_vip.sh` (VIP), `run_r3m_vit.sh` (R3M on ViT-S/16),
+  `run_mvp_epochs.sh` / `run_mvp_images.sh` (MVP, the two budgets),
+  `run_imagenet.sh` (ImageNet: supervised or MoCo v2, set `METHOD`/`ARCH`),
+  and `run_pretrain_generic.sh`, any network x data x method x augmentation
+  from four variables (`ARCH`, `DATA`, `METHOD`, `AUG`; the combination is
+  checked before anything runs, `DRY_RUN=1` prints the command).
+  `debug_pretrain.sh` is a smoke test (including a resume),
+  `run_profile_pretrain.sh` runs `profile_pretrain.py` on R3M variants.
+- **Downstream:** `run_sac.sh` (full run), `run_ft_sac.sh` (fine-tuning)
+  and `debug_sac.sh` (quick smoke test) for `train_sac.py` -- adjust
+  `embedding=`/`env=`/`encoder.*`/`augmentation=`; `run_ft_r3m.sh` is SAC on
+  your own R3M encoder (`embedding=custom_checkpoint`). `debug_pieg.sh` /
+  `arrayrun_pieg.sh` run the PIE-G preset on `train_drqv2.py`.
+  `run_buffer_ram.sh` / `run_buffer_ssd.sh` (job arrays) compare
+  replay-buffer storage options on one SAC setup (see "Buffer metrics"
+  above), and `run_buffer_stress_1m.sh` runs `src.rl.buffer_stress` on a
+  1M-frame compressed disk buffer, without training. `run_ft_bc.sh` is the template for `train_bc.py`
+  (ResNet-18 finetuning on cheetah_run; `run_bc.sh` is a legacy script for
+  a different cluster).
+
+`*.sh` files are gitignored, so scripts not yet tracked (e.g.
+`run_ft_bc.sh`) need `git add -f`.

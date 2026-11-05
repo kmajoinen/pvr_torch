@@ -56,6 +56,13 @@ class EncoderSettings:
     bn_adapt: bool = False              # encoder.bn=adapt
     strong_name: Optional[str] = None   # augmentation.strong: the SVEA-style second view
     strong_weight: float = 0.0
+    aux_views: int = 0                  # views of each frame image objectives read (max needs_views)
+
+    @property
+    def views_aug(self) -> bool:
+        """Image objectives' views are augmentation draws (stage aux or both),
+        not the clean frames."""
+        return self.aug_name is not None and self.aug_stage in ("aux", "both")
 
     @property
     def aux_names(self) -> List[str]:
@@ -103,15 +110,15 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     aux_specs = list(_plain(enc.get("aux")) or [])
     aux_classes = aux_loss_classes(aux_specs)
     pretrain_only = [s["name"] for s, c in zip(aux_specs, aux_classes)
-                     if c.needs_clips or c.needs_text or c.needs_views or c.needs_labels]
+                     if c.needs_clips or c.needs_text or c.needs_labels]
     if pretrain_only:
         raise ValueError(
-            f"encoder.aux {pretrain_only}: these objectives read video clips, text, multi-view "
-            "images or class labels, which replay buffers and BC datasets don't provide. Use "
-            "them in pretrain.py."
+            f"encoder.aux {pretrain_only}: these objectives read video clips, text or class "
+            "labels, which replay buffers and BC datasets don't provide. Use them in pretrain.py."
         )
     aux_needs_clean = any(c.needs_features for c in aux_classes)
     aux_needs_aug = any(c.needs_augmented for c in aux_classes)
+    aux_views = max((int(c.needs_views) for c in aux_classes), default=0)
     aug_readers = [s["name"] for s, c in zip(aux_specs, aux_classes) if c.needs_augmented]
 
     aug = cfg.get("augmentation") or {}
@@ -144,15 +151,37 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     if bn not in ("frozen", "adapt"):
         raise ValueError(f"encoder.bn={bn!r}; expected frozen or adapt")
     bn_adapt = bn == "adapt"
+    if bn_adapt and "moco" in [s["name"] for s in aux_specs]:
+        raise ValueError(
+            "encoder.aux moco with encoder.bn=adapt: the key encoder averages only the encoder's "
+            "weights, so its BatchNorm statistics would stay at their starting values while the "
+            "encoder's move. Use encoder.bn=frozen."
+        )
+    if bn_adapt and "ema_consistency" in [s["name"] for s in aux_specs]:
+        raise ValueError(
+            "encoder.aux ema_consistency with encoder.bn=adapt: the encoder's BatchNorm would "
+            "normalise with each batch's statistics and the target's with running ones, so the "
+            "loss would measure that difference rather than change in the encoder. Use "
+            "encoder.bn=frozen."
+        )
     if aug_stage not in AUG_STAGES:
         raise ValueError(f"augmentation.stage={aug_stage!r}; expected one of {AUG_STAGES}")
     if aug_name is None and aug_stage != "rl":
         raise ValueError(f"augmentation.stage={aug_stage} has no effect without an augmentation")
-    if aug_name is not None and aug_stage in ("aux", "both") and not aux_needs_aug:
+    if aug_name is not None and aug_stage in ("aux", "both") and not (aux_needs_aug or aux_views):
         raise ValueError(
             f"augmentation.stage={aug_stage} feeds augmented observations to aux "
             f"losses, but none of encoder.aux={[s['name'] for s in aux_specs]} "
-            "reads them (needs_augmented). Add one, e.g. aug_consistency, or use stage=rl."
+            "reads them (needs_augmented or needs_views). Add one, e.g. aug_consistency, "
+            "or use stage=rl."
+        )
+    multi_view = [s["name"] for s, c in zip(aux_specs, aux_classes) if c.needs_views >= 2]
+    if multi_view and (aug_name is None or aug_stage == "rl"):
+        raise ValueError(
+            f"aux losses {multi_view} compare two views of each frame, which need an "
+            "augmentation with stage=aux or both to differ (got "
+            f"augmentation={aug_name}, stage={aug_stage}), e.g. augmentation=random_shift "
+            "augmentation.stage=aux."
         )
     if aug_readers and (aug_name is None or aug_stage == "rl"):
         raise ValueError(
@@ -163,6 +192,14 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
     task_aug = aug_name is not None and aug_stage in ("rl", "both")
 
     trains = grads != "none" or bool(aux_specs)
+
+    aux_lr = enc.get("aux_lr")
+    if aux_lr is not None:
+        if isinstance(aux_lr, bool) or not isinstance(aux_lr, (int, float)) or aux_lr <= 0:
+            raise ValueError(f"encoder.aux_lr={aux_lr!r}: expected a positive number, or null for encoder.lr")
+        if not aux_specs:
+            raise ValueError("encoder.aux_lr sets the learning rate of aux losses' own parameters, "
+                             "but encoder.aux is empty.")
 
     trainable = _plain(enc.get("trainable", "all"))
     if isinstance(trainable, (list, tuple)):
@@ -210,21 +247,26 @@ def encoder_settings(cfg, valid_grads: Tuple[str, ...]) -> EncoderSettings:
             )
 
     # Without RL gradients, only aux losses move the encoder. One that reads
-    # no observations (l2sp) only pulls weights back toward where they start,
-    # so its gradient is zero throughout and the run equals a frozen one.
+    # no observations (l2sp), or only pulls the encoder toward a reference
+    # (moves_encoder = False: l2sp, ema_consistency), has zero gradient
+    # until something else moves it, so the run would equal a frozen one.
     # Keyed off needs_*, so a custom loss that reads observations counts.
-    if trains and grads == "none" and not (aux_needs_clean or aux_needs_aug):
+    movers = [c for c in aux_classes if c.moves_encoder and
+              (c.needs_features or c.needs_augmented or c.needs_views)]
+    if trains and grads == "none" and not movers:
         raise ValueError(
-            f"encoder.aux={[s['name'] for s in aux_specs]} with encoder.grads=none: no aux "
-            "loss reads observations, so nothing moves the encoder (l2sp's gradient is "
-            "zero at the pretrained weights) and the run equals a frozen one. Set "
-            "encoder.grads, or add an aux loss that reads observations (e.g. aug_consistency)."
+            f"encoder.aux={[s['name'] for s in aux_specs]} with encoder.grads=none: nothing "
+            "moves the encoder (l2sp and ema_consistency only pull it toward a reference, and "
+            "their gradient is zero until something else moves it), so the run equals a frozen "
+            "one. Set encoder.grads, or add an aux loss that trains the encoder (e.g. "
+            "aug_consistency, reconstruction, moco, mae)."
         )
 
     return EncoderSettings(
         has_embedding, grads, aux_specs, trains, trainable, aug_name, aug_stage,
         task_aug, aux_needs_clean, aux_needs_aug,
         bn_adapt=bn_adapt, strong_name=strong_name, strong_weight=strong_weight,
+        aux_views=aux_views,
     )
 
 
@@ -376,7 +418,7 @@ def warn_unused_encoder_overrides(s: EncoderSettings) -> None:
     except Exception:
         return
     unused = [o for o in overrides
-              if o.lstrip("+~").split("=")[0] in ("encoder.lr", "encoder.betas",
+              if o.lstrip("+~").split("=")[0] in ("encoder.lr", "encoder.aux_lr", "encoder.betas",
                                                   "encoder.grad_clip", "encoder.trainable")]
     if unused:
         print(f"WARNING: {unused} have no effect: the encoder is frozen "

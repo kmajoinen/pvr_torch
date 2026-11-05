@@ -19,7 +19,7 @@ import torch.optim as optim
 from omegaconf import OmegaConf
 
 from src.encoder_config import check_head_is_trained
-from src.losses import aux_grad_views, build_aux_losses
+from src.losses import aux_grad_views, build_aux_losses, clip_encoder_grads, encoder_param_groups
 
 
 # ------------------------------------------------------------------------------
@@ -206,20 +206,18 @@ class EncoderOptim:
     def __init__(self, cfg, enc, net, device):
         self.cfg = cfg
         self.net = net
-        self.optimizer, self.theta0, self.params, self.aux_terms = None, None, [], []
+        self.optimizer, self.theta0, self.groups, self.aux_terms = None, None, [], []
         if enc.trains:
             self.aux_terms = build_aux_losses(enc.aux_specs, net)
             for t in self.aux_terms:
                 t.loss.to(device)
             # Learnable heads owned by aux losses train alongside the encoder.
-            self.params = list(net.parameters()) + [
-                p for t in self.aux_terms for p in t.loss.parameters()
-            ]
+            self.groups = encoder_param_groups(net, self.aux_terms, cfg.encoder.get("aux_lr"))
             # Separate, much lower LR: at the head LRs a resnet18's weight sums
             # drift ~3% in 50 gradient steps (measured) -- far too fast for a
             # pretrained representation you want to adapt, not destroy.
             self.optimizer = optim.Adam(
-                self.params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
+                self.groups, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
             )
             # Kept on CPU: only read for the drift metric at log time, and a
             # GPU copy would double the encoder's memory (l2sp keeps its own
@@ -236,11 +234,10 @@ class EncoderOptim:
         self.optimizer.zero_grad(set_to_none=True)
 
     def step(self) -> float:
-        """Clip (encoder.grad_clip; null = no clipping) and step; returns the
-        pre-clip grad norm."""
-        clip = self.cfg.encoder.grad_clip
-        gnorm = float(torch.nn.utils.clip_grad_norm_(
-            self.params, max_norm=float("inf") if clip is None else clip))
+        """Clip (encoder.grad_clip, the encoder and the aux losses' own
+        parameters separately; null = no clipping) and step; returns the
+        encoder's pre-clip grad norm."""
+        gnorm = clip_encoder_grads(self.groups, self.cfg.encoder.grad_clip)
         self.optimizer.step()
         return gnorm
 
@@ -279,6 +276,9 @@ def encode_replay_batch(E: Encoding, stack: EncoderStack, enc, eo: "EncoderOptim
         aux_needs_aug=enc.aux_needs_aug,
         aux_grad_clean=eo.aux_grad_clean,
         aux_grad_aug=eo.aux_grad_aug,
+        aux_views=enc.aux_views,
+        views_aug=enc.views_aug,
+        autocast=E._autocast,
     )
     x_next = E.preprocess(b_next_obs)
     if enc.task_aug:

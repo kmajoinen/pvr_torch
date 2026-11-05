@@ -30,7 +30,8 @@ Contract:
     multiplies it by `weight`, sums the terms and backpropagates into the
     encoder. It must not step optimizers or touch the RL/BC networks.
   - Parameters the loss owns (decoders, predictor heads) are optimised by the
-    encoder's optimizer, at encoder.lr.
+    encoder's optimizer: in the RL/BC scripts at encoder.aux_lr (null:
+    encoder.lr), in pretrain.py at its lr.
   - Declare what the loss reads from AuxBatch with the class attributes
     below. The training loop fills only what some loss declared (each costs
     an encoder pass), and configs that can't supply it are rejected before
@@ -42,13 +43,22 @@ Contract:
         needs_views     = 2      # batch.views: this many augmented views per image
         needs_labels    = True   # batch.labels: one class per image
     needs_augmented also requires an augmentation with stage aux or both
-    (see src/views.py). Clips and text come from video datasets, so only
-    pretrain.py supplies them; the RL/BC scripts reject such objectives. A
-    clip objective also says which frames it wants: clip_sampler() returns a
-    picklable FrameSampler (it runs in data-loader workers). Image
-    objectives (needs_views) get the views as preprocessed, augmented
-    images and run batch.encoder on them themselves, so they control how
-    (MoCo: in chunks, for its BatchNorm shuffling).
+    (see src/views.py). Clips, text and labels come from pretraining
+    datasets, so only pretrain.py supplies them; the RL/BC scripts reject
+    such objectives. A clip objective also says which frames it wants:
+    clip_sampler() returns a picklable FrameSampler (it runs in data-loader
+    workers). Image objectives (needs_views) get the views as preprocessed,
+    augmented images and run batch.encoder on them themselves, so they
+    control how (MoCo: in chunks, for its BatchNorm shuffling). pretrain.py
+    crops each view in its loader; the RL/BC scripts make the views from the
+    replay/dataset frames: independent draws of the run's augmentation when
+    its stage is aux or both, otherwise the clean frames (so needs_views >= 2
+    requires such an augmentation).
+  - moves_encoder = False declares a loss that only pulls the encoder
+    toward a reference (l2sp: its starting weights; ema_consistency: its
+    own moving average), so its gradient is zero until something else moves
+    the encoder. Such losses alone, with encoder.grads=none, are rejected:
+    the run would equal a frozen one.
   - forward() may return (loss, metrics) instead of the loss alone: metrics
     is a dict of extra scalars to log (tensors or floats), logged as
     <name>/<key>.
@@ -67,7 +77,8 @@ Contract:
 
 import inspect
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Type
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Dict, List, Optional, Sequence, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -92,12 +103,20 @@ class AuxBatch:
     # the order it returned them, with gradient; and each video's text.
     clip_feats: Optional[torch.Tensor] = None
     text: Optional[Sequence[str]] = None
-    # Image objectives (pretrain.py): needs_views views of each of B images,
-    # each float (B, 3, H, W) at the encoder's input size, independently
-    # cropped and augmented, before mean/std normalisation (encode them
-    # with batch.encoder.encode_preprocessed); and class labels (B,).
+    # Image objectives: needs_views views of each of B images, each float
+    # (B, C, H, W) at the encoder's input size, before mean/std normalisation
+    # (encode them with batch.encoder.encode_preprocessed). pretrain.py crops
+    # and augments each independently; the RL/BC scripts draw the run's
+    # augmentation per view (stage aux or both), or pass the clean frames.
+    # C is 3, or 3 x embedding.frame_stack for stacked RL observations.
+    # labels: class labels (B,), pretrain.py only.
     views: Optional[List[torch.Tensor]] = None
     labels: Optional[torch.Tensor] = None
+    # The caller's mixed-precision context for encoder passes (a callable
+    # returning a context manager), so a loss that runs an encoder copy
+    # (ema_consistency's target) matches the precision of batch.feats.
+    # None: full precision.
+    autocast: Optional[Callable[[], ContextManager]] = None
 
 
 class FrameSampler:
@@ -119,6 +138,7 @@ class AuxLoss(nn.Module):
     needs_text: bool = False
     needs_views: int = 0
     needs_labels: bool = False
+    moves_encoder: bool = True
 
     def __init__(self, encoder: nn.Module):
         super().__init__()
@@ -182,6 +202,7 @@ class L2SP(AuxLoss):
     2018): adapt the encoder while penalising drift from its pretrained
     weights. A trainable head (embedding.head=linear) is excluded: it starts
     from a random init, which L2-SP has no reason to anchor to."""
+    moves_encoder = False
 
     def __init__(self, encoder: nn.Module):
         super().__init__(encoder)
@@ -242,6 +263,145 @@ class AugConsistency(AuxLoss):
         else:
             aug = aug.detach()
         return F.mse_loss(aug, clean)
+
+
+@register_aux_loss("ema_consistency")
+class EMAConsistency(AuxLoss):
+    """Keeps the encoder close to a slow-moving copy of itself: the loss is
+    the distance between the encoder's features of the clean observations
+    and those of a target encoder whose weights are an exponential moving
+    average (EMA) of the encoder's, target <- momentum * target + (1 -
+    momentum) * encoder, updated at every training forward pass (as MoCo's
+    key encoder). Like l2sp, but anchored in feature space and to where the
+    encoder was recently rather than where it started, so it damps fast
+    changes without holding the encoder at its pretrained weights. The
+    target is encoded without gradient and at the caller's precision
+    (batch.autocast), so the loss starts at zero.
+
+    It only pulls toward the encoder's own past (moves_encoder = False):
+    with encoder.grads=none it needs another loss that moves the encoder.
+    encoder.bn=adapt is rejected: the encoder's BatchNorm would normalise with
+    each batch's statistics and the target's with running ones, so the loss
+    would measure that difference rather than change in the encoder.
+
+    momentum: the EMA's decay per update (0.99: the target averages roughly
+    the last 100 updates). distance: 'mse' (on the raw features) or
+    'cosine' (1 - cosine similarity, ignores the features' scale).
+    Metric: cos, the mean cosine similarity to the target.
+    """
+    needs_features = True
+    moves_encoder = False
+
+    @classmethod
+    def check_params(cls, momentum=0.99, distance="mse") -> None:
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"ema_consistency momentum must be in [0, 1), got {momentum}")
+        if distance not in ("mse", "cosine"):
+            raise ValueError(f"ema_consistency distance must be 'mse' or 'cosine', got {distance!r}")
+
+    def __init__(self, encoder: nn.Module, momentum: float = 0.99, distance: str = "mse"):
+        super().__init__(encoder)
+        self.check_params(momentum, distance)
+        import copy
+        # Part of the loss's state, never optimised; always in eval mode, like
+        # the encoder itself (encoder.bn=adapt is rejected).
+        self.target = copy.deepcopy(encoder).requires_grad_(False).eval()
+        self.momentum, self.distance = float(momentum), distance
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.target.eval()
+        return self
+
+    @torch.no_grad()
+    def _momentum_update(self, encoder):
+        m = self.momentum
+        for pt, p in zip(self.target.parameters(), encoder.parameters()):
+            pt.mul_(m).add_(p.detach(), alpha=1 - m)
+
+    def forward(self, batch: AuxBatch):
+        if self.training:
+            self._momentum_update(batch.encoder)
+        with torch.no_grad(), (batch.autocast or nullcontext)():
+            target = self.target.encode_preprocessed(batch.obs)
+        f, target = batch.feats.float(), target.float()
+        cos = F.cosine_similarity(f, target, dim=1)
+        loss = F.mse_loss(f, target) if self.distance == "mse" else (1 - cos).mean()
+        return loss, {"cos": cos.mean().detach()}
+
+
+@register_aux_loss("reconstruction")
+class Reconstruction(AuxLoss):
+    """Pixel reconstruction from the encoder's features (SAC-AE, Yarats et
+    al., 2021): a deconvolutional decoder maps each feature vector back to
+    its observation, downsampled to `size` x `size` (all frames of a stack),
+    and the loss is the mean squared error. The decoder belongs to the loss
+    and trains with the encoder's optimizer.
+
+    grad: true backpropagates into the encoder -- SAC-AE's training signal,
+    which keeps the features informative about the whole image. grad: false
+    detaches the features, so only the decoder learns: a probe of what the
+    representation keeps (how well a frozen or RL-trained encoder's
+    features can be decoded), which leaves training unchanged.
+
+    The decoder: LayerNorm + Linear to `channels` x 4 x 4, then stride-2
+    transposed convolutions (channels halving, at least 32) up to `size`,
+    and a final 3x3 convolution. Targets are the preprocessed frames (the
+    encoder's input, before normalisation) shifted to [-0.5, 0.5], as
+    SAC-AE's. latent_l2 adds SAC-AE's penalty on the features,
+    latent_l2 * 0.5 * ||z||^2 (with grad: true; 1e-6 in SAC-AE), which keeps
+    their scale from growing to suit the decoder. Metric: psnr (dB, on
+    [0, 1] pixels).
+    """
+    needs_features = True
+
+    @classmethod
+    def check_params(cls, size=64, grad=True, latent_l2=1e-6, channels=256) -> None:
+        if int(size) != size or size < 8 or int(size) & (int(size) - 1):
+            raise ValueError(f"reconstruction size must be a power of 2 >= 8, got {size}")
+        if not isinstance(grad, bool):
+            raise ValueError(f"reconstruction grad must be true or false, got {grad!r}")
+        if latent_l2 < 0:
+            raise ValueError(f"reconstruction latent_l2 must be >= 0, got {latent_l2}")
+        if int(channels) != channels or channels < 1:
+            raise ValueError(f"reconstruction channels must be a whole number >= 1, got {channels}")
+
+    def __init__(self, encoder: nn.Module, size: int = 64, grad: bool = True,
+                 latent_l2: float = 1e-6, channels: int = 256):
+        super().__init__(encoder)
+        self.check_params(size, grad, latent_l2, channels)
+        import math
+        self.size, self.grad, self.latent_l2 = int(size), bool(grad), float(latent_l2)
+        out_ch = 3 * int(getattr(encoder, "build_spec", {}).get("frame_stack") or 1)
+        c = int(channels)
+        self.fc = nn.Sequential(nn.LayerNorm(encoder.out_size), nn.Linear(encoder.out_size, c * 16))
+        layers = []
+        for _ in range(int(math.log2(self.size)) - 2):
+            c_out = max(c // 2, 32)
+            layers += [nn.ConvTranspose2d(c, c_out, 4, stride=2, padding=1), nn.ReLU(inplace=True)]
+            c = c_out
+        self.deconv = nn.Sequential(*layers, nn.Conv2d(c, out_ch, 3, padding=1))
+        self._channels = int(channels)
+
+    @property
+    def grad_features(self) -> bool:
+        return self.grad
+
+    def decode(self, feats: torch.Tensor) -> torch.Tensor:
+        """Features (N, D) -> reconstructions (N, C, size, size), in [-0.5, 0.5]
+        pixel units (add 0.5 for an image)."""
+        h = F.relu(self.fc(feats.float())).view(len(feats), self._channels, 4, 4)
+        return self.deconv(h)
+
+    def forward(self, batch: AuxBatch):
+        z = batch.feats if self.grad else batch.feats.detach()
+        target = F.interpolate(batch.obs.float(), size=(self.size, self.size), mode="bilinear",
+                               antialias=True, align_corners=False) - 0.5
+        mse = F.mse_loss(self.decode(z), target)
+        loss = mse
+        if self.grad and self.latent_l2:
+            loss = loss + self.latent_l2 * 0.5 * z.float().pow(2).sum(1).mean()
+        return loss, {"psnr": (-10 * torch.log10(mse.detach().clamp_min(1e-10)))}
 
 
 # ------------------------------------------------------------------------------
@@ -653,6 +813,17 @@ class MoCo(AuxLoss):
     Uses each batch once: with pretrain.py's schedule.updates_per_batch > 1
     the same keys enter the queue (and the momentum encoder steps) once per
     update, so the queue holds duplicates -- pretrain.py warns.
+
+    As an RL/BC aux loss (encoder.aux, CURL-style contrastive learning on
+    replay frames): the two views are two draws of the run's augmentation
+    (stage aux or both, required), e.g. random_shift as in CURL, or a
+    random_resized_crop + colour pipeline closer to MoCo v2's. Replay
+    batches resample frames, so the queue can hold keys of the same frame as
+    a query (false negatives); a smaller queue_size (e.g. 4096) keeps the
+    queue to recent batches. The RL encoder stays in eval mode, so BatchNorm
+    statistics don't change and the batch isn't split (bn_splits applies to
+    encoders in train mode only); encoder.bn=adapt is rejected, since the key
+    encoder's statistics wouldn't follow.
     """
     needs_views = 2
     assumes_fresh_batches = True
@@ -695,7 +866,10 @@ class MoCo(AuxLoss):
     def _project(self, encoder, head, x, perm=None):
         if perm is not None:
             x = x[perm]
-        out = torch.cat([head(encoder.encode_preprocessed(c)) for c in x.chunk(self.bn_splits)])
+        # Chunks only matter to BatchNorm in train mode; in eval mode (the RL
+        # encoder, validation) they'd be extra passes with the same result.
+        chunks = self.bn_splits if encoder.training else 1
+        out = torch.cat([head(encoder.encode_preprocessed(c)) for c in x.chunk(chunks)])
         if perm is not None:
             out = out[torch.argsort(perm)]
         return F.normalize(out.float(), dim=1)
@@ -709,12 +883,13 @@ class MoCo(AuxLoss):
 
     def forward(self, batch: AuxBatch):
         x_q, x_k = batch.views[0], batch.views[1]
-        q = self._project(batch.encoder, self.head, x_q)
-        with torch.no_grad():
-            if self.training:
-                self._momentum_update(batch.encoder)
-            k = self._project(self.key_encoder, self.key_head, x_k,
-                              perm=torch.randperm(len(x_k), device=x_k.device))
+        with (batch.autocast or nullcontext)():
+            q = self._project(batch.encoder, self.head, x_q)
+            with torch.no_grad():
+                if self.training:
+                    self._momentum_update(batch.encoder)
+                k = self._project(self.key_encoder, self.key_head, x_k,
+                                  perm=torch.randperm(len(x_k), device=x_k.device))
         logits = torch.cat([(q * k).sum(1, keepdim=True), q @ self.queue.clone()], dim=1) / self.temperature
         target = torch.zeros(len(q), dtype=torch.long, device=q.device)
         loss = F.cross_entropy(logits, target)
@@ -743,6 +918,10 @@ class MAE(AuxLoss):
     Defaults are MAE's: mask ratio 0.75, per-patch normalised targets
     (norm_pix_loss, as its released models), decoder 512 wide, 8 blocks of
     16 heads.
+
+    As an RL/BC aux loss (encoder.aux): reconstructs the replay frames
+    (augmented, if the augmentation's stage is aux or both). The decoder is
+    MAE's full one; a smaller one (decoder_depth=2..4) is cheaper per update.
     """
     needs_views = 1
 
@@ -778,10 +957,11 @@ class MAE(AuxLoss):
             norm_pix_loss=bool(norm_pix_loss))
 
     def forward(self, batch: AuxBatch):
-        imgs = batch.encoder.normalize(batch.views[0])
-        latent, mask, ids_restore = batch.encoder.embedding.forward_encoder(imgs, self.mask_ratio)
-        pred = self.decoder.forward_decoder(latent, ids_restore)
-        return self.decoder.forward_loss(imgs, pred, mask)
+        with (batch.autocast or nullcontext)():
+            imgs = batch.encoder.normalize(batch.views[0])
+            latent, mask, ids_restore = batch.encoder.embedding.forward_encoder(imgs, self.mask_ratio)
+            pred = self.decoder.forward_decoder(latent, ids_restore)
+            return self.decoder.forward_loss(imgs, pred, mask)
 
 
 # ------------------------------------------------------------------------------
@@ -854,6 +1034,27 @@ def build_aux_losses(specs, encoder: nn.Module) -> List[AuxTerm]:
             )
         terms.append(AuxTerm(name, weight, loss))
     return terms
+
+
+def encoder_param_groups(encoder: nn.Module, terms: List[AuxTerm], aux_lr: Optional[float] = None) -> List[dict]:
+    """Optimizer parameter groups for the RL/BC encoder optimizer: the encoder
+    at the optimizer's lr, and the aux losses' own parameters (decoders, heads)
+    at aux_lr. They start from a random init, so they usually want a far higher
+    rate than a pretrained encoder (null: the same rate)."""
+    groups = [{"params": list(encoder.parameters())}]
+    owned = [p for t in terms for p in t.loss.parameters() if p.requires_grad]
+    if owned:
+        groups.append({"params": owned} if aux_lr is None else {"params": owned, "lr": float(aux_lr)})
+    return groups
+
+
+def clip_encoder_grads(groups: List[dict], max_norm: Optional[float]) -> float:
+    """Clip each encoder_param_groups group separately (null: no clipping), so
+    a large gradient on a fresh decoder doesn't shrink the encoder's. Returns
+    the encoder's pre-clip norm, which leaves the aux losses' parameters out."""
+    limit = float("inf") if max_norm is None else max_norm
+    norms = [torch.nn.utils.clip_grad_norm_(g["params"], max_norm=limit) for g in groups]
+    return float(norms[0])
 
 
 def aux_grad_views(terms: List[AuxTerm]) -> Tuple[bool, bool]:

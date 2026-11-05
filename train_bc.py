@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from src.encoder_config import (check_head_is_trained, embedding_kwargs, encoder_settings,
                                 warn_unused_encoder_overrides)
-from src.losses import aux_grad_views, build_aux_losses, total_aux_loss
+from src.losses import aux_grad_views, build_aux_losses, clip_encoder_grads, encoder_param_groups, total_aux_loss
 from src.models import ContinuousPolicyNet
 from src.views import CollapseMonitor, encode_views
 
@@ -251,17 +251,15 @@ def main(cfg: DictConfig) -> None:
         if use_wandb and embedding.build_warnings:
             wandb.config.update({"encoder_build_warnings": embedding.build_warnings})
 
-    enc_optimizer, enc_params, aux_terms = None, [], []
+    enc_optimizer, enc_groups, aux_terms = None, [], []
     if encoder_trains:
         aux_terms = build_aux_losses(enc.aux_specs, embedding)
         for t in aux_terms:
             t.loss.to(device)
         # Learnable heads owned by aux losses train alongside the encoder.
-        enc_params = list(embedding.parameters()) + [
-            p for t in aux_terms for p in t.loss.parameters()
-        ]
+        enc_groups = encoder_param_groups(embedding, aux_terms, cfg.encoder.get("aux_lr"))
         enc_optimizer = torch.optim.Adam(
-            enc_params, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
+            enc_groups, lr=cfg.encoder.lr, betas=tuple(cfg.encoder.betas)
         )
         print(f"Encoder trains: grads={enc.grads}  aux={enc.aux_names}  lr={cfg.encoder.lr}")
     aux_grad_clean, aux_grad_aug = aux_grad_views(aux_terms)
@@ -340,6 +338,8 @@ def main(cfg: DictConfig) -> None:
                     aux_needs_aug=enc.aux_needs_aug,
                     aux_grad_clean=aux_grad_clean,
                     aux_grad_aug=aux_grad_aug,
+                    aux_views=enc.aux_views,
+                    views_aug=enc.views_aug,
                 )
                 obs_b = views.feats_task
                 if strong_module is not None:
@@ -365,9 +365,7 @@ def main(cfg: DictConfig) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             if enc_optimizer is not None:
-                clip = cfg.encoder.grad_clip
-                torch.nn.utils.clip_grad_norm_(
-                    enc_params, max_norm=float("inf") if clip is None else clip)
+                clip_encoder_grads(enc_groups, cfg.encoder.grad_clip)
                 enc_optimizer.step()
             optimizer.step()
             train_loss += loss.item()

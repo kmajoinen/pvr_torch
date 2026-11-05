@@ -74,11 +74,19 @@ per epoch) or `random` (uniform with replacement, an epoch being
 steps per batch. E.g. `schedule.sampling=random schedule.epoch_batches=1000
 epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
 
-**On the cluster.** Job scripts are templates to copy: `run_pretrain.sh`
-(clip pretraining, copies the data shards to the node's local disk),
-`run_imagenet.sh` (image pretraining), `run_sac.sh` / `run_ft_sac.sh`
-(SAC), `run_ft_bc.sh` (BC), `debug_*.sh` (short smoke tests). `*.sh` files
-are gitignored: `git add -f` a script to keep it in the repo.
+**On the cluster.** Job scripts are templates to copy (all listed in
+`RUNNING_EXPERIMENTS.md`, "Cluster job scripts"):
+- pretraining: `run_pretrain.sh` (R3M), `run_vip.sh`, `run_r3m_vit.sh`,
+  `run_mvp_epochs.sh` / `run_mvp_images.sh` (the two MVP budgets),
+  `run_imagenet.sh` (supervised or MoCo v2 on ImageNet), and
+  `run_pretrain_generic.sh` (any network x data x method x augmentation,
+  checked before submitting); each copies its data to the node's local disk;
+- data: `run_prepare_ssv2.sh` (the one-time SSv2 conversion);
+- downstream: `run_sac.sh` / `run_ft_sac.sh` (SAC), `run_ft_r3m.sh` (SAC on
+  your own R3M encoder), `run_ft_bc.sh` (BC);
+- `debug_*.sh`: short smoke tests.
+
+`*.sh` files are gitignored: `git add -f` a script to keep it in the repo.
 
 **Locally, before a cluster run.**
 - Run the tests: `env/bin/python -m pytest tests -q`.
@@ -86,14 +94,141 @@ are gitignored: `git add -f` a script to keep it in the repo.
 - Do a tiny run on CPU: `device=cpu`, a small `batch_size` and a few
   `train_steps` (or `epochs=1`), on a small dataset (e.g. `prepare_ssv2.py
   --limit 20`).
-- Size the real run: read `steps/s` and `data_wait` from a few hundred
-  steps; for clip objectives `profile_pretrain.py` breaks a step down.
+- Size the real run: `timing.benchmark_steps=N` trains N steps, then prints
+  the predicted job time and a `--time` for sbatch (run it on the node type
+  the real job gets); `data_wait` shows whether the loader keeps up, and for
+  clip objectives `profile_pretrain.py` breaks a step down.
 
 **Multi-GPU.**
 - Not implemented yet: one GPU per run. Planned: DDP via `torchrun`
   (`TODO.md`).
 
-## 3. Adding a dataset
+## 3. The encoder in RL and BC
+
+### The interface
+
+The agents only ever see a feature vector. Everything about the encoder sits
+behind `EmbeddingNet` (`src/embeddings.py`), so swapping encoders is one
+option (`embedding=`) and the RL code doesn't change:
+
+| `EmbeddingNet` | what it does |
+|---|---|
+| `preprocess(x)` | frames (N, C, H, W) -> float in [0, 1] at the encoder's input size: resize and crop, no normalisation. Augmentation runs on this output |
+| `encode_preprocessed(x)` | that output -> features (N, `out_size`): normalise, backbone, fuse stacked frames, output head |
+| `out_size` | the feature width: the input size of the actor and critics |
+
+The actor and critics are plain MLPs built for `out_size`, each with its own
+LayerNorm on the input (`obs_norm`). A run takes one of two paths, chosen at
+startup and printed as `Buffer stores: ...` (`buffer_obs=auto`):
+
+| | features (frozen fast path) | pixels |
+|---|---|---|
+| **when** | the encoder doesn't train and there's no augmentation | the encoder trains, or augmentation is on, or `buffer_obs=pixels` |
+| **who encodes** | an env wrapper (`FrozenEncoderWrapper`), once per env step | the training loop, every sampled batch |
+| **the replay buffer holds** | feature vectors | uint8 frames |
+| **cost** | cheap: the env just emits vectors | one or more encoder passes per update |
+
+On the pixel path, one update is (`encode_replay_batch` in `src/rl/common.py`,
+`encode_views` in `src/views.py`):
+```
+sample frames -> preprocess -> augment (per augmentation.stage) -> encode
+  obs:      with gradient if the critic or an aux loss trains through it
+  next_obs: no gradient, for the Q targets (live encoder: target networks
+            exist for the Q heads only)
+```
+Acting and evaluation always encode the clean frame, without gradient. BC is
+the same without a replay buffer: `train_bc.py` encodes every dataset batch,
+frozen or not.
+
+What comes out: with a training encoder (or `encoder.bn=adapt`), runs save
+`best_encoder.pt`, and `final_checkpoint.pt` holds it too. Both load through
+`embedding.checkpoint`, like a `pretrain.py` snapshot.
+
+### Which gradients reach the encoder
+
+Three independent settings decide (`src/encoder_config.py` checks them at
+startup). The encoder trains if `encoder.grads != none` or `encoder.aux` is
+non-empty; otherwise it's frozen.
+
+| setting | values | decides |
+|---|---|---|
+| `encoder.grads` | SAC, DrQ-v2: `none`, `critic`, `actor`, `both`. BC: `none`, `policy` | which task loss backpropagates into the encoder |
+| `encoder.aux` | list of `{name, weight, ...}` | extra losses on the encoder, independent of `grads` |
+| `augmentation` + its `stage` | `rl`, `aux`, `both` | whether the task loss, the aux losses, or both see augmented frames |
+
+What each update does (SAC; DrQ-v2 is the same with one actor step):
+```
+critic phase, every update:
+    backward(critic loss + aux losses)        one pass, so they can share an encode
+    step critics
+    step encoder     if grads is critic or both, or there are aux losses
+actor phase, every policy_frequency updates (that many steps at once):
+    grads actor/both: re-encode the same frames with gradient
+    otherwise:        reuse the critic phase's features, detached
+    backward(actor loss), step actor
+    step encoder     if grads is actor or both
+```
+- **`critic`** is DrQ-v2's recipe and the usual choice.
+- **`actor`** gives the encoder the full actor-loss gradient, through both
+  the policy's input and the Q evaluation.
+- **`both`** takes separate encoder steps, not one summed gradient: summing
+  would mean evaluating the actor loss against critics from before their
+  update, which changes SAC's order.
+- **Aux losses always ride the critic phase**, so `actor` plus an aux loss
+  alternates aux steps and actor steps.
+- **BC** has one backward per batch: BC loss (with `policy`) plus aux losses.
+
+The encoder has its own Adam optimizer: `encoder.lr` (default 1e-5, far below
+the heads' rates, to adapt a pretrained encoder and not destroy it), `betas`,
+`grad_clip`. Aux losses' own parameters (decoders, heads) are in it too, at
+`encoder.aux_lr`; they start from random weights, so set it (e.g. 1e-3). They
+are clipped separately, and `train/encoder_grad_norm_*` leaves them out, so a
+large decoder gradient neither shrinks the encoder's nor shows up as its norm.
+`encoder.trainable` narrows what updates: `all`, `head`, or modules such as
+`[layer3]`. The encoder stays in `eval()` even while it trains, so BatchNorm
+statistics don't move, unless `encoder.bn=adapt`.
+
+### Auxiliary losses
+
+| `name` | reads | what it does | can train alone (`grads=none`)? |
+|---|---|---|---|
+| `l2sp` | weights | pulls the weights toward their starting values | no: zero gradient until something moves them |
+| `ema_consistency` | clean frames | feature distance to a slow-moving (EMA) copy of the encoder; damps fast change without pinning it to the start. Rejected with `encoder.bn=adapt` | no: same reason |
+| `aug_consistency` | clean + augmented | augmented features should match clean ones | allowed, but collapses to a constant: pair it with `l2sp` or `grads` |
+| `reconstruction` | clean frames | a decoder rebuilds the frame from the features (SAC-AE). `grad: false` detaches them: only the decoder learns, a probe of what the features keep | yes |
+| `moco` | 2 views | contrastive on replay frames with a momentum encoder, as in CURL. Needs an augmentation at `stage: aux` or `both`, or the views would be identical. Rejected with `encoder.bn=adapt` | yes |
+| `mae` | 1 view | masked-patch reconstruction; only a whole `vit_*` encoder | yes |
+
+`supervised`, `r3m` and `vip` are rejected: they need class labels or video
+clips, and replay buffers and BC datasets have neither. For `moco` and `mae`,
+the views are independent augmentation draws with `stage: aux` or `both`, and
+the clean frames otherwise. There's no loader crop as in `pretrain.py`, so for
+`moco` pick an augmentation strong enough to make the views differ.
+
+```bash
+# critic gradients, kept near a slow copy of the encoder
+python train_sac.py embedding=resnet18 encoder.grads=critic \
+    'encoder.aux=[{name:ema_consistency,weight:1.0,momentum:0.99}]'
+# SAC-AE: critic plus reconstruction
+python train_sac.py embedding=resnet18 encoder.grads=critic encoder.aux_lr=1e-3 \
+    'encoder.aux=[{name:reconstruction,weight:1.0,size:64}]'
+# frozen encoder: what can be decoded from its features? (train/aux/reconstruction/psnr)
+python train_sac.py embedding=r3m_resnet50 encoder.aux_lr=1e-3 \
+    'encoder.aux=[{name:reconstruction,weight:1.0,grad:false}]'
+# CURL-style: critic gradients plus contrastive on two random shifts
+python train_sac.py embedding=resnet18 encoder.grads=critic encoder.aux_lr=1e-3 \
+    augmentation=random_shift augmentation.stage=both \
+    'encoder.aux=[{name:moco,weight:1.0,queue_size:4096}]'
+# fine-tune an MAE-pretrained ViT with MAE still on (a smaller decoder is cheaper)
+python train_sac.py embedding=custom_checkpoint embedding.name=my_mae embedding.arch=vit_s16 \
+    embedding.checkpoint=$RUN/encoder_step1000000.pt encoder.grads=critic encoder.aux_lr=1e-3 \
+    'encoder.aux=[{name:mae,weight:1.0,decoder_depth:2}]'
+```
+Each loss adds cost per update: `moco` two encoder passes, `mae` a masked pass
+and its decoder, `ema_consistency` one target pass. These RL uses are new:
+they're tested and smoke-run, but none has been through a full training run.
+
+## 4. Adding a dataset
 
 The pretraining formats in full, with a conversion example, are in
 `DATASETS.md`; `python -m src.data.check <root>` checks a dataset and
@@ -174,7 +309,7 @@ A clip dataset's frame shards are already an image dataset: point
 already covers needs only `configs/env/<name>.yaml` (`name`, `builder`,
 `id`, `image_size`); a new kind of env needs a builder function there.
 
-## 4. Adding an augmentation
+## 5. Adding an augmentation
 
 Augmentations are `nn.Module`s in a registry (`src/augmentations.py`).
 
@@ -214,7 +349,7 @@ params:
   every registered augmentation through shape/dtype/range, per-sample and
   reproducibility checks, and builds every file in `configs/augmentation/`.
 
-## 5. Adding a loss or pretraining objective
+## 6. Adding a loss or pretraining objective
 
 One registry serves both uses (`src/losses.py`): pretraining objectives
 (`pretrain.py`'s `objectives`) and auxiliary losses during RL/BC
@@ -247,6 +382,7 @@ python train_sac.py 'encoder.aux=[{name:my_loss,weight:0.1,scale:2.0}]' encoder.
 This one reads RL/BC features (`needs_features`), so it's an auxiliary loss.
 A pretraining objective declares `needs_clips` or `needs_views` instead and
 is used as `python pretrain.py 'objectives=[{name:my_objective,weight:1.0}]' ...`.
+An objective with `needs_views` and no labels works in both (`moco`, `mae`).
 
 **What a loss reads** is declared with class attributes, and only that is
 computed (each costs an encoder pass). Configs that can't supply it are
@@ -256,8 +392,9 @@ rejected at startup.
 |---|---|---|
 | `needs_features` | `batch.obs`, `batch.feats`: the clean view and its features | RL/BC |
 | `needs_augmented` | `batch.obs_aug`, `batch.feats_aug` (needs an augmentation with `stage: aux` or `both`) | RL/BC |
-| `needs_clips` | `batch.clip_feats` (B, T, D) and `batch.text`; also define `clip_sampler()` returning a `FrameSampler` (which frames of each video) | `pretrain.py` (clip data) |
-| `needs_views = n` | `batch.views`: n augmented views per image, encoded by the loss itself (`batch.encoder.encode_preprocessed`) | `pretrain.py` (image data) |
+| `needs_clips` | `batch.clip_feats` (B, T, D); also define `clip_sampler()` returning a `FrameSampler` (which frames of each video) | `pretrain.py` (clip data) |
+| `needs_text` | `batch.text`: one description per video | `pretrain.py` (clip data) |
+| `needs_views = n` | `batch.views`: n augmented views per image, encoded by the loss itself (`batch.encoder.encode_preprocessed`) | `pretrain.py` (image data); RL/BC (from replay or dataset frames, section 3) |
 | `needs_labels` | `batch.labels` | `pretrain.py` (labelled images) |
 
 Rules of thumb:
@@ -273,13 +410,16 @@ Rules of thumb:
 - An objective that needs the backbone's internals (MAE's masking) can call
   `batch.encoder.normalize(view)` and then `batch.encoder.embedding`
   directly.
+- A loss that only pulls the encoder toward a reference (`l2sp`,
+  `ema_consistency`) sets `moves_encoder = False`, so `encoder.grads=none`
+  with nothing else to move the encoder is rejected at startup.
 - For a method recipe, add `configs/experiment/<method>.yaml` (below).
 - When porting a published method, add a parity test that runs the
   official code on the same inputs and compares losses and weights after an
   optimizer step (`tests/test_r3m.py`, `tests/test_vip.py`), skipped when
   the official package isn't installed.
 
-## 6. Adding an encoder
+## 7. Adding an encoder
 
 Encoders are branches of `_get_embedding()` in `src/embeddings.py`, each
 returning `(model, transforms, forward_fn)`:
@@ -296,7 +436,7 @@ weights when `pretrained=false`, and an entry in `CHECKPOINT_ARCHS`.
 `embedding.layer` and `embedding.head` then work on it as on every encoder
 (ViTs: their blocks must be in a `blocks` list).
 
-## 7. Adding a method preset
+## 8. Adding a method preset
 
 A preset is a recipe: a config that sets everything a method needs.
 ```yaml
@@ -320,7 +460,7 @@ lr: 1.0e-4
 the source of every value in its comments, and add a compose test (see
 `test_presets` in `tests/test_mae.py`).
 
-## 8. Before calling something done
+## 9. Before calling something done
 
 - Tests pass (`env/bin/python -m pytest tests -q`), with new tests for the new piece.
 - A tiny end-to-end run works (CPU is fine).

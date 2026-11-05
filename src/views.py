@@ -12,6 +12,11 @@ The task loss is the SAC critic/actor or the BC policy loss. The
 augmentation is drawn once per update; callers that encode the task view
 again later (SAC's actor phase) reuse Views.x_task rather than re-drawing.
 
+Image objectives (MoCo, MAE: needs_views) read views of the frames
+instead, which they encode themselves: with stage aux or both, independent
+draws of the augmentation (the first is the update's augmented view);
+otherwise the clean frames.
+
 Cost: when an aux loss reads the same view as the task loss, the task's
 encode is reused, so an update costs at most one encoder forward pass more
 than the task loss alone. A view is encoded with gradient only if the task
@@ -54,6 +59,9 @@ def encode_views(
     aux_needs_aug: bool,
     aux_grad_clean: Optional[bool] = None,
     aux_grad_aug: Optional[bool] = None,
+    aux_views: int = 0,
+    views_aug: bool = False,
+    autocast: Optional[Callable] = None,
 ) -> Views:
     """
     featurize(x, grad) -> features: the caller's encoder call on preprocessed
@@ -68,6 +76,11 @@ def encode_views(
     over detached when it shares the task's encode. None means "same as
     aux_needs_*": gradient wherever an aux loss reads, which is always
     correct but builds a graph for views a loss only uses as a target.
+
+    aux_views: how many views image objectives read (max needs_views);
+    views_aug: draw them from the augmentation (stage aux or both) rather
+    than passing the clean frames. autocast: the caller's mixed-precision
+    context, handed to the aux losses (AuxBatch.autocast).
     """
     if aux_grad_clean is None:
         aux_grad_clean = aux_needs_clean
@@ -79,7 +92,7 @@ def encode_views(
             f"aux loss reads (aux_needs_clean={aux_needs_clean}, "
             f"aux_needs_aug={aux_needs_aug})"
         )
-    if (task_aug or aux_needs_aug) and augment is None:
+    if (task_aug or aux_needs_aug or (aux_views and views_aug)) and augment is None:
         raise ValueError("augmented view requested but no augmentation is configured")
 
     x_aug = augment(x_clean) if (task_aug or aux_needs_aug) else None
@@ -101,12 +114,22 @@ def encode_views(
     if aux_needs_aug:
         feats_aug = f_shared_aux if task_aug else featurize(x_aug, aux_grad_aug)
 
+    views = None
+    if aux_views:
+        if views_aug:
+            first = x_aug if x_aug is not None else augment(x_clean)
+            views = [first] + [augment(x_clean) for _ in range(aux_views - 1)]
+        else:
+            views = [x_clean] * aux_views
+
     aux = AuxBatch(
         encoder=encoder,
         obs=x_clean if aux_needs_clean else None,
         obs_aug=x_aug if aux_needs_aug else None,
         feats=feats_clean,
         feats_aug=feats_aug,
+        views=views,
+        autocast=autocast,
     )
     return Views(x_task=x_task, feats_task=feats_task, aux=aux)
 

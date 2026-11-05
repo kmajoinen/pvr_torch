@@ -2,7 +2,7 @@
 
 What `pretrain.py` reads, how to get a dataset into that form, and how to
 check it. Behavioural-cloning datasets are a different thing (observations
-plus actions); see `GUIDE.md`, section 3.
+plus actions); see `GUIDE.md`, section 4.
 
 **In short:** a pretraining dataset is either **video clips** (a manifest CSV
 plus frames) or **images** (class folders, or shards). Convert your data
@@ -16,7 +16,7 @@ python pretrain.py +experiment=r3m pretrain_data=my_data pretrain_data.root=/pat
 
 | method | data | also needs |
 |---|---|---|
-| R3M (`+experiment=r3m`) | video clips | a text description per video (or `objectives.0.lang_weight=0`) |
+| R3M (`+experiment=r3m`, `r3m_vit`) | video clips | a text description per video (or `objectives.0.lang_weight=0`) |
 | VIP (`+experiment=vip`) | video clips | — |
 | MAE / MVP (`+experiment=mae`, `mvp`) | images (video frames work) | — |
 | MoCo v2 (`+experiment=moco_v2`) | images (video frames work) | — |
