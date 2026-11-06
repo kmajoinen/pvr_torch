@@ -7,3 +7,4 @@ image_size: 224   # native dm_control render resolution, matches the encoder's
                   # replay buffer for finetune runs -- see finetune buffer
                   # memory note in configs/config_sac.yaml.
 n_envs: 1         # >1 uses SubprocVecEnv (dm_control physics is CPU-bound)
+probe_episode_steps: 300   # probe_encoder.py: 50 random steps barely leave the start pose

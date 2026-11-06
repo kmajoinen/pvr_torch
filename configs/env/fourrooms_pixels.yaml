@@ -1,0 +1,11 @@
+# FourRooms (sparisi/gym_gridworlds) from rendered frames: fully observed, so
+# no frame stack. Discrete actions: needs a discrete agent. Random start,
+# fixed goal (bottom-right corner), so the frames only need to show where the
+# agent is. env.kwargs.random_goals=true moves the goal at every reset: from
+# state, DQN was still at ~35% greedy success after 200k steps.
+name: fourrooms_pixels
+builder: gym
+id: Gym-Gridworlds/FourRooms-13x13-v0
+image_size: 224
+kwargs:
+  random_goals: false

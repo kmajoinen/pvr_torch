@@ -50,55 +50,77 @@ def _repeat(env, action_repeat: int):
     return ActionRepeat(env, action_repeat) if action_repeat > 1 else env
 
 
-def _make_dmc(env_id: str, image_size: int, action_repeat: int = 1):
-    import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
+def _register_env_ids(env_id: str) -> None:
+    """Import the package that registers env_id, if Gymnasium doesn't already
+    know it (Pendulum, BipedalWalker: built in, so no MuJoCo/GL import)."""
+    if "dm_control" in env_id:
+        import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
+    elif "Gym-Gridworlds" in env_id:
+        import gym_gridworlds  # noqa: F401
+    elif env_id not in gym.registry:
+        import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
+
+
+def _wrap(env, wrappers):
+    """cfg.env.wrappers: observation wrappers by import path, applied right
+    after gym.make (e.g. gym_gridworlds' MatrixWithGoalWrapper, so a state
+    observation includes FourRooms' random goal)."""
+    import importlib
+    for path in wrappers or ():
+        module, name = str(path).rsplit(".", 1)
+        env = getattr(importlib.import_module(module), name)(env)
+    return env
+
+
+def _make_dmc(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
     from gymnasium.wrappers import AddRenderObservation
 
-    env = gym.make(
+    _register_env_ids(env_id)
+    env = _wrap(gym.make(
         env_id,
         render_mode="rgb_array",
         render_kwargs=dict(height=image_size, width=image_size, camera_id=0),
-    )
+        **env_kwargs,
+    ), wrappers)
     return AddRenderObservation(_repeat(env, action_repeat), render_only=True)
 
 
-def _make_carracing(env_id: str, image_size: int, action_repeat: int = 1):
-    return _repeat(gym.make(env_id, render_mode="rgb_array"), action_repeat)
+def _make_carracing(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
+    return _repeat(_wrap(gym.make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
 
 
-def _make_gym(env_id: str, image_size: int, action_repeat: int = 1):
+def _make_gym(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
     """Generic pixel builder for envs that don't natively emit pixel
     observations and don't support dm_control's render_kwargs convention
-    (Adroit hand envs, FrankaKitchen): render_mode="rgb_array" + swap the
-    observation for the rendered frame via AddRenderObservation, then
-    resize down to image_size. Unlike dm_control, these envs don't expose
-    a height/width render kwarg, so rendering itself always happens at the
-    env's native camera resolution (480x480 for Adroit) -- ResizeObservation
-    shrinks the frame post-render, before it reaches the replay buffer.
-    Without this, finetune mode (raw pixels in the buffer) stores every
-    frame at native resolution regardless of image_size, which is both
-    wasted memory (EmbeddingNet resizes to the encoder's input size
+    (Adroit hand envs, FrankaKitchen, Pendulum, BipedalWalker, FourRooms):
+    render_mode="rgb_array" + swap the observation for the rendered frame via
+    AddRenderObservation, then resize down to image_size. Unlike dm_control,
+    these envs don't expose a height/width render kwarg, so rendering itself
+    always happens at the env's native camera resolution (480x480 for Adroit)
+    -- ResizeObservation shrinks the frame post-render, before it reaches the
+    replay buffer. Without this, finetune mode (raw pixels in the buffer)
+    stores every frame at native resolution regardless of image_size, which
+    is both wasted memory (EmbeddingNet resizes to the encoder's input size
     anyway) and, at buffer_size=1_000_000, enough to OOM (480x480x3 x 1M
-    = 691 GB).
+    = 691 GB). Frames that aren't square (BipedalWalker's 600x400) are
+    squashed: the encoders' center crop would otherwise cut off the walker,
+    which sits left of center.
     """
-    import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
     from gymnasium.wrappers import AddRenderObservation, ResizeObservation
 
-    env = _repeat(gym.make(env_id, render_mode="rgb_array"), action_repeat)
+    _register_env_ids(env_id)
+    env = _repeat(_wrap(gym.make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
     env = AddRenderObservation(env, render_only=True)
     return ResizeObservation(env, (image_size, image_size))
 
 
-def _make_state(env_id: str, image_size: int, action_repeat: int = 1):
-    if "dm_control" in env_id:
-        import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
-    elif "Adroit" in env_id or "FrankaKitchen" in env_id:
-        import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
+def _make_state(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
+    _register_env_ids(env_id)
     # FlattenObservation: dm_control/FrankaKitchen/etc emit Dict observations
     # (separate proprioceptive components) natively -- ReplayBuffer needs a
     # flat obs_shape, and a Dict space has no .shape at all. Box-observation
     # envs (e.g. Pendulum-v1) pass through this wrapper as a no-op.
-    return gym.wrappers.FlattenObservation(_repeat(gym.make(env_id), action_repeat))
+    return gym.wrappers.FlattenObservation(_repeat(_wrap(gym.make(env_id, **env_kwargs), wrappers), action_repeat))
 
 
 ENV_BUILDERS = {
@@ -132,6 +154,13 @@ class _StackToChannels(gym.ObservationWrapper):
         return np.asarray(obs).transpose(1, 2, 0, 3).reshape(h, w, n * c)
 
 
+def env_kwargs(cfg) -> dict:
+    """cfg.env.kwargs: extra arguments for gym.make (e.g. FourRooms' random_goals)."""
+    from omegaconf import OmegaConf
+    kw = cfg.env.get("kwargs")
+    return OmegaConf.to_container(kw, resolve=True) if OmegaConf.is_config(kw) else dict(kw or {})
+
+
 def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     """
     wrap_encoder=True  -> frozen fast path: env emits feature vectors.
@@ -147,6 +176,8 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
     env = ENV_BUILDERS[cfg.env.builder](
         cfg.env.id, cfg.env.get("image_size", 84),
         action_repeat=int(cfg.algo.get("action_repeat", 1)),
+        wrappers=list(cfg.env.get("wrappers") or ()),
+        **env_kwargs(cfg),
     )
     frame_stack = cfg.embedding.get("frame_stack", 1) if cfg.env.builder != "state" else 1
     if frame_stack > 1 and cfg.embedding.get("name") is not None:
@@ -263,17 +294,21 @@ def _success_fn_for(env_id: str):
     return None
 
 
-def evaluate(act_fn, env, n_episodes: int, device, encode_fn=None, success_fn=None) -> dict:
+def evaluate(act_fn, env, n_episodes: int, device, encode_fn=None, success_fn=None, seeds=None) -> dict:
     """act_fn: (1, feat_dim) tensor -> (1, action_dim) deterministic action
     (SAC: the mean action; DrQ-v2: the policy mean).
     encode_fn: obs -> feature tensor (pixel path, where the env emits
     pixels); None when the env already emits features/state vectors.
     success_fn: see _success_fn_for(); None means no success-rate tracking
-    (that key is omitted from the returned dict entirely)."""
+    (that key is omitted from the returned dict entirely).
+    seeds: one reset seed per episode, to evaluate on fixed episodes; None
+    continues the env's own random stream."""
+    if seeds is not None and len(seeds) != n_episodes:
+        raise ValueError(f"evaluate: {len(seeds)} seeds for {n_episodes} episodes")
     returns = []
     successes = [] if success_fn is not None else None
-    for _ in range(n_episodes):
-        obs, _ = env.reset()
+    for i in range(n_episodes):
+        obs, _ = env.reset(seed=None if seeds is None else seeds[i])
         ep_return, done = 0.0, False
         ep_infos = [] if success_fn is not None else None
         while not done:
@@ -285,7 +320,10 @@ def evaluate(act_fn, env, n_episodes: int, device, encode_fn=None, success_fn=No
                 ).unsqueeze(0)
             with torch.no_grad():
                 action = act_fn(obs_t)
-            obs, reward, term, trunc, info = env.step(action.squeeze(0).cpu().numpy())
+            action = action.squeeze(0).cpu().numpy()
+            # A discrete action comes out 0-d: pass a plain int (gym_gridworlds
+            # looks actions up in a dict, which an ndarray can't key).
+            obs, reward, term, trunc, info = env.step(action.item() if action.ndim == 0 else action)
             ep_return += float(reward)
             if ep_infos is not None:
                 ep_infos.append(info)

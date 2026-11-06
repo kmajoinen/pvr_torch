@@ -3,3 +3,4 @@ builder: dmc
 id: dm_control/walker-walk-v0
 image_size: 224   # native dm_control render resolution; see dm_control_pixels.yaml
 n_envs: 1
+probe_episode_steps: 300   # probe_encoder.py: 50 random steps barely leave the start pose

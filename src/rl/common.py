@@ -67,7 +67,7 @@ def build_encoder_stack(cfg, enc, emb_kwargs, device, pixels_in_buffer: bool,
 
     net = EmbeddingNet(
         emb_name,
-        pretrained=True,
+        pretrained=bool(cfg.embedding.get("pretrained", True)),   # false: random weights (a control)
         train=enc.trains,
         disable_cuda=(str(device) == "cpu"),
         model_dir=cfg.model_dir,
@@ -310,20 +310,22 @@ def log_episode(info, step: int, wandb) -> None:
         )
 
 
-def log_eval(stats: dict, step: int, wandb) -> None:
+def log_eval(stats: dict, step: int, wandb, prefix: str = "eval", label: str = "EVAL") -> None:
+    """prefix: the wandb section (train_discrete.py's epsilon-greedy
+    evaluation logs under eval_eps/)."""
     print(
-        f"  step {step:>8,}  EVAL return={stats['return_mean']:.1f}"
-        f"±{stats['return_std']:.1f}"
+        f"  step {step:>8,}  {label} return={stats['return_mean']:.2f}"
+        f"±{stats['return_std']:.2f}"
         + (f"  success={stats['success_rate']:.2%}" if "success_rate" in stats else "")
     )
     if wandb is not None:
         log = {
-            "eval/mean_reward": stats["return_mean"],
-            "eval/std_reward": stats["return_std"],
+            f"{prefix}/mean_reward": stats["return_mean"],
+            f"{prefix}/std_reward": stats["return_std"],
             "global_step": step,
         }
         if "success_rate" in stats:
-            log["eval/success_rate"] = stats["success_rate"]
+            log[f"{prefix}/success_rate"] = stats["success_rate"]
         wandb.log(log, step=step)
 
 
@@ -346,6 +348,23 @@ def encoder_log(enc, stack: EncoderStack, eo: "EncoderOptim", collapse, enc_gnor
                 log[f"train/aux/{name}"] = value
     return log
 
+def embedding_tag(cfg, net) -> str:
+    """The encoder's part of a run name: its name, cut layer, head and frame
+    stack, and -scratch for random weights (embedding.pretrained=false with
+    no checkpoint), so a control doesn't share a pretrained run's name."""
+    tag = cfg.embedding.get("name") or "state"
+    if cfg.embedding.get("pretrained", True) is False and not cfg.embedding.get("checkpoint"):
+        tag += "-scratch"
+    layer = cfg.embedding.get("layer")
+    if layer is not None:
+        tag += f"-L{layer}" if isinstance(layer, int) else f"-{layer}"
+    if cfg.embedding.get("head") is not None:
+        tag += f"-{cfg.embedding.head}"
+    if net is not None and net.frame_stack > 1:
+        tag += f"-fs{net.frame_stack}{net.frame_fusion}"
+    return tag
+
+
 def init_wandb(cfg, algo: str, enc, stack: EncoderStack):
     """Start the wandb run (after the encoder is built: the buffer decision
     can still change there, and the run name and logged config should
@@ -360,14 +379,7 @@ def init_wandb(cfg, algo: str, enc, stack: EncoderStack):
     import wandb
 
     net = stack.net
-    emb_tag = cfg.embedding.get("name") or "state"
-    layer = cfg.embedding.get("layer")
-    if layer is not None:
-        emb_tag += f"-L{layer}" if isinstance(layer, int) else f"-{layer}"
-    if cfg.embedding.get("head") is not None:
-        emb_tag += f"-{cfg.embedding.head}"
-    if net is not None and net.frame_stack > 1:
-        emb_tag += f"-fs{net.frame_stack}{net.frame_fusion}"
+    emb_tag = embedding_tag(cfg, net)
     tags = ""
     if enc.trains:
         tags += "_ft-" + "-".join([enc.grads] + enc.aux_names)

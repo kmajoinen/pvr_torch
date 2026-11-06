@@ -1,0 +1,8 @@
+# BipedalWalker-v3 from rendered frames (needs Box2D, see requirements.txt).
+# One frame shows no velocity: use +embedding.frame_stack=3. The state version's
+# lidar and joint speeds aren't visible, so this is harder than from state.
+name: bipedal_walker_pixels
+builder: gym
+id: BipedalWalker-v3
+image_size: 224
+probe_episode_steps: 300   # probe_encoder.py: 50 random steps barely leave the start pose

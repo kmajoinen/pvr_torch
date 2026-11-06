@@ -1,0 +1,6 @@
+# Pendulum-v1 from rendered frames. One frame shows no velocity: use
+# +embedding.frame_stack=3.
+name: pendulum_pixels
+builder: gym
+id: Pendulum-v1
+image_size: 224

@@ -217,6 +217,7 @@ def main(cfg: DictConfig) -> None:
 
         embedding = EmbeddingNet(
             emb_name,
+            pretrained=bool(cfg.embedding.get("pretrained", True)),   # false: random weights (a control)
             train=encoder_trains,
             disable_cuda=(str(device) == 'cpu'),
             model_dir=cfg.model_dir,

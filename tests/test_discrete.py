@@ -13,7 +13,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from src.rl.discrete import DQN, DiscreteSAC, linear_schedule
+from src.rl.discrete import DQN, DiscreteSAC, epsilon_greedy, linear_schedule
 
 CONFIG_DIR = str(Path(__file__).resolve().parents[1] / "configs")
 ROOT = str(Path(CONFIG_DIR).parent)
@@ -50,8 +50,8 @@ def test_dqn_target(double):
 
 
 def test_dqn_explores_by_epsilon():
-    agent = DQN(5, 4, _algo("dqn", **{"epsilon.start": 1.0, "epsilon.end": 0.0, "epsilon.duration": 100}),
-                obs_norm=False)
+    agent = DQN(5, 4, _algo("dqn", total_timesteps=200,
+                            **{"epsilon.start": 1.0, "epsilon.end": 0.0, "epsilon.fraction": 0.5}), obs_norm=False)
     feats = torch.randn(4000, 5)
     greedy = agent.act(feats, 0, explore=False)
     assert agent.epsilon(0) == 1.0 and agent.epsilon(50) == pytest.approx(0.5) and agent.epsilon(500) == 0.0
@@ -142,6 +142,51 @@ def test_evaluate_passes_a_discrete_action_as_an_int():
             return np.zeros(2, np.float32), 1.0, False, self.t >= 3, {}
     stats = evaluate(lambda o: torch.tensor([2]), Env(), 2, "cpu")
     assert stats["return_mean"] == 3.0
+
+
+def test_evaluate_resets_to_the_given_seeds():
+    pytest.importorskip("gym_gridworlds")
+    from src.sac_utils import _make_state, evaluate
+    env = _make_state("Gym-Gridworlds/FourRooms-13x13-v0", 0,
+                      wrappers=["gym_gridworlds.observation_wrappers.MatrixWithGoalWrapper"])
+
+    def observations(seeds):
+        seen = []
+
+        def act(o):
+            seen.append(o.clone())
+            return torch.tensor([len(seen) % 4])                             # cycles through the moves
+        evaluate(act, env, len(seeds), "cpu", seeds=seeds)
+        return torch.stack(seen)
+    first = observations([3, 4, 5])
+    assert torch.equal(observations([3, 4, 5]), first)                       # same episodes, step for step
+    assert not torch.equal(observations([6, 7, 8])[0], first[0])             # other seeds, another start/goal
+    act = lambda o: torch.tensor([0])  # noqa: E731
+    with pytest.raises(ValueError, match="2 seeds for 3"):
+        evaluate(act, env, 3, "cpu", seeds=[1, 2])
+
+
+def test_epsilon_greedy_uses_its_own_generator():
+    greedy = lambda f: torch.zeros(len(f), dtype=torch.long)  # noqa: E731
+    feats = torch.randn(4000, 5)
+    torch.manual_seed(0)
+    want = torch.rand(3)
+    torch.manual_seed(0)
+    acts = epsilon_greedy(greedy, 4, 0.5, torch.Generator().manual_seed(1))(feats)
+    assert torch.equal(torch.rand(3), want)                                  # global stream untouched
+    assert (acts == 0).float().mean().item() == pytest.approx(0.5 + 0.5 / 4, abs=0.04)
+    assert torch.equal(epsilon_greedy(greedy, 4, 0.0, torch.Generator())(feats), greedy(feats))
+
+
+def test_epsilon_greedy_evaluation_logs_its_own_keys():
+    from src.rl.common import log_eval
+
+    class Wandb:
+        def log(self, d, step):
+            self.d = d
+    w = Wandb()
+    log_eval({"return_mean": 0.5, "return_std": 0.1, "success_rate": 0.5}, 10, w, prefix="eval_eps")
+    assert set(w.d) == {"eval_eps/mean_reward", "eval_eps/std_reward", "eval_eps/success_rate", "global_step"}
 
 
 def test_continuous_envs_are_refused():

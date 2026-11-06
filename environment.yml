@@ -9,7 +9,6 @@ dependencies:
   - wheel
   - git                          # required by the git+https requirements below
   - ffmpeg                       # RecordVideo / moviepy backend
-  - swig                         # box2d-py builds from source and needs it
 
   - pip:
     # ── Core ML ────────────────────────────────────────────────────────────────
@@ -28,7 +27,9 @@ dependencies:
     - shimmy[dm-control]==2.0.1     # DMC → gymnasium bridge
     - mujoco==3.8.1                 # pinned: 3.9+ breaks dm_control 1.0.41
     - opencv-python-headless==5.0.0.93  # needed by ResizeObservation wrapper
-    - box2d-py==2.3.5               # CarRacing-v3, needs conda `swig` above
+    - --only-binary=Box2D           # a prebuilt wheel: box2d-py's source build fails
+    - Box2D                         # BipedalWalker, CarRacing
+    - git+https://github.com/sparisi/gym_gridworlds   # FourRooms
     - pygame>=2.6                   # box2d/classic-control rendering
 
     # ── Vision models ──────────────────────────────────────────────────────────
@@ -77,3 +78,4 @@ dependencies:
     - moviepy>=2.0
     - GitPython==3.1.46
     - ipykernel                     # for Open OnDemand Jupyter against this env
+    - pytest==9.1.1                 # python -m pytest tests

@@ -1,0 +1,12 @@
+# FourRooms from its true state: the agent's and the goal's cells as a
+# 13x13x2 grid (gym_gridworlds' MatrixWithGoalWrapper; the plain observation,
+# the agent's cell index alone, doesn't show a random goal). Flattened: 338.
+# Random start, fixed goal (bottom-right corner); env.kwargs.random_goals=true
+# moves the goal at every reset, a much harder task (see fourrooms_pixels.yaml).
+name: fourrooms_state
+builder: state
+id: Gym-Gridworlds/FourRooms-13x13-v0
+kwargs:
+  random_goals: false
+wrappers:
+  - gym_gridworlds.observation_wrappers.MatrixWithGoalWrapper

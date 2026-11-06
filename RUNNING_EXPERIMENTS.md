@@ -20,6 +20,10 @@ how to extend the repo is in `GUIDE.md`.
   frames: MAE as in MVP), producing a checkpoint the scripts above load as
   an embedding. Config: `configs/config_pretrain.yaml`. See
   [Pretraining](#pretraining-pretrainpy).
+- **`train_discrete.py`** — discrete actions (FourRooms): DQN (`algo=dqn`,
+  default) or discrete SAC (`algo=sac_discrete`), with the same encoder,
+  augmentation, buffer and wandb setup as `train_sac.py`. Config:
+  `configs/config_discrete.yaml`. See [Discrete actions](#discrete-actions-train_discretepy).
 - **`train_bc.py`** — behavioral cloning from offline datasets (V-D4RL,
   Minari, pickled trajectories), with the same `encoder.*`/`augmentation`
   options (BC: `encoder.grads` is `none | policy`). Config:
@@ -54,6 +58,18 @@ Only `configs/env/*.yaml` files that have a `builder:` field work with
 - `pendulum.yaml` (`builder: state`, `Pendulum-v1`)
 - `adroit_door_pixels.yaml` / `adroit_door_state.yaml`, and the same `_pixels`/`_state` pair for `adroit_hammer`, `adroit_pen`, `adroit_relocate` (`builder: gym`/`state`)
 - `franka_kitchen_pixels.yaml` / `franka_kitchen_state.yaml` (`builder: gym`/`state`)
+- `pendulum_pixels.yaml` (`builder: gym`; use `+embedding.frame_stack=3`, one frame shows no velocity)
+- `bipedal_walker_pixels.yaml` / `bipedal_walker_state.yaml` (`builder: gym`/`state`; needs Box2D:
+  `pip install --only-binary :all: Box2D`; `box2d-py`'s source build fails on Python 3.11). Frames are 600x400, squashed
+  to square, since the encoders' center crop would otherwise cut off the walker
+- `fourrooms_pixels.yaml` / `fourrooms_state.yaml` (`builder: gym`/`state`,
+  `Gym-Gridworlds/FourRooms-13x13-v0`; needs `pip install git+https://github.com/sparisi/gym_gridworlds`).
+  Discrete actions: `train_discrete.py`. The state version is the agent's and the goal's cells
+  (338 numbers), through `env.wrappers` (observation wrappers by import path). Random start,
+  fixed goal (bottom-right corner); `env.kwargs.random_goals=true` moves the goal at every
+  reset, which from state took DQN past 200k steps (still ~35% greedy success there)
+
+`env.kwargs` passes extra arguments to `gym.make`, e.g. `env.kwargs.random_goals=true` for FourRooms.
 
 The old `adroit_*.yaml`/`franka_kitchen.yaml`/`dmc_cheetah.yaml` files (only `id:`, no
 `builder:`) are still there, untouched, for `train_sac_sb3.py`'s universal
@@ -306,6 +322,27 @@ it looks for `/scratch/.../ckpts/resnet50_l3.*`. **Crashes loudly** if
 Only checkpoint-file-based embeddings honor `model_dir` — `resnet18/34/50`
 (plain, non-`_l3`/`_l4`/`_places` versions), `clip_*`, `openclip_*`, and
 `r3m_*` never consult it; they always use their own package's loader/cache.
+
+## Checking an encoder sees the task: `probe_encoder.py`
+
+Before spending RL time: does an encoder's output carry an environment's true
+state? It collects frames from a random policy, encodes them through the
+training input pipeline, fits a ridge regression and a small MLP to the true
+state, and reports R² on held-out episodes (FourRooms: also tiles off and how
+often the exact cell comes out). The MLP matters for speeds, which aren't a
+linear function of stacked per-frame features. Pass the run's
+`algo.action_repeat`, so stacked frames are as far apart as in training. Same `env=` and `embedding=` options as `train_sac.py`; takes
+minutes; results print and go to `probe.json`.
+```bash
+python probe_encoder.py env=fourrooms_pixels embedding=resnet18
+python probe_encoder.py env=dm_control_pixels embedding=custom_checkpoint embedding.arch=resnet50 \
+    embedding.checkpoint=$RUN/encoder_step1000000.pt embedding.name=r3m50_ours +embedding.frame_stack=3
+python probe_encoder.py env=pendulum_pixels embedding=resnet18 embedding.pretrained=false   # random weights, a control
+```
+A random policy doesn't reach everything a trained one does, so this shows the
+information is there; it doesn't predict returns, and it can't show pretraining
+helps (random weights score well on it). `embedding.pretrained=false`
+gives frozen random weights in the RL scripts too, tagged `-scratch` in run names.
 
 ## Encoder training and augmentation
 
@@ -589,6 +626,62 @@ each episode's real final observation, so a truncated episode (time limit)
 bootstraps from its own last state; before, its last transition's next_obs
 was the next episode's first frame. n-step returns never cross an episode
 end, and a terminated step gets discount 0.
+
+## Discrete actions (`train_discrete.py`)
+
+DQN or discrete SAC (`src/rl/discrete.py`) for environments with discrete
+actions, on the same encoder, augmentation, replay buffer, wandb and timing
+setup as `train_sac.py`:
+
+```bash
+python train_discrete.py env=fourrooms_pixels embedding=resnet18                  # DQN, frozen encoder
+python train_discrete.py algo=sac_discrete env=fourrooms_pixels embedding=resnet18
+python train_discrete.py env=fourrooms_state embedding=none                        # from state
+python train_discrete.py env=fourrooms_pixels embedding=resnet18 encoder.grads=critic
+```
+
+- **DQN** (`configs/algo/dqn.yaml`): double DQN on n-step targets
+  (`algo.nstep: 3`), Huber loss (`algo.loss`), epsilon-greedy exploration
+  annealed linearly over the first `algo.epsilon.fraction` of the run
+  (`algo.epsilon.{start,end,fraction}`), a hard target copy
+  every `algo.target_network_frequency` steps (`algo.tau < 1` for Polyak),
+  `algo.double=false` for plain DQN.
+- **Discrete SAC** (`configs/algo/sac_discrete.yaml`; Christodoulou 2019): a
+  softmax policy and twin Q-networks over all actions, so the soft value and
+  policy loss are exact expectations over actions; the temperature is tuned
+  towards `target_entropy_scale × log(n_actions)` (0.5; CleanRL's `sac_atari`
+  uses 0.89, which with 4 actions keeps the training policy taking its best
+  action only ~50% of the time). Evaluation takes the most likely action.
+  Where reaching the goal ends the episode (FourRooms), the entropy bonus is
+  a reward for staying alive: about `alpha × entropy / (1 − gamma)` when the
+  time limit is bootstrapped, forfeited at the goal. Keep
+  `algo.alpha × log(n_actions) / (1 − gamma)` well below the goal reward, or
+  the agent first learns to avoid the goal until the temperature has decayed
+  (at `alpha: 0.2`, `gamma: 0.99`, 4 actions that's ~28 against +1, and
+  FourRooms from state scored 0% until ~18k steps on every seed). The default
+  `alpha: 0.001` (~0.14) reaches 100% by 12.5k on every seed; the autotuned
+  temperature then settles near 0.007 whatever it starts from.
+- **Encoder**: `encoder.grads` is `none | critic` -- the critic loss (DQN's
+  TD loss, discrete SAC's twin-Q loss) can train the encoder; discrete SAC's
+  actor reads detached features. `encoder.aux`, augmentation, `buffer_obs`,
+  `embedding.pretrained` and frame stacks work as in `train_sac.py`;
+  `augmentation.strong` isn't supported.
+- **Updates**: one every `algo.train_frequency` env steps, `algo.gradient_steps`
+  each time.
+- **Metrics** reuse `train_sac.py`'s keys where they mean the same thing; DQN
+  adds `train/epsilon` and `train/q_max_mean`.
+- **Evaluation**: greedy (`eval/*`, which picks `best_agent.pt`), plus, with
+  `algo.eval_epsilon > 0` (default 0.05, as Nature DQN), an epsilon-greedy
+  run logged as `eval_eps/*`: a greedy policy that walks into one wall stays
+  there until the time limit, so the greedy number alone can read as total
+  failure. Both passes, and every evaluation of the run, reset to the same
+  `algo.n_episodes_test` (50) episodes, from fixed seeds drawn from `seed`, so
+  differences between them are the policy's, not the episodes'; the
+  epsilon coins come from their own generator, so turning
+  `algo.eval_epsilon` on doesn't change training. FourRooms' only reward is +1 at
+  the goal, so `eval/mean_reward` is its success rate and
+  `charts/episodic_length` its steps to the goal (a random policy: 25%
+  success, ~171 steps with the fixed goal; 32%, ~158 with random goals).
 
 ## Behavioral cloning (`train_bc.py`)
 

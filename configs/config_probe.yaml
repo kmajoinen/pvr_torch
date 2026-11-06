@@ -1,0 +1,15 @@
+# probe_encoder.py: config_sac's env and embedding choices, plus the probe's settings.
+defaults:
+  - config_sac
+  - _self_
+
+probe:
+  frames: null              # random-policy frames (null: enough for 20 episodes, at least 5000)
+  episode_steps: null       # reset after this many (null: the env config's probe_episode_steps,
+                            #   for physics tasks starting from one pose, else 50)
+  test_fraction: 0.2        # the last episodes are held out
+  batch_size: 64
+
+hydra:
+  run:
+    dir: outputs/probe/${env.name}/${embedding.name}/${now:%Y-%m-%d_%H-%M-%S}
