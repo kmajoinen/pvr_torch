@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 import torch
 
+import src.rl.buffer as buffer
 from src.rl.buffer import ReplayBuffer as _ReplayBuffer
+from src.rl.buffer import fs_type as _fs_type
 
 GAMMA = 0.5
 
@@ -15,8 +17,11 @@ GAMMA = 0.5
                 ids=lambda p: "-".join(p))
 def compression(request, monkeypatch, tmp_path):
     """Every test runs on raw and compressed storage (zlib: always available),
-    each in RAM and on disk."""
+    each in RAM and on disk. pytest's folders count as a real disk: on
+    diskless cluster nodes /tmp is RAM (tmpfs), which disk storage refuses
+    (test_disk_storage_refuses_a_ram_backed_folder checks that)."""
     import functools
+    monkeypatch.setattr(buffer, "fs_type", lambda path, mounts="/proc/mounts": "ext4")
     comp, storage = request.param
     monkeypatch.setitem(globals(), "ReplayBuffer",
                         functools.partial(_ReplayBuffer, compression=comp, decode_threads=2,
@@ -243,7 +248,7 @@ def test_a_ram_buffer_must_fit_the_jobs_memory(monkeypatch, tmp_path, capsys, kw
 
 
 def test_fs_type_picks_the_longest_mount_prefix(tmp_path):
-    from src.rl.buffer import fs_type
+    fs_type = _fs_type                                           # the real one, not the fixture's
     mounts = tmp_path / "mounts"
     mounts.write_text("/dev/sda1 / ext4 rw 0 0\n"
                       "tmpfs /tmp tmpfs rw 0 0\n"
@@ -258,7 +263,6 @@ def test_fs_type_picks_the_longest_mount_prefix(tmp_path):
 
 @pytest.mark.parametrize("fstype", ["tmpfs", "ramfs"])
 def test_disk_storage_refuses_a_ram_backed_folder(tmp_path, monkeypatch, fstype):
-    import src.rl.buffer as buffer
     monkeypatch.setattr(buffer, "fs_type", lambda path, mounts="/proc/mounts": fstype)
     with pytest.raises(ValueError, match=f"on {fstype}, which is RAM"):
         _ReplayBuffer(100, (8, 8, 3), 1, "cpu", obs_dtype=np.uint8, storage="disk", storage_dir=str(tmp_path))
