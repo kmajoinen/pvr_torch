@@ -16,7 +16,7 @@ final_crop: null              # clips: {resize, crop} after augmentation, in val
                               #   too: resize the shorter side, then center-crop (VIP's
                               #   loader: {resize: 256, crop: 224})
 
-batch_size: 16                # videos / images per batch
+batch_size: 16                # videos / images per batch, the total across GPUs
 schedule:                     # how batches are drawn and used:
   sampling: null              #   sweep: each item once per epoch, fresh order | random: uniform,
                               #   with replacement (null: clips random, as R3M; images sweep)
@@ -50,7 +50,7 @@ lr_schedule:
   gamma: 0.1
   total: null                 # cosine: length (null: the whole run)
 grad_clip: null               # null: no clipping (the norm is still logged)
-num_workers: 10               # data-loader processes (JPEG decoding)
+num_workers: 10               # data-loader processes (JPEG decoding), per GPU
 
 log_frequency: 100            # steps; logged values are averages over the interval
 eval_frequency: 20_000        # steps between validations (clips: one batch; images: the
@@ -82,6 +82,8 @@ perf:
   tf32: true
   cudnn_benchmark: true
   amp_bf16: false             # bf16 autocast for the encoder forward
+  ddp_find_unused: false      # several GPUs: allow parameters a loss doesn't use (DDP's error
+                              #   says when; costs a graph walk per step)
 
 hydra:
   job:

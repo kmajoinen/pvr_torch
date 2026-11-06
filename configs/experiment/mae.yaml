@@ -6,7 +6,7 @@
 # and norm weights), lr 1.5e-4 per 256 images, 40 warmup epochs then a half
 # cosine to 0 (updated every step), 800 epochs; random resized crop (scale
 # 0.2-1, bicubic) and horizontal flip. The official batch is 4096 across
-# GPUs; here batch_size is one GPU's, and the lr scales with it. Video
+# GPUs; here batch_size is the total too, and the lr scales with it. Video
 # frames instead of ImageNet: +experiment=mvp.
 #   python pretrain.py +experiment=mae pretrain_data.root=/path/to/imagenet
 #   python pretrain.py +experiment=mae embedding=vit_s16 epochs=100 ...

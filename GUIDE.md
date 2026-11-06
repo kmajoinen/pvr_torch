@@ -84,7 +84,8 @@ epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
 - data: `run_prepare_ssv2.sh` (the one-time SSv2 conversion);
 - downstream: `run_sac.sh` / `run_ft_sac.sh` (SAC), `run_ft_r3m.sh` (SAC on
   your own R3M encoder), `run_ft_bc.sh` (BC);
-- `debug_*.sh`: short smoke tests.
+- `debug_*.sh`: short smoke tests (`debug_ddp.sh`: the same short run on 1
+  and 2 GPUs, to compare).
 
 `*.sh` files are gitignored: `git add -f` a script to keep it in the repo.
 
@@ -99,9 +100,15 @@ epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
   the real job gets); `data_wait` shows whether the loader keeps up, and for
   clip objectives `profile_pretrain.py` breaks a step down.
 
-**Multi-GPU.**
-- Not implemented yet: one GPU per run. Planned: DDP via `torchrun`
-  (`TODO.md`).
+**Multi-GPU.** `pretrain.py` runs on several GPUs of one node for
+`supervised` and `mae` (`RUNNING_EXPERIMENTS.md`, "Multi-GPU pretraining"):
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 pretrain.py \
+    +experiment=mae hydra.run.dir=$WRKDIR/pretrain_runs/mae_4gpu batch_size=1024 ...
+```
+`batch_size` is the total, `num_workers` per GPU. Other objectives, and the
+RL/BC scripts, use one GPU. An objective declares it works per GPU with
+`multi_gpu = True` (`src/losses.py`).
 
 ## 3. The encoder in RL and BC
 

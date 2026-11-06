@@ -13,11 +13,24 @@ batches in turn, starting with worker 0, so a fresh loader started after
 start_batch batches gets batch start_batch + k from worker k % workers. This
 covers which items come next, not what's drawn from each (a clip's frames,
 crops): those use the workers' RNGs, reseeded on resume so they don't repeat.
+
+With several GPUs (one process each), the same split runs over every worker of
+every process (split_across_processes), so no two workers read the same items.
 """
 
 import math
 
 import numpy as np
+
+
+def split_across_processes(wid: int, workers: int, start_batch: int, rank: int, world: int):
+    """(wid, workers, start_batch) for the streams below, treating the workers
+    of all processes as one pool. Each process draws one batch per step, so
+    process `rank`'s s-th batch is number s * world + rank overall, and
+    start_batch steps mean start_batch * world batches. A process's worker i
+    then keeps the role it needs for its batches: each process alone hands out
+    whole batches in turn, as above."""
+    return wid * world + rank, workers * world, start_batch * world
 
 
 def epoch_stream(n: int, seed: int, wid: int, workers: int, start_batch: int, batch_size: int):

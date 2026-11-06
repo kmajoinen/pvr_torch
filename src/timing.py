@@ -289,10 +289,11 @@ def benchmark_stop_step(bench: int, base: int, log_frequency: int) -> int:
 
 def timer_from_config(cfg, total_steps: int, eval_every, warmup_steps: int, run_dir: str, info: dict,
                       t_script: float, start_step: int = 0, final_eval: bool = False,
-                      save_per_eval: bool = False, log_frequency: int = 1):
+                      save_per_eval: bool = False, log_frequency: int = 1, main_process: bool = True):
     """(RunTimer, benchmark_steps) from cfg.timing ({enabled, benchmark_steps});
     benchmark mode turns timing on regardless. A resumed run (start_step > 0)
-    carries over the time its earlier jobs recorded in timing.json."""
+    carries over the time its earlier jobs recorded in timing.json. With several
+    processes only the main one times anything or writes files."""
     tcfg = cfg.get("timing") or {}
     bench = tcfg.get("benchmark_steps")
     if bench:
@@ -318,7 +319,8 @@ def timer_from_config(cfg, total_steps: int, eval_every, warmup_steps: int, run_
     # A benchmark writes its own file: timing.json is what the next job of a
     # resumed run reads as its earlier jobs' time.
     timer = RunTimer(total_steps, eval_every=eval_every, warmup_steps=warmup_steps, start_step=start_step,
-                     path=os.path.join(run_dir, "timing_benchmark.json") if bench else path, info=info, enabled=bool(tcfg.get("enabled", True)) or bool(bench),
+                     path=os.path.join(run_dir, "timing_benchmark.json") if bench else path, info=info,
+                     enabled=(bool(tcfg.get("enabled", True)) or bool(bench)) and main_process,
                      final_eval=final_eval, save_per_eval=save_per_eval, prior_seconds=prior)
     if bench:
         print(f"Benchmark mode: {int(bench):,} training steps after the warm-up, one evaluation, "

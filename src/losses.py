@@ -54,6 +54,11 @@ Contract:
     replay/dataset frames: independent draws of the run's augmentation when
     its stage is aux or both, otherwise the clean frames (so needs_views >= 2
     requires such an augmentation).
+  - multi_gpu = True declares that the loss works with each GPU computing it
+    on its own share of the batch, gradients being averaged (pretrain.py on
+    several GPUs, src/distributed.py). True when each sample's loss doesn't
+    depend on the rest of the batch; losses that compare samples within the
+    batch (negatives, queues) need gathering across GPUs first.
   - moves_encoder = False declares a loss that only pulls the encoder
     toward a reference (l2sp: its starting weights; ema_consistency: its
     own moving average), so its gradient is zero until something else moves
@@ -139,6 +144,7 @@ class AuxLoss(nn.Module):
     needs_views: int = 0
     needs_labels: bool = False
     moves_encoder: bool = True
+    multi_gpu: bool = False
 
     def __init__(self, encoder: nn.Module):
         super().__init__()
@@ -769,6 +775,7 @@ class Supervised(AuxLoss):
     stays a feature extractor."""
     needs_views = 1
     needs_labels = True
+    multi_gpu = True
 
     @classmethod
     def check_params(cls, num_classes=1000, label_smoothing=0.0) -> None:
@@ -924,6 +931,7 @@ class MAE(AuxLoss):
     MAE's full one; a smaller one (decoder_depth=2..4) is cheaper per update.
     """
     needs_views = 1
+    multi_gpu = True
 
     @classmethod
     def check_params(cls, mask_ratio=0.75, norm_pix_loss=True, decoder_dim=512, decoder_depth=8,

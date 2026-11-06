@@ -38,7 +38,7 @@ python pretrain.py +experiment=<x> pretrain_data=<y> embedding=<z> augmentation=
 | **data** (*y*) | `pretrain_data=` | Something-Something v2 as video clips + text, SSv2 frames as images, ImageNet-1k, any ImageFolder-layout image set | Ego4D-style data (needs a prep script) |
 | **architecture** (*z*) | `embedding=` | ResNet-18/34/50; small 5-layer CNN; ViT-S/16, ViT-B/16, ViT-L/16 (MAE layout); DINOv2 and OpenCLIP ViTs experimental | — |
 | **augmentation** (*k*) | `augmentation=` | 8 transforms (plus `none`), combinable into pipelines; presets for R3M/VIP and MoCo v2 | — |
-| supporting options | optimizer, schedule, precision | Adam, AdamW, SGD; constant / cosine / step with warmup, MAE's warmup-cosine; bf16; gradient clipping; sweep or random sampling, several updates per batch (`schedule.*`); run length in epochs, steps or total images (`train_images`); run-time estimates and a benchmark mode (`timing.*`) | multi-GPU (DDP) |
+| supporting options | optimizer, schedule, precision | Adam, AdamW, SGD; constant / cosine / step with warmup, MAE's warmup-cosine; bf16; gradient clipping; sweep or random sampling, several updates per batch (`schedule.*`); run length in epochs, steps or total images (`train_images`); run-time estimates and a benchmark mode (`timing.*`); several GPUs on one node for supervised and MAE/MVP (experimental) | several GPUs for MoCo, R3M, VIP |
 
 ## 3. Which algorithm accepts which data
 
@@ -215,10 +215,13 @@ run's `embedding.yaml` lists every field.)
   head from its checkpoint; otherwise the run stops at startup.
 
 **Compute and evaluation**
-- One GPU per run (no multi-GPU/DDP). This caps the batch size (MAE's
-  official batch is 4096; here 256 with the learning rate scaled), makes
-  long runs slow (R3M ResNet-50: ~23 h for 1M steps; VIP's 2M steps at
-  batch 32 longer), and MoCo's multi-GPU BatchNorm shuffle is emulated.
+- Several GPUs on one node (DDP) work for supervised and MAE/MVP only, and
+  only on CPU so far (`tests/test_distributed.py`; `debug_ddp.sh` is the GPU
+  check, not yet run). MoCo, R3M and VIP compare samples within a batch, so
+  they still run on one GPU: long runs stay slow there (R3M ResNet-50: ~23 h
+  for 1M steps; VIP's 2M steps at batch 32 longer), and MoCo's multi-GPU
+  BatchNorm shuffle is emulated. One GPU caps MAE's batch (official: 4096;
+  256 here with the learning rate scaled).
 - Validation during clip pretraining is one batch, so the curves are noisy.
   Image runs validate on the validation split (or a fixed number of batches).
 - The quality of an encoder is only measured downstream (RL/BC), where

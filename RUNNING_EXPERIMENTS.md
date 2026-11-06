@@ -805,6 +805,55 @@ epochs / train_steps / train_images   # run length: epochs, updates, or samples 
 - The startup log prints the schedule: sampling, batches per epoch, updates
   per batch.
 
+### Multi-GPU pretraining
+
+One process per GPU on one node (DDP, `src/distributed.py`), started by
+PyTorch's launcher:
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=4 pretrain.py \
+    +experiment=mae pretrain_data.root=... hydra.run.dir=$WRKDIR/pretrain_runs/mae_4gpu \
+    batch_size=1024 num_workers=15
+```
+In a job: `--gpus=4`, about 16 CPUs per GPU, and `srun` in front of the same
+line.
+- **Which objectives:** `supervised` and `mae` (so `+experiment=imagenet_supervised`,
+  `mae`, `mvp`). MoCo, R3M and VIP compare samples within a batch
+  (negatives, a queue), which would need gathering across GPUs, so they're
+  refused with more than one process.
+- **`batch_size` is the total** across GPUs, so the same config gives the same
+  recipe on any number of GPUs; each GPU takes `batch_size / GPUs`, which
+  must divide evenly. Epochs, `train_images` and `lr_reference_batch` all
+  use the total, so scaling up is deliberate: e.g. `batch_size=1024` on 4
+  GPUs gives MAE/MVP 4x the learning rate (linear scaling) and a quarter of
+  the steps. `num_workers` is per GPU.
+- **`hydra.run.dir` must be a fixed folder:** every process runs Hydra, and a
+  timestamped default could differ between them (checked at startup).
+- **Data:** each GPU reads its own share of every batch; a sweep still sees
+  every image once per epoch, and resuming continues exactly with the same
+  GPU count (a different count warns, as a changed `num_workers` does).
+- **What rank 0 alone does:** printing, wandb, validation, checkpoints,
+  `timing.json`; the others wait (up to 30 minutes, the limit on any wait
+  between GPUs, after which a hung job fails). Validation runs at the per-GPU
+  batch size, with `pretrain_data.eval_batches` scaled by the GPU count, so
+  it covers the same number of images as on one GPU. Logged training values
+  are averaged over GPUs. Augmentation and MAE masks are drawn independently
+  per GPU (rank 0's draws are those of a single-GPU run).
+- **BatchNorm** (ResNets) normalises per GPU, over `batch_size / GPUs`
+  images, as in torchvision's own multi-GPU training; rank 0's running
+  statistics are copied to the others at each step. No synced BatchNorm yet.
+- **`perf.ddp_find_unused=true`** if DDP stops on parameters that get no
+  gradient (it names them); MAE on `vit_*` and supervised ResNets don't need
+  it.
+- **Status:** tested on CPU (several processes with gloo): the gradient
+  equals the single-process one on the full batch, data split and resume
+  are exact (`tests/test_distributed.py`). Not yet run on GPUs:
+  `debug_ddp.sh` runs the same 1000 steps on 1 and 2 GPUs to compare loss and
+  `steps/s`. Both runs train on the whole total batch per step, so `steps/s`
+  (per log interval) compares directly. Losses should be close, not equal:
+  BatchNorm sees half the batch per GPU and rank 1 draws other crops. If the
+  2-GPU run's `data_wait` is clearly higher, the loader limits it: more CPUs
+  per GPU, not code.
+
 ### ImageNet (supervised, MoCo v2)
 
 ```bash
@@ -874,7 +923,7 @@ both views encoded in chunks of 32, the keys after a random permutation).
 Implemented from the papers, not the official code (its license is
 non-commercial).
 
-**Compute.** One GPU for now (multi-GPU DDP is a planned follow-up). The
+**Compute.** One GPU, or several (see "Multi-GPU pretraining"). The
 supervised ResNet-18 run (90 epochs, 450k steps, bf16, `run_imagenet.sh`)
 took 10 h 20 min; ResNet-50 is several times that -- watch `data_wait`; `perf.amp_bf16=true` and
 `--short-side 256` help. ImageNet-100 or fewer epochs make quick runs
@@ -1019,7 +1068,9 @@ job start and resume from `checkpoint.pt` when resubmitted with the same
   and `run_pretrain_generic.sh`, any network x data x method x augmentation
   from four variables (`ARCH`, `DATA`, `METHOD`, `AUG`; the combination is
   checked before anything runs, `DRY_RUN=1` prints the command).
-  `debug_pretrain.sh` is a smoke test (including a resume),
+  `debug_pretrain.sh` is a smoke test (including a resume), `debug_ddp.sh`
+  the same short run on 1 and 2 GPUs (`METHOD`, `ARCH`) to compare loss and
+  steps/s,
   `run_profile_pretrain.sh` runs `profile_pretrain.py` on R3M variants.
 - **Downstream:** `run_sac.sh` (full run), `run_ft_sac.sh` (fine-tuning)
   and `debug_sac.sh` (quick smoke test) for `train_sac.py` -- adjust

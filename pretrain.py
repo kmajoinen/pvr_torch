@@ -51,6 +51,12 @@ ResNets: resize 256, center crop 224, ImageNet normalisation), the same one
 the released weights get here, so they compare under identical RL
 preprocessing.
 
+Multi-GPU (image objectives that declare multi_gpu, src/distributed.py): one
+process per GPU on one node, batch_size being the total across GPUs:
+    python -m torch.distributed.run --standalone --nproc_per_node=4 pretrain.py \
+        hydra.run.dir=<a fixed folder> batch_size=1024 ...
+Rank 0 validates, saves and logs. num_workers is per GPU.
+
 Resuming: rerun with the same hydra.run.dir; checkpoint.pt is picked up
 (resume=true). Checkpoints fall between batches (validation intervals must
 be multiples of updates_per_batch). Random clip streams are reseeded from
@@ -84,6 +90,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from src import distributed
 from src.augmentations import build_augmentation
 from src.data.clips import ClipDataset, ClipManifest
 from src.encoder_config import embedding_kwargs
@@ -126,21 +133,23 @@ def _shared_sampler(terms, train: bool):
     return first
 
 
-def reseed(seed: int, step: int) -> int:
+def reseed(seed: int, step: int, rank: int = 0) -> int:
     """Seed every RNG from (seed, step). Called after resuming, before the data
     loaders start: their workers' seeds come from torch's RNG, so reseeding
     with the run seed alone would replay the opening batches (same videos,
-    frames, crops and negatives) after every resume."""
-    s = int(np.random.SeedSequence([seed, step]).generate_state(1)[0])
+    frames, crops and negatives) after every resume. With several GPUs each
+    process's rank joins in, so they draw different crops and MAE masks (rank
+    0's draws are a single-GPU run's)."""
+    s = int(np.random.SeedSequence([seed, step] + ([rank] if rank else [])).generate_state(1)[0])
     torch.manual_seed(s)
     np.random.seed(s)
     random.seed(s)
     return s
 
 
-def _data_loader(dataset, cfg, num_workers, device, persistent=True):
+def _data_loader(dataset, cfg, num_workers, device, persistent=True, batch_size=None):
     return torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.batch_size, num_workers=num_workers,
+        dataset, batch_size=batch_size or cfg.batch_size, num_workers=num_workers,
         pin_memory=device.type == "cuda", persistent_workers=persistent and num_workers > 0,
         prefetch_factor=4 if num_workers > 0 else None,
     )
@@ -194,7 +203,7 @@ def schedule_settings(cfg, images: bool) -> dict:
 
 
 def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_batch: int = 0,
-                   order: str = "sweep"):
+                   order: str = "sweep", batch_size=None, rank: int = 0, world: int = 1):
     from hydra.utils import to_absolute_path
     from src.data.images import ImageDataset
     crop = data.get("train_crop") or {}
@@ -204,9 +213,9 @@ def _image_dataset(cfg, data, split, train: bool, views: int, seed: int, start_b
     return ImageDataset(
         to_absolute_path(str(data.root)), split, train=train, size=int(data.image_size), views=views,
         scale=tuple(crop.get("scale", (0.08, 1.0))), ratio=tuple(crop.get("ratio", (3 / 4, 4 / 3))),
-        resize=int(data.get("eval_resize") or 256), seed=seed, batch_size=int(cfg.batch_size),
+        resize=int(data.get("eval_resize") or 256), seed=seed, batch_size=int(batch_size or cfg.batch_size),
         start_batch=start_batch, every=int(every), interpolation=str(data.get("interpolation") or "bilinear"),
-        order=order)
+        order=order, rank=rank, world=world)
 
 
 def scale_to_images(epochs: float, sched: dict, n_images: int, train_images: float):
@@ -358,6 +367,7 @@ def _save(obj, path):
 @hydra.main(config_path="configs", config_name="config_pretrain", version_base=None)
 def main(cfg: DictConfig) -> None:
     t_script = _T_START.pop() if _T_START else time.time()
+    procs = distributed.setup(str(cfg.device))
     print(OmegaConf.to_yaml(cfg))
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -365,14 +375,29 @@ def main(cfg: DictConfig) -> None:
     torch.backends.cuda.matmul.allow_tf32 = cfg.perf.tf32
     torch.backends.cudnn.allow_tf32 = cfg.perf.tf32
     torch.backends.cudnn.benchmark = cfg.perf.cudnn_benchmark
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
+    device = distributed.device_of(procs, str(cfg.device))
+    print(f"\nDevice: {device}" + (f" (one of {procs.world} processes)" if procs.active else ""))
 
     # ── Validate before anything expensive ────────────────────────────────────
     data = cfg.pretrain_data
     data_type = str(data.get("type", "clips"))
     images = data_type == "images"
     specs = _check_objectives(cfg, data_type)
+    local_batch = int(cfg.batch_size)
+    if procs.active:
+        single_gpu = [s["name"] for s, c in zip(specs, aux_loss_classes(specs)) if not c.multi_gpu]
+        if single_gpu:
+            raise ValueError(f"objectives {single_gpu} run on one GPU for now: they use the whole batch "
+                             "together (negatives, queues), which needs gathering across GPUs. "
+                             "Multi-GPU works for: supervised, mae")
+        if local_batch % procs.world:
+            raise ValueError(f"batch_size={local_batch} is the total across GPUs, and doesn't divide "
+                             f"evenly over {procs.world}")
+        local_batch //= procs.world
+        distributed.check_same(procs, "the run directory (set hydra.run.dir to a fixed folder)",
+                               hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
+        print(f"Multi-GPU: {procs.world} processes, batch_size {cfg.batch_size} = {local_batch} per GPU, "
+              f"num_workers {cfg.num_workers} per GPU")
     if cfg.embedding.get("name") is None:
         raise ValueError("pretrain.py needs an encoder: set embedding=<config>")
     emb_kwargs = embedding_kwargs(cfg)
@@ -465,6 +490,8 @@ def main(cfg: DictConfig) -> None:
         step, wandb_id = int(ckpt["step"]), ckpt.get("wandb_id")
         print(f"Resumed from {ckpt_path} at step {step:,}")
         changed = resume_changes(ckpt.get("config"), cfg, sch, images)
+        if ckpt.get("world_size", 1) != procs.world:
+            changed["GPUs"] = (ckpt.get("world_size", 1), procs.world)
         if changed:
             print(f"WARNING: {changed} (checkpoint, now) differ: the run won't continue at the item "
                   "it stopped at")
@@ -473,20 +500,21 @@ def main(cfg: DictConfig) -> None:
     # runs only there), so step // K batches have been drawn. Random clip
     # streams are reseeded from the step; sweep streams and random image
     # streams skip to the exact item (per-item draws are reseeded either way).
-    seed = reseed(cfg.seed, step)
+    seed = reseed(cfg.seed, step, procs.rank)
     start_batch = step // K
     print("Data:")
     views = max(t.loss.needs_views for t in terms) if images else 0
     if images:
         train_set = _image_dataset(cfg, data, data.train_split, True, views, cfg.seed,
-                                   start_batch=start_batch, order=sch["sampling"])
+                                   start_batch=start_batch, order=sch["sampling"],
+                                   batch_size=local_batch, rank=procs.rank, world=procs.world)
         if any(t.loss.needs_labels for t in terms) and not train_set.labelled:
             raise ValueError(f"{[t.name for t in terms if t.loss.needs_labels]} need class labels, but "
                              f"{train_set.dir} has unlabelled images (e.g. video frames)")
         n_items = len(train_set)
         print(f"  {train_set.dir}: {len(train_set):,} images, {views} view(s), crop scale {train_set.scale}"
               + (f", {train_set.thinning}" if train_set.thinning else ""))
-        train_iter = iter(_data_loader(train_set, cfg, int(cfg.num_workers), device))
+        train_iter = iter(_data_loader(train_set, cfg, int(cfg.num_workers), device, batch_size=local_batch))
     else:
         clips = _clip_dataset(cfg, data, data.train_manifest, _shared_sampler(terms, True), seed,
                               order=sch["sampling"], clips_per_video=sch["clips_per_video"],
@@ -543,7 +571,7 @@ def main(cfg: DictConfig) -> None:
     wandb = None
     if cfg.wandb.enabled and (cfg.get("timing") or {}).get("benchmark_steps"):
         print("wandb: off in benchmark mode (the measurements go to stdout and timing_benchmark.json)")
-    elif cfg.wandb.enabled:
+    elif cfg.wandb.enabled and procs.is_main:
         import wandb
         aug_tag = f"_aug-{cfg.augmentation.name}" if aug is not None else ""
         wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity,
@@ -569,7 +597,7 @@ def main(cfg: DictConfig) -> None:
         record["step"] = step
         return record, {**record, "objectives": {t.name: t.loss.state_dict() for t in terms},
                         "optimizer": optimizer.state_dict(), "wandb_id": wandb_id,
-                        "config": OmegaConf.to_container(cfg, resolve=True)}
+                        "world_size": procs.world, "config": OmegaConf.to_container(cfg, resolve=True)}
 
     def save(step, final=False):
         if not cfg.save.enabled:
@@ -631,6 +659,11 @@ def main(cfg: DictConfig) -> None:
     def run_objectives(raw, augment):
         return objectives_on(augmented(stage(raw), augment))
 
+    # The training forward pass, through DDP with several GPUs; validation
+    # runs on rank 0 and uses objectives_on directly.
+    train_forward = distributed.wrap(procs, device, encoder, [t.loss for t in terms], objectives_on,
+                                     find_unused_parameters=bool(cfg.perf.get("ddp_find_unused", False)))
+
     def set_mode(train):
         encoder.train(train)
         for t in terms:
@@ -645,10 +678,15 @@ def main(cfg: DictConfig) -> None:
                 total, values = run_objectives(next(val_iter), augment=False)
             values["loss"] = total
             return {k: float(v) for k, v in values.items()}
+        # Rank 0 validates alone, at the per-GPU batch size it trains at (the
+        # total could run out of memory), so eval_batches scales up to cover
+        # the same number of images.
         val_set = _image_dataset(cfg, data, data.val_split, False, views, cfg.seed)
-        loader = _data_loader(val_set, cfg, int(cfg.num_workers), device, persistent=False)
+        loader = _data_loader(val_set, cfg, int(cfg.num_workers), device, persistent=False,
+                              batch_size=local_batch)
         sums, n = {}, 0
         limit = data.get("eval_batches")
+        limit = None if limit is None else int(limit) * procs.world
         with torch.no_grad():
             for i, raw in enumerate(loader):
                 if limit is not None and i >= limit:
@@ -673,9 +711,9 @@ def main(cfg: DictConfig) -> None:
         cfg, train_steps, eval_frequency, 0, run_dir,
         {"script": "pretrain", "objectives": names, "data": data.name, "embedding": cfg.embedding.name,
          "batch_size": cfg.batch_size, "image_size": int(data.image_size),
-         "num_workers": int(cfg.num_workers), "amp_bf16": bool(cfg.perf.amp_bf16)},
+         "num_workers": int(cfg.num_workers), "amp_bf16": bool(cfg.perf.amp_bf16), "gpus": procs.world},
         t_script, start_step=step, final_eval=True, save_per_eval=bool(cfg.save.enabled),
-        log_frequency=int(cfg.log_frequency))
+        log_frequency=int(cfg.log_frequency), main_process=procs.is_main)
     bench_from = step
     sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
     # The loop: draw a batch, then K updates on it (schedule.updates_per_batch),
@@ -696,7 +734,7 @@ def main(cfg: DictConfig) -> None:
             set_mode(True)
             if inputs is None or sch["reaugment"]:
                 inputs = augmented(staged, augment=True)
-            total, values = objectives_on(inputs)
+            total, values = train_forward(inputs)
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             values["grad_norm"] = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
@@ -709,7 +747,7 @@ def main(cfg: DictConfig) -> None:
 
             if step % cfg.log_frequency == 0 or step == train_steps:
                 elapsed = time.time() - t_log
-                avg = {k: float(v) / n_sum for k, v in sums.items()}
+                avg = distributed.mean_over_ranks(procs, {k: float(v) / n_sum for k, v in sums.items()}, device)
                 sps, wait = n_sum / elapsed, data_time / elapsed
                 timer.mark(step)
                 timing_text, timing_metrics = timer.status(step)
@@ -727,31 +765,39 @@ def main(cfg: DictConfig) -> None:
                     wandb.log(log, step=step)
                 sums, n_sum, data_time, t_log = {}, 0, 0.0, time.time()
 
-            bench_now = (bench_steps and step % cfg.log_frequency == 0 and timer.rate() is not None
-                         and step - bench_from >= bench_steps)
+            bench_now = False
+            if bench_steps and step % cfg.log_frequency == 0:      # rank 0's clock decides
+                bench_now = distributed.from_main(
+                    procs, timer.rate() is not None and step - bench_from >= bench_steps, device)
             scheduled = step % eval_frequency == 0 or step == train_steps
-            if scheduled or (bench_now and timer.mean_excluded("eval") is None):
+            eval_now = scheduled
+            if bench_now:
+                eval_now = distributed.from_main(procs, scheduled or timer.mean_excluded("eval") is None, device)
+            if eval_now:
                 t_eval = time.time()
-                with timer.exclude("eval", timing_only=not scheduled):
-                    ev = evaluate()
-                    print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
-                    if wandb is not None:
-                        wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
-                if cfg.save.enabled and not bench_steps:
-                    with timer.exclude("save"):
-                        save(step, final=step == train_steps)
-                elif cfg.save.enabled and (scheduled or timer.mean_excluded("save") is None):
-                    # Benchmark: time one checkpoint write (to a scratch name -- a
-                    # checkpoint.pt here would be resumed by the next run).
-                    test_path = os.path.join(run_dir, ".timing_save_test.pt")
-                    with timer.exclude("save", timing_only=not scheduled):
-                        _save(checkpoint(step)[1], test_path)
-                    os.remove(test_path)
+                if procs.is_main:
+                    with timer.exclude("eval", timing_only=not scheduled):
+                        ev = evaluate()
+                        print(f"  step {step:>9,}  EVAL loss={ev['loss']:.4f}  {fmt(ev, sorted(k for k in ev if '/' in k))}")
+                        if wandb is not None:
+                            wandb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
+                    if cfg.save.enabled and not bench_steps:
+                        with timer.exclude("save"):
+                            save(step, final=step == train_steps)
+                    elif cfg.save.enabled and (scheduled or timer.mean_excluded("save") is None):
+                        # Benchmark: time one checkpoint write (to a scratch name -- a
+                        # checkpoint.pt here would be resumed by the next run).
+                        test_path = os.path.join(run_dir, ".timing_save_test.pt")
+                        with timer.exclude("save", timing_only=not scheduled):
+                            _save(checkpoint(step)[1], test_path)
+                        os.remove(test_path)
+                distributed.barrier(procs)         # the others wait for rank 0
                 t_log += time.time() - t_eval      # keep steps/s about training
 
             if bench_now:                          # benchmark mode: measured; predict and stop
                 timer.write(step)
-                print("\n" + timer.benchmark_report(step))
+                if procs.is_main:
+                    print("\n" + timer.benchmark_report(step))
                 stop = True
                 break
 
@@ -764,6 +810,7 @@ def main(cfg: DictConfig) -> None:
         # included. Not for a job resumed after the run had already finished
         # (chained jobs): it trained nothing, and would replace the record.
         timer.write(step)
+    distributed.close(procs)
 
 
 if __name__ == "__main__":

@@ -106,12 +106,17 @@ class ImageDataset(IterableDataset):
     with worker 0, so the batch after start_batch belongs to role
     start_batch % workers -- a fresh loader's worker i takes role
     (i + start_batch) % workers, and role r had produced
-    ceil((start_batch - r) / workers) batches."""
+    ceil((start_batch - r) / workers) batches.
+
+    rank, world (training): this process's share with several GPUs, with
+    batch_size and start_batch counted per process (src/data/order.py)."""
 
     def __init__(self, root: str, split: str, train: bool, size: int = 224, views: int = 1,
                  scale=(0.08, 1.0), ratio=(3 / 4, 4 / 3), resize: int = 256, seed: int = 0,
                  batch_size: int = 1, start_batch: int = 0, limit: Optional[int] = None,
-                 every: int = 1, interpolation: str = "bilinear", order: str = "sweep"):
+                 every: int = 1, interpolation: str = "bilinear", order: str = "sweep",
+                 rank: int = 0, world: int = 1):
+        self.rank, self.world = rank, world
         if order not in ("sweep", "random"):
             raise ValueError(f"order={order!r}; expected sweep or random")
         self.order = order
@@ -182,7 +187,8 @@ class ImageDataset(IterableDataset):
             for i in range(wid, len(self), workers):
                 yield self._item(i)
             return
-        from src.data.order import epoch_stream, random_stream
+        from src.data.order import epoch_stream, random_stream, split_across_processes
         stream = epoch_stream if self.order == "sweep" else random_stream
-        for _, i in stream(len(self), self.seed, wid, workers, self.start_batch, self.batch_size):
+        wid, workers, start = split_across_processes(wid, workers, self.start_batch, self.rank, self.world)
+        for _, i in stream(len(self), self.seed, wid, workers, start, self.batch_size):
             yield self._item(i)
