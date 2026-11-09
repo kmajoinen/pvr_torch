@@ -158,6 +158,8 @@ def test_edge_mass_shows_returns_beyond_the_support():
     _, stats = critic_loss(critic, target, torch.randn(4, 4), torch.rand(4, 2),
                            torch.randn(4, 4), torch.rand(4, 2), rewards, torch.zeros(4))
     assert stats["mass_vmax"].item() == pytest.approx(0.5) and stats["mass_vmin"].item() == 0.0
+    # discount 0: every atom of a sample shifts to its reward, so half are clipped
+    assert stats["clip_percentage"].item() == pytest.approx(0.5)
 
 
 def test_mse_variant_matches_sac_target():
@@ -263,7 +265,14 @@ def test_configs_compose():
         x = compose(config_name="config_xqc", overrides=["env=pendulum", "embedding=none"])
         d = compose(config_name="config_drqv2", overrides=["algo=drqv2_xqc"])
     assert x.algo.name == "xqc" and x.algo.gamma == "auto" and x.algo.updates_per_step == 2
+    # The authors' defaults (conf/config.yaml, conf/agent/{base_agent,xqc}.yaml).
     assert x.algo.policy_delay == 3 and list(x.algo.critic_hidden) == [512] * 4
+    assert list(x.algo.actor_hidden) == [256] * 4 and x.algo.n_critics == 2
+    assert x.algo.learning_starts == 5000 and x.algo.tau == 0.005 and x.algo.init_alpha == 0.01
+    assert x.algo.batch_size == 256 and x.algo.buffer_size == 1_000_000 and x.algo.nstep == 1
+    assert x.algo.critic_lr == x.algo.actor_lr == 3e-4 and x.algo.lr_end == 3e-5
+    assert (x.algo.num_atoms, x.algo.v_min, x.algo.v_max) == (101, -5.0, 5.0)
+    assert x.algo.target_entropy_scale == 0.5 and x.algo.reward_normalization
     assert d.algo.arch == "xqc" and d.algo.nstep == 3 and d.algo.lr == 1e-4 and d.algo.tau == 0.01
     assert d.algo.hidden_dim == 1024 and d.algo.num_blocks == 4 and d.algo.feature_dim == 50
 
@@ -300,7 +309,7 @@ def test_train_xqc_runs_end_to_end(tmp_path):
     text = _run("train_xqc.py", "algo.total_timesteps=300", "algo.learning_starts=200",
                 "algo.log_frequency=100", "algo.eval_frequency=300", "algo.n_episodes_test=1",
                 "algo.batch_size=32", tmp_path=tmp_path)
-    assert "Discount: 0.9750" in text and "qf_loss=" in text and "edge_mass=" in text
+    assert "Discount: 0.9750" in text and "qf_loss=" in text and "edge_mass=" in text and "clip=" in text
     ckpt = torch.load(tmp_path / "final_checkpoint.pt", weights_only=False)
     rows = [m for k, m in ckpt["critic"].items() if k.endswith("weight") and m.dim() == 2]
     assert all(torch.allclose(w.norm(dim=1), torch.ones(w.shape[0]), atol=1e-4) for w in rows)

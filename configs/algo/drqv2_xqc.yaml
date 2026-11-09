@@ -2,8 +2,13 @@
 # paper's pixel recipe (Table 2). DrQ-v2's trunk, exploration schedule,
 # n-step returns and optimizer settings stay; after the trunk each network
 # is XQC's BatchNorm MLP (weight-normalised), and the critic is categorical.
-# Reward normalisation isn't listed in Table 2, but the [-5, 5] support
-# needs it at gamma 0.99 (DMC returns run into the hundreds).
+# A RECONSTRUCTION: the authors' pixel code (inside the DrQ-v2 codebase)
+# isn't released. Guessed: the input BatchNorm after the trunk (the trunk
+# already ends in LayerNorm + Tanh), reward normalisation (not in Table 2,
+# but the [-5, 5] support needs it at gamma 0.99: DMC returns run into the
+# hundreds), and a constant learning rate (DrQ-v2's; no decay listed).
+# Also not the paper's: the encoder (DrQ-v2's conv net isn't in this repo).
+# Compare against plain DrQ-v2 on the same encoder, not the paper's numbers.
 defaults:
   - drqv2
   - _self_

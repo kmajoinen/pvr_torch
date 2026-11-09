@@ -683,13 +683,33 @@ python train_drqv2.py algo=drqv2_xqc embedding=random env.image_size=84 \
   `total_timesteps × updates_per_step`, which includes the warm-up. So the
   critic ends ~1% short of `lr_end` (500k steps, 5k warm-up), and the actor
   and temperature, which step on every 3rd update, only get a third of the
-  way (3e-4 → ~2.1e-4). Probably an accident on their side, kept to match
-  their curves; `lr_end: null` keeps all three constant.
+  way (3e-4 → ~2.1e-4); their temperature also uses the actor's schedule
+  (their `temp_lr` is never read). Deliberate, to match their runs: don't
+  "fix" it without meaning to change the algorithm. `lr_end: null` keeps
+  all three constant.
+- **The pixel recipe is a reconstruction.** The state recipe follows the
+  authors' released code. Their pixel runs were reimplemented inside the
+  DrQ-v2 codebase, which isn't released, so `drqv2_xqc` is built from
+  Table 2 and the text, and three of its choices are guesses: the input
+  BatchNorm right after DrQ-v2's trunk (which already ends in LayerNorm +
+  Tanh), reward normalisation (not in Table 2, but DMC returns at γ 0.99
+  don't fit [-5, 5] without it), and a constant learning rate. A fourth
+  deviation is the encoder: the paper used DrQ-v2's unmodified conv
+  encoder, which isn't in this repo (`embedding=random` is a different,
+  smaller conv net), so the trunk sees different features. Judge the pixel
+  recipe by `drqv2_xqc` vs `drqv2` on the same encoder here, not by the
+  paper's absolute numbers.
 - **Paper vs repo**: the paper's pixel experiments trained DrQ-v2's conv
-  encoder from scratch, and its state recipe used raw state. Using either
-  recipe on frozen pretrained features is untested in the paper. Table 2
-  doesn't list reward normalisation; it's on here, since DMC returns at γ
-  0.99 don't fit [-5, 5] without it.
+  encoder from scratch (not in this repo; `embedding=random` is a
+  different, smaller conv net), and its state recipe used raw state. Using
+  either recipe on frozen pretrained features is untested in the paper.
+- **Evaluation** differs from the authors' (10 episodes every 50k agent
+  steps): `n_episodes_test: 5` every 10k, as in `train_sac.py`. Both use
+  the deterministic action (tanh of the mean).
+- **Reward normaliser**: the return G resets after an episode's last step.
+  The authors' code multiplies by (1 − done) of the current step instead,
+  so their terminal step's G is its own reward and the next episode's
+  first G carries γ·r over: one sample in T differs (~1% on DMC).
 - **Ablations** (the paper's Fig. 10): `algo.critic_loss=mse`,
   `algo.weight_norm=false`. Both scripts support every `encoder.*` option;
   `augmentation.strong` isn't supported. `obs_norm` doesn't apply to
@@ -701,12 +721,15 @@ python train_drqv2.py algo=drqv2_xqc embedding=random env.image_size=84 \
 - **Support saturation**: the normaliser divides by the return's std
   without subtracting its mean, so on dense, same-sign rewards normalised
   values can reach the [-5, 5] edges, where the critic can't tell actions
-  apart. `train/target_mass_vmin`/`vmax` log the target's probability on
-  the two edge atoms (`edge_mass=` in the console); values well above 0
-  mean the support is too narrow.
+  apart. `train/clip_percentage` (the authors' metric and name: the share
+  of shifted target atoms at or beyond ±5; `clip=` in the console) and
+  `train/target_mass_vmin`/`vmax` (the target's probability on the two
+  edge atoms; `edge_mass=`) show it; values well above 0 mean the support
+  is too narrow.
 - **Metrics** reuse `train_sac.py`'s keys, plus `train/critic_lr`,
   `train/actor_lr`, `train/reward_scale` (the std rewards are divided by),
-  `train/alpha_reward_units`, `train/target_mass_vmin`/`vmax` and
+  `train/alpha_reward_units`, `train/clip_percentage`,
+  `train/target_mass_vmin`/`vmax` and
   `charts/updates` (gradient steps: XQC makes 2 per agent step, SAC 1,
   DrQ-v2 ½, so compare against both). Runs are named `xqc_...`.
 - **Comparing with SAC**: besides the method, γ (0.975/0.99 vs 0.99), UTD

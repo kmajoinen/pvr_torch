@@ -30,7 +30,12 @@ embedding works, including a trainable head (embedding.head=linear).
 algo=drqv2_xqc is the XQC paper's pixel recipe (Palenicek et al., ICLR
 2026, Table 2): the same agent, with XQC's BatchNorm + weight-normalised
 MLPs after DrQ-v2's trunks and a categorical cross-entropy critic on
-normalised rewards (src/rl/xqc.py, configs/algo/drqv2_xqc.yaml):
+normalised rewards (src/rl/xqc.py, configs/algo/drqv2_xqc.yaml). A
+reconstruction from the paper: the authors' pixel code isn't released, and
+the input BN after the trunk, reward normalisation and the constant
+learning rate are guesses; the encoder isn't DrQ-v2's either (see
+src/rl/xqc.py). Compare it with algo=drqv2 on the same encoder. Logs train/clip_percentage
+and train/target_mass_vmin/vmax:
     python train_drqv2.py algo=drqv2_xqc embedding=random env.image_size=84 \
         embedding.frame_stack=3 encoder.grads=critic augmentation=random_shift
 
@@ -439,6 +444,7 @@ def main(cfg: DictConfig) -> None:
                     if "mass_vmin" in xqc_stats:
                         log["train/target_mass_vmin"] = xqc_stats["mass_vmin"].item()
                         log["train/target_mass_vmax"] = xqc_stats["mass_vmax"].item()
+                        log["train/clip_percentage"] = xqc_stats["clip_percentage"].item()
                 log.update(encoder_log(enc, stack, eo, collapse, enc_gnorm_critic,
                                        enc_gnorm_actor, aux_total, aux_values))
                 wandb.log(log, step=global_step)

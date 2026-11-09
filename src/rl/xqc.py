@@ -24,11 +24,24 @@ Used by train_xqc.py (the paper's state recipe: SAC, configs/algo/xqc.yaml)
 and train_drqv2.py with algo=drqv2_xqc (the paper's pixel recipe: DrQ-v2
 with these MLPs and loss, configs/algo/drqv2_xqc.yaml).
 
-BatchNorm modes follow the authors' code: the critic loss runs the online
-and target critics in train mode (batch statistics) on the joint batch; the
-actor loss evaluates the critic in eval mode (running statistics); acting,
-evaluation and the next-state actions use the actor in eval mode. The
-target critic's running statistics are never used (its BN momentum is 0).
+The state recipe follows the authors' released code. The pixel recipe is a
+RECONSTRUCTION: the paper's pixel runs were reimplemented inside the DrQ-v2
+codebase, which isn't released, so it is built from the paper's Table 2 and
+text. Three of its choices are guesses: the input BatchNorm right after
+DrQ-v2's trunk (which already ends in LayerNorm + Tanh; Table 2 lists only
+Dense -> BN -> ReLU blocks), reward normalisation (not in Table 2), and a
+constant learning rate (no decay listed). A fourth deviation is the
+encoder: the paper used DrQ-v2's unmodified conv encoder, which this repo
+doesn't have (embedding=random is a different conv net), so the trunk sees
+different features. Judge the pixel recipe by drqv2_xqc vs plain DrQ-v2 on
+the same encoder here, not by the paper's absolute numbers.
+
+BatchNorm modes, as in the authors' state code (and reused for the pixel
+recipe): the critic loss runs the online and target critics in train mode
+(batch statistics) on the joint batch; the actor loss evaluates the critic
+in eval mode (running statistics); acting, evaluation and the next-state
+actions use the actor in eval mode. The target critic's running statistics
+are never used (its BN momentum is 0).
 """
 
 import contextlib
@@ -182,10 +195,12 @@ def critic_loss(critic: CriticEnsemble, critic_target: CriticEnsemble, feats, ac
     rewards are the (n-step, normalised) sums; discounts gamma^k or 0.
 
     Returns (loss, stats): stats holds per_critic (C,) losses, q (C, B)
-    expected values, target_mean, and (categorical) mass_vmin / mass_vmax,
-    the target's mean probability on the two edge atoms -- values piling up
-    there mean the support is too narrow for the (normalised) returns.
-    All detached."""
+    expected values, target_mean, and (categorical) two saturation metrics:
+    clip_percentage, the fraction of shifted target atoms at or beyond
+    [v_min, v_max] (the authors' metric, same name), and mass_vmin /
+    mass_vmax, the projected target's mean probability on the two edge
+    atoms. Values well above 0 mean the support is too narrow for the
+    (normalised) returns. All detached."""
     B = feats.shape[0]
     x = torch.cat([feats, next_feats.detach()], dim=0)
     a = torch.cat([actions, next_actions.detach()], dim=0)
@@ -202,6 +217,7 @@ def critic_loss(critic: CriticEnsemble, critic_target: CriticEnsemble, feats, ac
             target = project_categorical(target_values, probs, critic.v_min, critic.v_max)
             target_mean = (target * critic.atoms).sum(-1).mean()
             edges = target[:, [0, -1]].mean(0)
+            clip_frac = ((target_values <= critic.v_min) | (target_values >= critic.v_max)).float().mean()
         else:
             next_v = t_q.min(dim=0).values
             if next_bonus is not None:
@@ -217,6 +233,7 @@ def critic_loss(critic: CriticEnsemble, critic_target: CriticEnsemble, feats, ac
              "target_mean": target_mean}
     if edges is not None:
         stats["mass_vmin"], stats["mass_vmax"] = edges[0], edges[1]
+        stats["clip_percentage"] = clip_frac
     return per_critic.sum(), stats
 
 
@@ -315,8 +332,16 @@ def drqv2_xqc_critic(feat_dim: int, action_dim: int, algo) -> CriticEnsemble:
 
 class RewardNormalizer:
     """Rewards divided by the running std of the discounted return
-    G <- gamma * G + r (reset at episode ends), with no mean subtraction
-    (XQC's RewardNormalizer; Engstrom et al. 2020)."""
+    G <- gamma * G + r (reset after an episode's last step), with no mean
+    subtraction (XQC's RewardNormalizer; Engstrom et al. 2020).
+
+    Differs from the authors' code at episode boundaries: they compute
+    G = gamma * (1 - done) * G + r with the current step's done, so a
+    terminal step's G is its own reward and the next episode's first G
+    carries gamma * r_terminal over. Here G resets after the update, the
+    textbook return. One sample in T differs (~1% at T = 500). Their
+    statistics also start at count 0 with no prior; that doesn't matter,
+    since normalisation is only used after the warm-up."""
 
     def __init__(self, gamma: float, eps: float = 1e-8):
         self.gamma, self.eps = float(gamma), eps

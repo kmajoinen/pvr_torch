@@ -28,8 +28,10 @@ start with their own BatchNorm). Logged metrics reuse train_sac.py's keys;
 XQC adds train/critic_lr, train/actor_lr, train/reward_scale,
 train/alpha_reward_units (alpha weighs entropy against normalised rewards:
 compare this one across tasks or with SAC's train/alpha),
-train/target_mass_vmin/vmax (target probability on the edge atoms: values
-piling up there mean [v_min, v_max] is too narrow) and charts/updates
+train/clip_percentage (the authors' metric: share of shifted target atoms
+at or beyond [v_min, v_max]) and train/target_mass_vmin/vmax (target
+probability on the edge atoms; both well above 0 mean the support is too
+narrow) and charts/updates
 (gradient steps, for plots against update count).
 """
 
@@ -287,6 +289,8 @@ def main(cfg: DictConfig) -> None:
         critic_optimizer.zero_grad(set_to_none=True)
         (loss if aux_total is None else loss + aux_total).backward()
         q_gnorm = float(torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=grad_clip))
+        # Deliberately the authors' schedule, incl. the actor's slow decay
+        # (see xqc_learning_rates): don't "fix" it without meaning to.
         critic_lr, actor_lr = xqc_learning_rates(n_updates, a)
         set_lr(critic_optimizer, critic_lr)
         critic_optimizer.step()
@@ -404,7 +408,8 @@ def main(cfg: DictConfig) -> None:
             per_critic, q = last["per_critic"], last["q"]
             critic_lr = critic_optimizer.param_groups[0]["lr"]
             reward_scale = reward_norm.scale if reward_norm is not None else 1.0
-            edge_text = (f"  edge_mass={last['mass_vmin'].item():.3f}/{last['mass_vmax'].item():.3f}"
+            edge_text = (f"  clip={last['clip_percentage'].item():.3f}"
+                         f"  edge_mass={last['mass_vmin'].item():.3f}/{last['mass_vmax'].item():.3f}"
                          if "mass_vmin" in last else "")
             print(
                 f"  step {global_step:>8,}  qf_loss={per_critic.mean().item():8.3f}"
@@ -445,6 +450,7 @@ def main(cfg: DictConfig) -> None:
                 if "mass_vmin" in last:
                     log["train/target_mass_vmin"] = last["mass_vmin"].item()
                     log["train/target_mass_vmax"] = last["mass_vmax"].item()
+                    log["train/clip_percentage"] = last["clip_percentage"].item()
                 for i in range(per_critic.shape[0]):
                     log[f"train/qf{i + 1}_loss"] = per_critic[i].item()
                     log[f"train/qf{i + 1}_values"] = q[i].mean().item()
