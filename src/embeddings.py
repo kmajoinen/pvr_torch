@@ -1163,6 +1163,11 @@ class EmbeddingNet(nn.Module):
             from src.truncation import truncate
             self._forward_fn, self.layer = truncate(self.embedding, self._forward_fn, layer)
             head = head or "avgpool"
+        # An fc head is part of a single frame's representation (VIP's): with
+        # per-frame fusion it runs on each frame, before the fusion. The
+        # others run on the fused output (linear: PIE-G's projection of the
+        # whole stack; avgpool/cls/flatten give the same features either way).
+        self._head_per_frame = self._per_frame and head == "fc"
         # How this encoder was built, beyond its weights; compared against a
         # loaded checkpoint's record of the same (_load_checkpoint).
         from src.truncation import DEFAULT_HEAD_DIM, TRAINABLE_HEADS
@@ -1191,7 +1196,7 @@ class EmbeddingNet(nn.Module):
             # Fused per-frame outputs are already batch-first.
             self.head = make_head(head, dummy_raw, batch=2, head_dim=head_dim,
                                   seq_first=False if self._per_frame else None)
-            self.out_size = int(np.prod(self.head(dummy_raw).shape[1:]))
+            self.out_size = int(np.prod(self._head_output(dummy_raw, batch=2).shape[1:]))
 
         # Whether the head's weights came from `checkpoint` (only a file saved
         # by this repo with head.* keys); a trainable head on a frozen encoder
@@ -1269,7 +1274,8 @@ class EmbeddingNet(nn.Module):
 
     def _raw_output(self, x):
         """Preprocessed (and maybe augmented) frames -> the backbone's raw
-        output, with stacked frames fused (batch-first)."""
+        output, batch-first: the head's input. Stacked frames are fused, or
+        left as N * frame_stack rows when the head runs on each frame."""
         if not self._per_frame:
             x = self._normalize(x)                    # mean/std normalisation or [0, 255] rescale
             # Fold any extra leading dims into the batch. Taken from the
@@ -1285,7 +1291,18 @@ class EmbeddingNet(nn.Module):
                 self._seq_first = tokens_seq_first(out, frames.shape[0])
             if self._seq_first:
                 out = out.transpose(0, 1)
+        if self._head_per_frame:
+            return out
         return fuse_frames(out, n, self.frame_stack, self.frame_fusion)
+
+    def _head_output(self, raw, batch):
+        """_raw_output() of `batch` samples -> the head's output, one row per
+        sample (a per-frame head's outputs fused here)."""
+        out = self.head(raw)
+        if self._head_per_frame:
+            from src.truncation import fuse_frames
+            out = fuse_frames(out, batch, self.frame_stack, self.frame_fusion)
+        return out
 
     def encode_preprocessed(self, observation):
         """preprocess() output, optionally augmented -> (N, out_size)."""
@@ -1299,7 +1316,7 @@ class EmbeddingNet(nn.Module):
         # is frozen (requires_grad=False on every param, non-grad-requiring
         # input), autograd already builds no backward graph on its own --
         # forcing no_grad() explicitly was redundant for that case anyway.
-        out = self.head(self._raw_output(observation))
+        out = self._head_output(self._raw_output(observation), batch=observation.shape[0])
         if out.shape[1] != self.out_size:
             # A plain reshape(-1, out_size) could silently fold features into
             # the batch dimension here instead of failing.
@@ -1373,8 +1390,12 @@ class EmbeddingNet(nn.Module):
             'frame_fusion': (meta.get('frame_fusion') or ('channels' if arch == 'random' else 'concat'))
                             if frame_stack > 1 else None,
         }
+        # A single-frame encoder stacked with per-frame fusion encodes each
+        # frame exactly as it was saved: not a different representation.
+        same_per_frame = frame_stack == 1 and self._per_frame
         diffs = [f"{k}: saved {saved[k]!r}, now {self.build_spec[k]!r}"
-                 for k in saved if saved[k] != self.build_spec[k]]
+                 for k in saved if saved[k] != self.build_spec[k]
+                 and not (same_per_frame and k in ('frame_stack', 'frame_fusion'))]
         # Without a resize, the frame size is part of what the encoder sees
         # (a linear/flatten head would fail on it anyway; avgpool and cls
         # would silently run at a different resolution).

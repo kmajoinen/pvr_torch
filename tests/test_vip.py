@@ -122,6 +122,22 @@ def test_fc_head_is_a_plain_linear_that_saves_and_reloads(tmp_path):
     assert torch.allclose(enc.encode_preprocessed(x), back.encode_preprocessed(x)) and not back.build_warnings
 
 
+def test_a_single_frame_fc_checkpoint_encodes_each_stacked_frame(tmp_path):
+    from src.embeddings import EmbeddingNet
+    from src.rl.common import encoder_record
+    enc = EmbeddingNet("resnet18", pretrained=False, train=True, disable_cuda=True, head="fc", head_dim=32)
+    cfg = OmegaConf.create({"embedding": {"name": "resnet18", "head": "fc", "head_dim": 32}})
+    torch.save(encoder_record(cfg, enc), tmp_path / "enc.pt")
+    stacked = EmbeddingNet("resnet18", disable_cuda=True, head="fc", head_dim=32, frame_stack=3,
+                           checkpoint=str(tmp_path / "enc.pt"))
+    assert stacked.out_size == 3 * 32 and not stacked.build_warnings
+    x = torch.rand(2, 9, 224, 224)
+    enc.eval(), stacked.eval()
+    with torch.no_grad():
+        per_frame = torch.cat([enc.encode_preprocessed(x[:, 3 * i:3 * i + 3]) for i in range(3)], 1)
+        assert torch.allclose(stacked.encode_preprocessed(x), per_frame, atol=1e-5)
+
+
 @pytest.mark.parametrize("checkpoint, ok", [(None, False), ("/x/enc.pt", True)])
 def test_a_frozen_fc_head_needs_trained_weights(checkpoint, ok):
     from src.encoder_config import encoder_settings
