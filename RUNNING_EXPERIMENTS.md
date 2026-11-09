@@ -864,9 +864,50 @@ is converted again); `--format folders` is, skipping videos finished with
 the same settings. `run_pretrain.sh` copies the shards to the node's local
 disk at job start. Other datasets need only a script that writes the same
 layout (`DATASETS.md` has the formats and an example; `python -m
-src.data.check <root>` checks the result and prints a config), plus a
-`configs/pretrain_data/<name>.yaml` (`text_strip: 2`
-reproduces R3M's cut of Ego4D's "C " narration prefix).
+src.data.check <root>` checks the result and prints a config); then
+`pretrain_data=auto` reads it, or a `configs/pretrain_data/<name>.yaml`
+pins the settings (`text_strip: 2` reproduces R3M's cut of Ego4D's "C "
+narration prefix).
+
+**EPIC-KITCHENS-100** (700 videos, 100 h of 1080p kitchen video; on Triton
+as MP4s in `/scratch/shareddata/dldata/epic-kitchens/EPIC-KITCHENS`): the
+narrations aren't there, so clone the public annotations once, on a login
+node:
+```bash
+git clone https://github.com/epic-kitchens/epic-kitchens-100-annotations $WRKDIR/data/epic-kitchens-100-annotations
+```
+Then `run_prepare_epic.sh` converts both splits (train: 495 videos, 67k
+narrated segments; validation: 138 videos, 9.7k). Each video's frames are
+resampled to `--fps` (default 10) and stored once, as 224×224 JPEG shards
+(~55 GB for train and ~10 GB for validation at 10 fps). Run `quota` on a
+login node before submitting and make sure about 65 GB is free in `$WRKDIR`
+(200 GB and 1M files by default; the shards are only a few hundred files):
+a conversion that hits the quota fails partway and can't resume.
+`manifest_<split>.csv` has one row per narrated segment
+(`txt`: "open door"), pointing into its video's frames, and
+`manifest_<split>_videos.csv` one row per whole video.
+
+*Timing.* Every frame is decoded whatever `--fps` is, so decoding sets the
+run time, and a split isn't resumable: a job that hits its time limit loses
+everything. `LIMIT=20 sbatch run_prepare_epic.sh` converts 20 videos per
+split (into `epic_limit20`) and ends with its rate in minutes per GB of video
+and the whole split's projected time. Scale by GB, not by video count: EPIC
+videos run from a minute to an hour, and the first 20 in annotation order
+needn't be typical. If the projection is above about two thirds of the
+script's `--time`, raise the time or the CPUs before the full run. Memory
+peaks at the start (the longest videos go first), so a too-small `--mem`
+fails within minutes.
+
+*Which manifest.* `pretrain_data=epic` reads the segments, for R3M and for
+VIP comparable to the official setup (R3M's Ego4D clips, at most a few
+minutes long; VIP ignores the text). VIP draws its goal anywhere after the
+start frame, so whole videos (`pretrain_data.train_manifest=manifest_train_videos.csv`)
+put start and goal up to an hour apart: use them only for that on purpose.
+In between, `--window 300` adds `manifest_<split>_win300s.csv` (videos cut
+into parts of at most 5 minutes; 1,172 for train). `frame_times_<split>.npz`
+records each stored frame's time, so `--manifests-only` adds or rebuilds
+manifests (windows, `--text none`) without decoding again.
+`pretrain_data=epic_frames` reads the frames as images (1 fps; MAE/MVP).
 
 **R3M** (`configs/experiment/r3m.yaml`, objective `r3m`): time-contrastive,
 video-language and L1/L2 terms, a term-for-term port of the official
@@ -1264,15 +1305,18 @@ pretraining ones copy (or extract) their data to the node's local disk at
 job start and resume from `checkpoint.pt` when resubmitted with the same
 `RUN_DIR` (chain jobs with `sbatch --dependency=afterany:<jobid>`).
 
-- **Data:** `run_prepare_ssv2.sh`, the one-time SSv2 conversion to shards
-  (CPU job).
+- **Data:** `run_prepare_ssv2.sh` and `run_prepare_epic.sh`, the one-time
+  SSv2 and EPIC-KITCHENS-100 conversions to shards (CPU jobs).
 - **Pretraining:** `run_pretrain.sh` (R3M, ResNet-50 on SSv2),
   `run_vip.sh` (VIP), `run_r3m_vit.sh` (R3M on ViT-S/16),
   `run_mvp_epochs.sh` / `run_mvp_images.sh` (MVP, the two budgets),
   `run_imagenet.sh` (ImageNet: supervised or MoCo v2, set `METHOD`/`ARCH`),
   and `run_pretrain_generic.sh`, any network x data x method x augmentation
   from four variables (`ARCH`, `DATA`, `METHOD`, `AUG`; the combination is
-  checked before anything runs, `DRY_RUN=1` prints the command).
+  checked before anything runs, `DRY_RUN=1` prints the command). `DATA` is
+  a dataset name (`imagenet`, `ssv2`, `ssv2_frames`, `epic`, `epic_frames`)
+  or any prepared dataset folder's path, read with `pretrain_data=auto`
+  after a check of the folder, before it's copied.
   `debug_pretrain.sh` is a smoke test (including a resume), `debug_ddp.sh`
   the same short run on 1 and 2 GPUs (`METHOD`, `ARCH`) to compare loss and
   steps/s,

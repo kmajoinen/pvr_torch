@@ -20,6 +20,10 @@
 #   DATA    imagenet     ImageNet, extracted from Triton's shared tar to /tmp
 #           ssv2         SSv2 as video clips (shards from run_prepare_ssv2.sh)
 #           ssv2_frames  SSv2's frames as unlabelled images (same shards)
+#           epic         EPIC-KITCHENS-100 narrated segments (run_prepare_epic.sh)
+#           epic_frames  EPIC's frames as unlabelled images (same shards)
+#           /a/path      any prepared dataset folder (pretrain_data=auto: pretrain.py
+#                        picks clips or images to match METHOD); checked before the copy
 #   METHOD  the objective and its recipe, a configs/experiment/ preset:
 #             image data (imagenet, ssv2_frames):
 #               imagenet_supervised (imagenet only: needs labels), moco_v2, mae, mvp
@@ -51,8 +55,8 @@ SEED="${SEED:-1}"
 EXTRA="${EXTRA:-}"
 
 IMAGENET_TAR=/scratch/shareddata/dldata/imagenet_imagefolder/ILSVRC2012_imagefolder.tar
-SSV2_SHARDS="$WRKDIR/data/ssv2"
-RUN_DIR="${RUN_DIR:-$WRKDIR/pretrain_runs/${METHOD}_${DATA}_${ARCH}_aug-${AUG:-default}_s${SEED}}"
+DATA_NAME=$(basename "$DATA")
+RUN_DIR="${RUN_DIR:-$WRKDIR/pretrain_runs/${METHOD}_${DATA_NAME}_${ARCH}_aug-${AUG:-default}_s${SEED}}"
 
 # ---- check the combination before using any resources -----------------------
 case "$METHOD" in
@@ -61,16 +65,20 @@ case "$METHOD" in
     *) echo "unknown METHOD=$METHOD (see configs/experiment/)"; exit 1 ;;
 esac
 case "$DATA" in
-    ssv2)                  data_kind=clips ;;
-    imagenet|ssv2_frames)  data_kind=images ;;
-    *) echo "unknown DATA=$DATA (imagenet | ssv2 | ssv2_frames)"; exit 1 ;;
+    ssv2|epic)                         data_kind=clips;  SRC="$WRKDIR/data/${DATA}" ;;
+    imagenet)                          data_kind=images; SRC="" ;;
+    ssv2_frames|epic_frames)           data_kind=images; SRC="$WRKDIR/data/${DATA%_frames}" ;;
+    */*) [ -d "$DATA" ] || { echo "DATA=$DATA: no such folder"; exit 1; }
+                                       data_kind=auto;   SRC="$DATA" ;;
+    *) echo "unknown DATA=$DATA (imagenet | ssv2 | ssv2_frames | epic | epic_frames | a dataset folder's path)"; exit 1 ;;
 esac
-[ "$kind" = "$data_kind" ] || { echo "METHOD=$METHOD reads $kind, but DATA=$DATA is $data_kind"; exit 1; }
-[ "$METHOD" != imagenet_supervised ] || [ "$DATA" = imagenet ] || { echo "imagenet_supervised needs ImageNet's labels"; exit 1; }
+[ "$data_kind" = auto ] || [ "$kind" = "$data_kind" ] || { echo "METHOD=$METHOD reads $kind, but DATA=$DATA is $data_kind"; exit 1; }
+[ "$METHOD" != imagenet_supervised ] || [ "$DATA" = imagenet ] || [ "$data_kind" = auto ] || { echo "imagenet_supervised needs labels (ImageNet, or a labelled dataset folder)"; exit 1; }
 [ -z "$AUG" ] || [ -f "configs/augmentation/$AUG.yaml" ] || { echo "no configs/augmentation/$AUG.yaml"; exit 1; }
 [ -f "configs/embedding/$ARCH.yaml" ] || { echo "no configs/embedding/$ARCH.yaml"; exit 1; }
 
-OVERRIDES=(+experiment="$METHOD" embedding="$ARCH" pretrain_data="$DATA" seed="$SEED")
+if [ "$data_kind" = auto ]; then DATA_CFG=auto; else DATA_CFG="$DATA"; fi
+OVERRIDES=(+experiment="$METHOD" embedding="$ARCH" pretrain_data="$DATA_CFG" seed="$SEED")
 [ -z "$AUG" ] || OVERRIDES+=(augmentation="$AUG")
 if [ "$kind" = clips ]; then
     case "$AUG" in
@@ -106,10 +114,11 @@ if [ "$DATA" = imagenet ]; then
     [ -n "$TRAIN" ] && [ -d "$(dirname "$TRAIN")/val" ] || { echo "no train/ and val/ under $LOCAL"; exit 1; }
     ROOT=$(dirname "$TRAIN")
 else
-    need_kb=$(du -sk "$SSV2_SHARDS" | cut -f1)
+    python3 -m src.data.check "$SRC" --quick || { echo "$SRC isn't a dataset pretrain.py reads (above)"; exit 1; }
+    need_kb=$(du -sk "$SRC" | cut -f1)
     [ "$need_kb" -lt "$free_kb" ] || { echo "only $((free_kb / 1048576)) GB free in /tmp"; exit 1; }
-    echo "copying $SSV2_SHARDS -> $LOCAL"; time cp -r "$SSV2_SHARDS" "$LOCAL/ssv2"
-    ROOT="$LOCAL/ssv2"
+    ROOT="$LOCAL/$(basename "$SRC")"
+    echo "copying $SRC -> $ROOT"; time cp -r "$SRC" "$ROOT"
 fi
 
 # shellcheck disable=SC2086  # EXTRA is a list of overrides

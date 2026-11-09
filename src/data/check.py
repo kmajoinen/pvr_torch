@@ -128,9 +128,10 @@ def _check_starts(shard_dir: str, starts, lengths, row_ids, rep: Report, where: 
             "the index row of the video's first frame, before adding its frames)")
 
 def check_manifest(root: str, manifest: str, rep: Report, image_size: int, sample: int, full: bool,
-                   rng) -> Optional[dict]:
+                   rng, quick: bool = False) -> Optional[dict]:
     """One clip manifest. Returns facts for the suggested config (None if
-    unreadable)."""
+    unreadable). quick: skip the whole-manifest `start` check (it reads every
+    key in the index)."""
     import pandas as pd
     name = os.path.basename(manifest)
     try:
@@ -195,7 +196,8 @@ def check_manifest(root: str, manifest: str, rep: Report, image_size: int, sampl
                 continue
             if _shard_bounds(d, index, rep, where):
                 readers[d] = (index, ShardReader(d))
-            _check_starts(d, starts[rows], lengths[rows], np.flatnonzero(rows), rep, where)
+            if not quick:
+                _check_starts(d, starts[rows], lengths[rows], np.flatnonzero(rows), rep, where)
 
         def read(i, frame):
             index, reader = readers[paths[i]]
@@ -347,14 +349,59 @@ def _image_split_dirs(root: str, exclude=()) -> List[str]:
     return out
 
 
+def _prepared_subfolders(root: str) -> List[str]:
+    """Subfolders that are prepared datasets themselves (root pointed one level too high)."""
+    out = []
+    for e in sorted(os.scandir(root), key=lambda e: e.name):
+        if e.is_dir() and (glob.glob(os.path.join(e.path, "manifest*.csv"))
+                           or glob.glob(os.path.join(e.path, "*", "index.npz"))):
+            out.append(e.name)
+    return out
+
+
+def _known_source(root: str, files: List[str]) -> Optional[str]:
+    """A raw dataset this repo has a converter (or a plan) for, recognised by its
+    file names: what it is and the command that prepares it."""
+    import re
+    norm = [f.replace(os.sep, "/") for f in files]
+    if any(re.search(r"(^|/)P\d\d/videos/P\d\d_\d+\.mp4$", f, re.I) for f in norm):
+        return ("EPIC-KITCHENS videos (<P##>/videos/<id>.MP4): convert with python -m src.data.prepare_epic "
+                f"--videos {root} --annotations <clone of github.com/epic-kitchens/epic-kitchens-100-annotations> "
+                "--out <dataset folder> --split train (then --split validation); run_prepare_epic.sh does both")
+    if any(re.search(r"(^|/)\d+\.webm$", f) for f in norm) or any("something-something" in f.lower() for f in norm):
+        return ("Something-Something v2 (numbered .webm videos / its labels): convert with python -m "
+                "src.data.prepare_ssv2 (run_prepare_ssv2.sh extracts Triton's archive and converts both splits)")
+    if any(re.search(r"\.tar$", f) for f in norm) and any(re.search(r"\d{4,}\.tar$", f) for f in norm):
+        return ("numbered .tar files, probably WebDataset shards (e.g. imagenet-1k-wds): not read directly; "
+                "no converter yet (DATASETS.md section 5)")
+    if any(re.search(r"(^|/)(ILSVRC|LOC_val_solution\.csv|n\d{8}/)", f) for f in norm) or \
+            any(re.search(r"imagenet.*\.(zip|tar)$", f, re.I) for f in norm):
+        return ("ImageNet (ILSVRC files or <wnid> folders): convert with python -m src.data.prepare_imagenet "
+                f"--source {root} --out <dataset folder> (it also reads Kaggle's zip and the imagefolder tar)")
+    if any("tfrecord" in f for f in norm) or any(f.endswith(("dataset_info.json", "features.json")) for f in norm):
+        return ("TFDS/RLDS TFRecords (e.g. Open X-Embodiment, BridgeData's RLDS release): no converter yet; "
+                "DATASETS.md section 5 shows how to write one")
+    return None
+
+
 def _guess_unknown(root: str, rep: Report):
     """Nothing in a known layout: say what the folder looks like instead."""
+    rep.errors.append("no dataset in a format pretrain.py reads: expected manifest*.csv (video clips), or "
+                      "<split>/index.npz or <split>/<class>/<images> (images); see DATASETS.md")
+    nested = _prepared_subfolders(root)
+    if nested:
+        rep.notes.append(f"prepared datasets one level down: {', '.join(n + '/' for n in nested)} -- point the "
+                         f"root at one of them (e.g. {os.path.join(root, nested[0])})")
     # islice: a raw dataset can hold millions of files; look at the first 20k only.
     files = [os.path.relpath(p, root)
              for p in itertools.islice(glob.iglob(os.path.join(root, "**", "*"), recursive=True), 20000)]
+    known = _known_source(root, files)
+    if known:
+        rep.notes.append(f"looks like {known}")
+        return
     ext = lambda e: [f for f in files if f.lower().endswith(e)]          # noqa: E731
-    rep.errors.append("no dataset in a format pretrain.py reads: expected manifest*.csv (video clips), or "
-                      "<split>/index.npz or <split>/<class>/<images> (images); see DATASETS.md")
+    if not files:
+        rep.notes.append("the folder is empty")
     if ext(_VIDEO_EXT):
         rep.notes.append(f"found video files (e.g. {ext(_VIDEO_EXT)[0]!r}): decode them into frames + a "
                          "manifest (src/data/prepare_ssv2.py does this for SSv2; DATASETS.md, 'Video clips')")
@@ -367,12 +414,12 @@ def _guess_unknown(root: str, rep: Report):
     if ext(".tar"):
         rep.notes.append(f"found tar files (e.g. {ext('.tar')[0]!r}): WebDataset/other tars aren't read "
                          "directly; convert them (DATASETS.md)")
-    if ext(".tfrecord") or any("tfrecord" in f for f in files):
-        rep.notes.append("found TFRecords (RLDS/TFDS): not read directly; convert them (DATASETS.md)")
 
 
 def check_dataset(root: str, image_size: int = 224, sample: int = 200, full: bool = False,
-                  seed: int = 0) -> Report:
+                  seed: int = 0, quick: bool = False) -> Report:
+    """Everything under root, checked; quick (pretrain.py's startup check):
+    decode only `sample` items and skip the scans over a whole index."""
     rep = Report()
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -384,7 +431,7 @@ def check_dataset(root: str, image_size: int = 224, sample: int = 200, full: boo
     manifests = sorted(glob.glob(os.path.join(root, "manifest*.csv")))
     clip_dirs, clip_sizes, frame_folders = {}, {}, set()
     for m in manifests:
-        facts = check_manifest(root, m, rep, image_size, sample, full, rng)
+        facts = check_manifest(root, m, rep, image_size, sample, full, rng, quick=quick)
         if facts:
             if facts["shape"] is not None:
                 clip_sizes[os.path.basename(m)] = facts["shape"]
@@ -441,6 +488,90 @@ def check_dataset(root: str, image_size: int = 224, sample: int = 200, full: boo
     return rep
 
 
+# ── pretrain.py's startup check ───────────────────────────────────────────────
+
+def _missing(cfg: dict, root: str) -> List[str]:
+    """What the config names that isn't under root (existence only: cheap)."""
+    if not os.path.isdir(root):
+        return [f"{root} doesn't exist" if not os.path.exists(root) else f"{root} isn't a folder"]
+    out = []
+    if cfg.get("type") == "clips":
+        for key in ("train_manifest", "val_manifest"):
+            m = cfg.get(key)
+            if m and not os.path.isfile(m if os.path.isabs(m) else os.path.join(root, m)):
+                out.append(f"no {key} {m!r}")
+    else:
+        for key in ("train_split", "val_split"):
+            s = cfg.get(key)
+            if not s:
+                continue
+            d = os.path.join(root, s)
+            if os.path.isfile(os.path.join(d, "index.npz")):
+                continue
+            if not (os.path.isdir(d) and any(e.is_dir() for e in os.scandir(d))):
+                out.append(f"no {key} {s!r} (a shard folder with index.npz, or class folders)")
+    return out
+
+
+_KIND = {"clips": "a video-clip", "images": "an image"}
+
+
+def _wanted(cfg: dict) -> str:
+    if cfg.get("type") == "clips":
+        return "video clips (manifest*.csv + frames)"
+    return "images (<split>/index.npz shards or <split>/<class>/ folders)"
+
+
+def resolve_config(cfg: dict, want: str, image_size: int = 224, sample: int = 4) -> dict:
+    """pretrain.py's check of pretrain_data before anything expensive. cfg: the
+    pretrain_data config as a plain dict; want: clips | images, what the
+    objectives read. type auto: returns the config detected under root (as
+    check_dataset suggests it), with cfg's non-null values on top. Otherwise
+    returns cfg once what it names exists. Raises ValueError saying what the
+    folder holds instead and how to get from there to a run."""
+    root = os.path.abspath(str(cfg["root"]))
+    name, auto = cfg.get("name") or "auto", cfg.get("type") in (None, "auto")
+    if not auto:
+        missing = _missing(cfg, root)
+        if not missing:
+            return cfg
+    if not os.path.isdir(root):
+        raise ValueError(f"pretrain_data.root={root} doesn't exist" if not os.path.exists(root)
+                         else f"pretrain_data.root={root} isn't a folder")
+    rep = check_dataset(root, image_size=int(cfg.get("image_size") or image_size), sample=sample, quick=True)
+    found = [c for c in rep.configs.values() if c["type"] == want]
+    if auto and found:
+        out = dict(found[0])
+        out.update({k: v for k, v in cfg.items() if v is not None and k != "type"})
+        out["root"] = root
+        return out
+
+    if auto:
+        head = f"pretrain_data=auto: no {want} dataset in {root}"
+    else:
+        head = (f"pretrain_data={name} reads {_wanted(cfg)} from {root}, but: " + "; ".join(missing))
+    lines = [head, "", f"What {root} holds (python -m src.data.check {root} for the full check):"]
+    if rep.configs:
+        for c in rep.configs.values():
+            parts = ([f"train_manifest={c['train_manifest']}", f"val_manifest={c['val_manifest']}"]
+                     if c["type"] == "clips" else [f"train_split={c['train_split']}", f"val_split={c['val_split']}"])
+            lines.append(f"  - {_KIND[c['type']]} dataset: {', '.join(parts)}")
+        lines += [f"  - {m}" for m in rep.errors]
+    else:
+        lines += [f"  - {m}" for m in rep.errors + rep.notes]
+    other = [c for c in rep.configs.values() if c["type"] != want]
+    if found:
+        lines += ["", f"It is {_KIND[want]} dataset pretrain.py reads, in another layout than pretrain_data={name} "
+                      f"expects: use pretrain_data=auto, or the config python -m src.data.check prints."]
+    elif other:
+        reads = "videos" if want == "clips" else "images"
+        lines += ["", f"It holds {_KIND[other[0]['type']]} dataset, but the objectives read {want} ({reads}). "
+                      + ("A clip dataset's frame shards also work as images (pretrain_data=auto does that)."
+                         if want == "images" else
+                         "Image datasets can't feed clip objectives (R3M, VIP): they need videos.")]
+    raise ValueError("\n".join(lines))
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip(),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -448,9 +579,11 @@ def main(argv=None) -> int:
     p.add_argument("--image-size", type=int, default=224, help="encoder input side to check frames against")
     p.add_argument("--sample", type=int, default=200, help="videos/images decoded per manifest/split")
     p.add_argument("--full", action="store_true", help="decode every frame and image (slow)")
+    p.add_argument("--quick", action="store_true",
+                   help="what pretrain.py checks at startup: a few samples, no whole-index scans")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(argv)
-    rep = check_dataset(a.root, a.image_size, a.sample, a.full, a.seed)
+    rep = check_dataset(a.root, a.image_size, 8 if a.quick else a.sample, a.full, a.seed, quick=a.quick)
     print(rep.format())
     return 0 if rep.ok else 1
 

@@ -6,11 +6,16 @@ plus actions); see `GUIDE.md`, section 4.
 
 **In short:** a pretraining dataset is either **video clips** (a manifest CSV
 plus frames) or **images** (class folders, or shards). Convert your data
-into one of the two, write a small config, and check it:
+into one of the two and point a run at the folder; `pretrain_data=auto`
+works out the rest:
 ```bash
 python -m src.data.check /path/to/data        # reports problems, prints a config
-python pretrain.py +experiment=r3m pretrain_data=my_data pretrain_data.root=/path/to/data
+python pretrain.py +experiment=r3m pretrain_data=auto pretrain_data.root=/path/to/data
 ```
+A run checks its data folder at startup, before building the encoder: a
+folder that isn't what the config reads stops the run with what the folder
+holds instead (a raw EPIC, SSv2 or ImageNet download gets the command that
+converts it).
 
 ## 1. Which kind of data each method needs
 
@@ -115,6 +120,13 @@ first `eval_batches` batches.
 One file per dataset in `configs/pretrain_data/`, chosen with
 `pretrain_data=<name>`; `root` is usually set on the command line.
 
+**Or none:** `pretrain_data=auto` fills the config in at startup from what's
+under `root` (the same detection as `src.data.check`), picking the kind the
+objectives read: R3M and VIP get the clip manifests, MAE, MoCo and
+supervised get image splits (a clip dataset's frame shards count). The run
+prints the config it settled on; any key you set (`pretrain_data.every=5`)
+wins over the detected value.
+
 **Video clips** (`configs/pretrain_data/ssv2.yaml` is the reference):
 ```yaml
 name: my_videos               # used in run names
@@ -150,6 +162,12 @@ A method preset may override some of these (e.g. `+experiment=mae` sets
 **Existing converters:**
 - `python -m src.data.prepare_ssv2`: video files + a labels JSON -> clips
   (shards or frame folders). A starting point for other video datasets.
+- `python -m src.data.prepare_epic`: EPIC-KITCHENS-100's MP4s + its
+  annotation CSVs -> shards, each video once at a set fps (default 10), with
+  one clip per narrated segment (`manifest_<split>.csv`), one per whole
+  video (`manifest_<split>_videos.csv`) and, with `--window N`, videos cut
+  into parts of at most N seconds. The starting point for long videos with
+  timestamped annotations.
 - `python -m src.data.prepare_imagenet`: class folders (as a folder, a tar
   or Kaggle's zip) -> image shards.
 
@@ -209,16 +227,22 @@ It finds every manifest and image split under the root and checks:
 
 It ends with a suggested `configs/pretrain_data/*.yaml` for each layout it
 found, and exits with status 1 if there are errors. For a folder in no
-known layout, it says what it found instead (video files, loose images,
-tar files, TFRecords) and which section of this file applies.
+known layout, it says what it found instead: a raw dataset it recognises
+(EPIC-KITCHENS videos, SSv2, ImageNet, RLDS TFRecords such as Open
+X-Embodiment, WebDataset tars) with the command that converts it, prepared
+datasets one folder down, or else video files, loose images, tar files.
+
+`--quick` checks what `pretrain.py` checks at startup: a few samples, no
+scans over a whole index (`run_pretrain_generic.sh` runs it before copying
+a folder to the node).
 
 ## 7. Datasets worth converting next
 
-Candidates on Triton for pretraining, most relevant first (none prepared yet):
+Candidates on Triton for pretraining, most relevant first:
 
 | dataset | kind | why |
 |---|---|---|
-| EPIC-Kitchens | egocentric video + narrations | part of MVP's training data; narrations work like Ego4D's for R3M |
+| EPIC-Kitchens | egocentric video + narrations | part of MVP's training data; narrations work like Ego4D's for R3M. Converter: `prepare_epic.py` |
 | Open X-Embodiment, BridgeData | robot video + language instructions | in-domain data for R3M/VIP; frames for MAE |
 | CO3Dv2, MVImgNet, OmniObject3D | object-centric multi-view video | object views from many angles |
 | Open Images, LAION-400M (if stored as images), Hypersim | images | large image sets for MAE/MoCo |

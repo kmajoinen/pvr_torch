@@ -233,3 +233,116 @@ def test_a_non_square_manifest_is_compared_too(tmp_path):
     rep = _check(tmp_path)
     assert any("between manifests" in e and f"{S - 8}x{S + 8}" in e for e in rep.errors)
     assert rep.configs[tmp_path.name]["frames_as_stored"] is False
+
+
+# ── Raw sources, quick mode, pretrain.py's startup check ─────────────────────
+
+@pytest.mark.parametrize("files, expect", [
+    (["P01/videos/P01_01.MP4"], "prepare_epic"),
+    (["videos/12345.webm"], "prepare_ssv2"),
+    (["ILSVRC/Data/CLS-LOC/train/x.JPEG", "LOC_val_solution.csv"], "prepare_imagenet"),
+    (["bridge/0.1.0/dataset_info.json", "bridge/0.1.0/bridge-train.tfrecord-00000-of-00001"], "RLDS"),
+    (["wds/imagenet1k-train-000000.tar", "wds/imagenet1k-train-000001.tar"], "WebDataset"),
+])
+def test_known_raw_sources_name_their_converter(tmp_path, files, expect):
+    for f in files:
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / f).write_bytes(b"")
+    rep = _check(tmp_path)
+    assert not rep.ok and any(expect in n for n in rep.notes), rep.notes
+
+
+def test_a_prepared_dataset_one_level_down_is_pointed_out(tmp_path):
+    _clip_shards(tmp_path / "ssv2")
+    rep = _check(tmp_path)
+    assert not rep.ok and any("one level down: ssv2/" in n for n in rep.notes)
+
+
+def test_quick_skips_the_whole_index_scan(tmp_path):
+    _clip_shards(tmp_path, splits=(("train", [5, 8, 12]),))
+    df = pd.read_csv(tmp_path / "manifest_train.csv")
+    df["start"] += 1
+    df.loc[2, "len"] -= 1
+    df.to_csv(tmp_path / "manifest_train.csv", index=False)
+    assert any("consecutive frames" in e for e in _check(tmp_path).errors)
+    assert not any("consecutive frames" in e for e in _check(tmp_path, quick=True).errors)
+
+
+def _auto(root, **kw):
+    return {"name": None, "type": "auto", "root": str(root), **kw}
+
+
+def test_auto_picks_the_kind_the_objectives_read(tmp_path):
+    from src.data.check import resolve_config
+    _clip_shards(tmp_path)
+    clips = resolve_config(_auto(tmp_path), "clips", image_size=S)
+    assert clips["type"] == "clips" and clips["train_manifest"] == "manifest_train.csv"
+    assert clips["val_manifest"] == "manifest_validation.csv" and clips["image_size"] == S
+    frames = resolve_config(_auto(tmp_path), "images", image_size=S)     # the clip shards as images
+    assert frames["type"] == "images" and frames["train_split"] == "train" and frames["val_split"] == "validation"
+    assert frames["every"] == 10
+
+
+def test_auto_keeps_values_set_by_hand(tmp_path):
+    from src.data.check import resolve_config
+    _clip_shards(tmp_path)
+    out = resolve_config(_auto(tmp_path, every=3, name="mine", eval_batches=None), "images", image_size=S)
+    assert out["every"] == 3 and out["name"] == "mine" and out["eval_batches"] == 20
+
+
+def test_auto_on_class_folders(tmp_path):
+    from src.data.check import resolve_config
+    _image_folders(tmp_path)
+    out = resolve_config(_auto(tmp_path), "images")
+    assert out["train_split"] == "train" and out["val_split"] == "val" and out["every"] == 1
+
+
+def test_a_named_config_passes_through_when_its_files_exist(tmp_path):
+    from src.data.check import resolve_config
+    _clip_shards(tmp_path)
+    cfg = {"name": "x", "type": "clips", "root": str(tmp_path), "train_manifest": "manifest_train.csv",
+           "val_manifest": None, "image_size": 7}
+    assert resolve_config(cfg, "clips") is cfg
+
+
+def test_a_named_config_on_the_wrong_layout_says_what_is_there(tmp_path):
+    from src.data.check import resolve_config
+    _clip_shards(tmp_path)
+    cfg = {"name": "imagenet", "type": "images", "root": str(tmp_path), "train_split": "train",
+           "val_split": "val"}
+    with pytest.raises(ValueError) as e:
+        resolve_config(cfg, "images")
+    msg = str(e.value)
+    assert "no val_split 'val'" in msg and "an image dataset: train_split=train, val_split=validation" in msg
+    assert "pretrain_data=auto" in msg
+
+
+def test_auto_without_a_matching_dataset(tmp_path):
+    from src.data.check import resolve_config
+    _image_folders(tmp_path)
+    with pytest.raises(ValueError, match="Image datasets can't feed clip objectives"):
+        resolve_config(_auto(tmp_path), "clips")
+    (tmp_path / "rlds").mkdir()
+    (tmp_path / "rlds" / "x.tfrecord-00000-of-00001").write_bytes(b"")
+    with pytest.raises(ValueError, match="(?s)no clips dataset.*RLDS"):
+        resolve_config(_auto(tmp_path / "rlds"), "clips")
+    with pytest.raises(ValueError, match="doesn't exist"):
+        resolve_config(_auto(tmp_path / "nope"), "images")
+
+
+def test_pretrain_resolves_auto_before_building_anything(tmp_path):
+    from hydra import compose, initialize_config_dir
+    from pretrain import resolve_data
+    _clip_shards(tmp_path)
+    config_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        cfg = compose(config_name="config_pretrain",
+                      overrides=["+experiment=mae", "pretrain_data=auto", f"pretrain_data.root={tmp_path}",
+                                 f"pretrain_data.image_size={S}"])
+        bad = compose(config_name="config_pretrain",
+                      overrides=["+experiment=r3m", f"pretrain_data.root={tmp_path / 'missing'}"])
+    resolve_data(cfg)
+    assert cfg.pretrain_data.type == "images" and cfg.pretrain_data.train_split == "train"
+    assert cfg.pretrain_data.name == os.path.basename(str(tmp_path)) + "_frames"
+    with pytest.raises(ValueError, match="doesn't exist"):
+        resolve_data(bad)

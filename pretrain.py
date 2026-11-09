@@ -88,7 +88,7 @@ import time
 import hydra
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from src import distributed
 from src.augmentations import build_augmentation
@@ -119,6 +119,29 @@ def _check_objectives(cfg, data_type: str):
         raise ValueError(f"objectives {wrong} don't read {data_type} (pretrain_data.type), "
                          "see their needs_* in src/losses.py")
     return specs
+
+
+def resolve_data(cfg) -> None:
+    """Check pretrain_data.root holds what the config reads, before anything
+    expensive (src/data/check.py's resolve_config: a clear error saying what
+    the folder holds instead). type auto: cfg.pretrain_data becomes the config
+    detected there, for the kind of data the objectives read."""
+    from hydra.utils import to_absolute_path
+    from src.data.check import resolve_config
+    specs = list(_plain(cfg.objectives) or [])
+    if not specs:
+        return                          # _check_objectives says what's missing
+    want = "images" if all(c.needs_views > 0 for c in aux_loss_classes(specs)) else "clips"
+    data = _plain(cfg.pretrain_data)
+    if data.get("type") not in (None, "auto", want):
+        return                          # _check_objectives names the mismatch
+    data["root"] = to_absolute_path(str(data["root"]))
+    resolved = resolve_config(data, want)
+    if data.get("type") in (None, "auto"):
+        with open_dict(cfg):
+            cfg.pretrain_data = OmegaConf.create(resolved)
+        print("pretrain_data=auto, detected in the root:\n  "
+              + OmegaConf.to_yaml(cfg.pretrain_data).rstrip().replace("\n", "\n  "))
 
 
 def _shared_sampler(terms, train: bool):
@@ -379,13 +402,12 @@ def main(cfg: DictConfig) -> None:
     print(f"\nDevice: {device}" + (f" (one of {procs.world} processes)" if procs.active else ""))
 
     # ── Validate before anything expensive ────────────────────────────────────
-    data = cfg.pretrain_data
-    data_type = str(data.get("type", "clips"))
-    images = data_type == "images"
-    specs = _check_objectives(cfg, data_type)
+    if OmegaConf.is_missing(cfg.pretrain_data, "root"):
+        raise ValueError("pretrain_data.root must be set (the prepared dataset's folder)")
     local_batch = int(cfg.batch_size)
     if procs.active:
-        single_gpu = [s["name"] for s, c in zip(specs, aux_loss_classes(specs)) if not c.multi_gpu]
+        given = list(_plain(cfg.objectives) or [])
+        single_gpu = [s["name"] for s, c in zip(given, aux_loss_classes(given)) if not c.multi_gpu]
         if single_gpu:
             raise ValueError(f"objectives {single_gpu} run on one GPU for now: they use the whole batch "
                              "together (negatives, queues), which needs gathering across GPUs. "
@@ -406,8 +428,12 @@ def main(cfg: DictConfig) -> None:
                          "single frames (objectives pick several per video themselves)")
     if cfg.clip_augmentation not in ("shared", "per_frame"):
         raise ValueError(f"clip_augmentation={cfg.clip_augmentation!r}; expected shared or per_frame")
-    if OmegaConf.is_missing(data, "root"):
-        raise ValueError("pretrain_data.root must be set (the prepared dataset's folder)")
+    # The data folder, once the settings that need no data are checked
+    resolve_data(cfg)
+    data = cfg.pretrain_data
+    data_type = str(data.get("type", "clips"))
+    images = data_type == "images"
+    specs = _check_objectives(cfg, data_type)
     sch = schedule_settings(cfg, images)
     K = sch["updates_per_batch"]
     if cfg.get("train_images") is not None and not float(cfg.train_images) > 0:

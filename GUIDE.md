@@ -81,7 +81,8 @@ epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
   `run_imagenet.sh` (supervised or MoCo v2 on ImageNet), and
   `run_pretrain_generic.sh` (any network x data x method x augmentation,
   checked before submitting); each copies its data to the node's local disk;
-- data: `run_prepare_ssv2.sh` (the one-time SSv2 conversion);
+- data: `run_prepare_ssv2.sh` and `run_prepare_epic.sh` (the one-time SSv2
+  and EPIC-KITCHENS-100 conversions);
 - downstream: `run_sac.sh` / `run_ft_sac.sh` (SAC), `run_ft_r3m.sh` (SAC on
   your own R3M encoder), `run_ft_bc.sh` (BC);
 - `debug_*.sh`: short smoke tests (`debug_ddp.sh`: the same short run on 1
@@ -239,7 +240,8 @@ they're tested and smoke-run, but none has been through a full training run.
 
 The pretraining formats in full, with a conversion example, are in
 `DATASETS.md`; `python -m src.data.check <root>` checks a dataset and
-prints a config for it. In brief:
+prints a config for it, and `pretrain_data=auto pretrain_data.root=<root>`
+trains on any prepared folder without one. In brief:
 
 ### Pretraining: video clips
 

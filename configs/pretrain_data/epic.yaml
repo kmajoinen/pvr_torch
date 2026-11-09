@@ -1,0 +1,15 @@
+# EPIC-KITCHENS-100, prepared by src/data/prepare_epic.py (once per split):
+# one clip per narrated action segment ("open door"), frames at the --fps the
+# conversion used (default 10). R3M and VIP both use these segments (VIP
+# ignores the text). Longer horizons: train_manifest=manifest_train_win300s.csv
+# (5-minute windows, prepare_epic.py --window 300) or
+# manifest_train_videos.csv (whole videos, up to 62 min: VIP's start and goal
+# can then be an hour apart).
+name: epic
+type: clips
+root: ???                                # the --out folder of prepare_epic.py
+train_manifest: manifest_train.csv
+val_manifest: manifest_validation.csv
+image_size: 224                          # frame side the prep script wrote (--size)
+frames_as_stored: true                   # feed frames at their stored size (see ssv2.yaml)
+text_strip: 0                            # narrations have no prefix to cut

@@ -1,0 +1,25 @@
+# Any prepared dataset folder: pretrain.py looks at what's under `root` at
+# startup and fills in the rest (src/data/check.py's resolve_config): clips
+# (manifest*.csv) for clip objectives (R3M, VIP), images (<split>/ shards or
+# class folders, or a clip dataset's frame shards) for image ones (MAE, MoCo,
+# supervised). The run prints the config it settled on. Any key set here or
+# on the command line (pretrain_data.every=5, ...) wins over the detected one.
+name: null                  # null: the folder's name
+type: auto
+root: ???
+# clips
+train_manifest: null
+val_manifest: null
+frames_as_stored: null
+text_strip: null
+# images
+train_split: null
+val_split: null
+train_crop: null
+interpolation: null
+every: null
+val_every: null
+eval_resize: null
+eval_batches: null
+# both
+image_size: null            # null: the frames' stored size (clips) / 224 (images)
