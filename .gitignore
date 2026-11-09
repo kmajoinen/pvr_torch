@@ -25,3 +25,7 @@ TODO.md
 /out_debug/
 *.sh
 replay/
+
+# papers
+xqc.pdf
+*:Zone.Identifier

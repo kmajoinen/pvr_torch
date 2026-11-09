@@ -27,6 +27,13 @@ Defaults (encoder.grads=none, augmentation=none) give a frozen encoder,
 like train_sac.py. DrQ-v2's own conv encoder isn't included; any
 embedding works, including a trainable head (embedding.head=linear).
 
+algo=drqv2_xqc is the XQC paper's pixel recipe (Palenicek et al., ICLR
+2026, Table 2): the same agent, with XQC's BatchNorm + weight-normalised
+MLPs after DrQ-v2's trunks and a categorical cross-entropy critic on
+normalised rewards (src/rl/xqc.py, configs/algo/drqv2_xqc.yaml):
+    python train_drqv2.py algo=drqv2_xqc embedding=random env.image_size=84 \
+        embedding.frame_stack=3 encoder.grads=critic augmentation=random_shift
+
 Logged metrics reuse train_sac.py's keys where they mean the same thing
 (train/qf*_loss, train/qf*_values, train/target_q_mean, train/actor_loss,
 grad norms, encoder metrics, eval/*); DrQ-v2 adds train/actor_stddev.
@@ -77,6 +84,16 @@ from src.rl.common import (
     log_eval,
 )
 from src.rl.drqv2 import Actor, Critic, stddev_schedule
+from src.rl.xqc import (
+    DrQv2XQCActor,
+    RewardNormalizer,
+    actor_q,
+    bn_mode,
+    critic_loss as xqc_critic_loss,
+    drqv2_xqc_critic,
+    make_target,
+    project_weights,
+)
 from src.sac_utils import _success_fn_for, evaluate, make_env
 from src.timing import timer_from_config
 from src.views import CollapseMonitor
@@ -141,9 +158,26 @@ def main(cfg: DictConfig) -> None:
             raise ValueError(f"algo.{key} ({a[key]}) must be a multiple of "
                              f"algo.update_every_steps ({a.update_every_steps}): "
                              "logging and evaluation run on update steps")
-    actor = Actor(feat_dim, action_dim, a.feature_dim, a.hidden_dim).to(device)
-    critic = Critic(feat_dim, action_dim, a.feature_dim, a.hidden_dim).to(device)
-    critic_target = copy.deepcopy(critic).requires_grad_(False)
+    # algo=drqv2_xqc (arch: xqc): XQC's BatchNorm MLPs and categorical
+    # critic after DrQ-v2's trunks (src/rl/xqc.py).
+    xqc = a.get("arch", "drqv2") == "xqc"
+    if xqc:
+        if enc.strong_name is not None:
+            raise ValueError("augmentation.strong isn't supported with algo.arch=xqc")
+        actor = DrQv2XQCActor(feat_dim, action_dim, a.feature_dim, [a.hidden_dim] * a.num_blocks,
+                              normalize_last_layer=a.normalize_last_layer).to(device)
+        critic = drqv2_xqc_critic(feat_dim, action_dim, a).to(device)
+        if a.weight_norm:
+            project_weights(actor)
+            project_weights(critic)
+        critic_target = make_target(critic)
+        actor.eval()        # acting, evaluation and target actions: BN running statistics
+        critic.eval()
+    else:
+        actor = Actor(feat_dim, action_dim, a.feature_dim, a.hidden_dim).to(device)
+        critic = Critic(feat_dim, action_dim, a.feature_dim, a.hidden_dim).to(device)
+        critic_target = copy.deepcopy(critic).requires_grad_(False)
+    reward_norm = RewardNormalizer(a.gamma) if a.get("reward_normalization", False) else None
     actor_optimizer = optim.Adam(actor.parameters(), lr=a.lr)
     critic_optimizer = optim.Adam(critic.parameters(), lr=a.lr)
     eo = EncoderOptim(cfg, enc, embedding_net, device)
@@ -229,6 +263,8 @@ def main(cfg: DictConfig) -> None:
             to_env(torch.as_tensor(action, device=device)).cpu().numpy()
         )
         rb.add(obs, next_obs, action, reward, terminated, truncated)
+        if reward_norm is not None:
+            reward_norm.update(reward, terminated or truncated)
 
         if terminated or truncated:
             log_episode(info, global_step, wandb)
@@ -244,6 +280,8 @@ def main(cfg: DictConfig) -> None:
 
         # ---- sample + featurize -----------------------------------------------
         b_obs, b_next_obs, b_actions, b_rewards, b_discounts = rb.sample(a.batch_size)
+        if reward_norm is not None:
+            b_rewards = reward_norm.normalize(b_rewards)
 
         route_critic = routing in ("critic", "both")
         route_actor = routing in ("actor", "both")
@@ -267,14 +305,24 @@ def main(cfg: DictConfig) -> None:
         # ---- critic update ------------------------------------------------------
         with torch.no_grad():
             next_actions = actor(next_feats, std).sample(clip=a.stddev_clip)
-            tq1, tq2 = critic_target(next_feats, next_actions)
-            next_q_value = b_rewards + b_discounts * torch.min(tq1, tq2).view(-1)
-
-        q1, q2 = critic(feats, b_actions)
-        qf1_a_values, qf2_a_values = q1.view(-1), q2.view(-1)
-        qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-        qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-        qf_loss = qf1_loss + qf2_loss
+        if xqc:
+            # (s, a) and (s', a') in one BatchNorm batch; categorical CE.
+            qf_loss, xqc_stats = xqc_critic_loss(
+                critic, critic_target, feats, b_actions, next_feats, next_actions,
+                b_rewards, b_discounts,
+            )
+            per_critic, q, next_q_value = xqc_stats["per_critic"], xqc_stats["q"], xqc_stats["target_mean"]
+            qf1_loss, qf2_loss = per_critic[0], per_critic[min(1, len(per_critic) - 1)]
+            qf1_a_values, qf2_a_values = q[0], q[min(1, len(q) - 1)]
+        else:
+            with torch.no_grad():
+                tq1, tq2 = critic_target(next_feats, next_actions)
+                next_q_value = b_rewards + b_discounts * torch.min(tq1, tq2).view(-1)
+            q1, q2 = critic(feats, b_actions)
+            qf1_a_values, qf2_a_values = q1.view(-1), q2.view(-1)
+            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
         critic_loss = qf_loss
         qf_loss_strong = None
         if feats_strong is not None:
@@ -297,6 +345,8 @@ def main(cfg: DictConfig) -> None:
         (critic_loss if aux_total is None else critic_loss + aux_total).backward()
         q_gnorm = float(torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=grad_clip))
         critic_optimizer.step()
+        if xqc and a.weight_norm:
+            project_weights(critic)
         if enc_step_now:
             enc_gnorm_critic = eo.step()
 
@@ -307,10 +357,16 @@ def main(cfg: DictConfig) -> None:
             feats_pi = E.featurize(views.x_task, grad=True)
         else:
             feats_pi = feats.detach()
-        dist = actor(feats_pi, std)
-        pi = dist.sample(clip=a.stddev_clip)
-        aq1, aq2 = critic(feats_pi, pi)
-        actor_loss = -torch.min(aq1, aq2).mean()
+        if xqc:
+            # Actor in train mode, the critic in eval mode (XQC's BN modes).
+            with bn_mode(True, actor):
+                pi = actor(feats_pi, std).sample(clip=a.stddev_clip)
+            actor_loss = -actor_q(critic, feats_pi, pi).mean()
+        else:
+            dist = actor(feats_pi, std)
+            pi = dist.sample(clip=a.stddev_clip)
+            aq1, aq2 = critic(feats_pi, pi)
+            actor_loss = -torch.min(aq1, aq2).mean()
 
         if route_actor:
             eo.zero_grad()
@@ -318,6 +374,8 @@ def main(cfg: DictConfig) -> None:
         actor_loss.backward()
         actor_gnorm = float(torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=grad_clip))
         actor_optimizer.step()
+        if xqc and a.weight_norm:
+            project_weights(actor)
         if route_actor:
             enc_gnorm_actor = eo.step()
         # actor_loss.backward() also leaves grads on the critic; its
@@ -375,6 +433,12 @@ def main(cfg: DictConfig) -> None:
                 }
                 if qf_loss_strong is not None:
                     log["train/qf_loss_strong"] = qf_loss_strong.item() / 2.0
+                if xqc:
+                    if reward_norm is not None:
+                        log["train/reward_scale"] = reward_norm.scale
+                    if "mass_vmin" in xqc_stats:
+                        log["train/target_mass_vmin"] = xqc_stats["mass_vmin"].item()
+                        log["train/target_mass_vmax"] = xqc_stats["mass_vmax"].item()
                 log.update(encoder_log(enc, stack, eo, collapse, enc_gnorm_critic,
                                        enc_gnorm_actor, aux_total, aux_values))
                 wandb.log(log, step=global_step)

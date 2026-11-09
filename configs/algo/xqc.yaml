@@ -1,0 +1,47 @@
+# XQC (train_xqc.py, src/rl/xqc.py): SAC with BatchNorm + weight-normalised
+# MLPs and a categorical cross-entropy critic. Defaults are the paper's
+# proprioception settings (Table 1) and the authors' code
+# (danielpalenicek/xqc conf/agent/{base_agent,xqc}.yaml).
+name: xqc
+total_timesteps: 500_000      # agent steps
+buffer_size: 1_000_000
+buffer_compression: none      # none | zstd | lz4 | zlib: lossless per-frame compression of pixel
+                              #   buffers (~3-5x at 224px); zstd needs `pip install zstandard`,
+                              #   lz4 `pip install lz4`; zlib is built in but slower to decode
+buffer_compression_level: null  # codec level (null: zstd 3, lz4 0, zlib 1)
+buffer_decode_threads: 8      # threads reading/decompressing sampled batches (in the background)
+buffer_storage: ram           # ram | disk: frames (or the compressed arena) in a memory-mapped
+                              #   file on a local disk; the page cache holds what fits in --mem
+buffer_dir: null              # disk: its folder (null: /tmp/$SLURM_JOB_ID, the node's local disk;
+                              #   needs --tmp / a local-disk node)
+buffer_max_gb: null           # cap on compressed storage: the buffer stops growing there
+learning_starts: 5000         # uniform random actions, no updates, until here
+batch_size: 256
+updates_per_step: 2           # UTD: updates (each on its own batch) per agent step
+policy_delay: 3               # actor + temperature step on every 3rd update
+gamma: auto                   # auto: 1 - 5/T clipped to [0.95, 0.995], T = episode length in
+                              #   agent steps (Pendulum 0.975, BipedalWalker 0.995); or a number
+nstep: 1                      # n-step returns (never cross an episode end)
+action_repeat: 1              # env frames per agent step (XQC: 2 on DMC)
+tau: 0.005                    # Polyak coefficient for the target critics, every update
+critic_lr: 3.0e-4
+actor_lr: 3.0e-4              # also the temperature's (as in the authors' code)
+lr_end: 3.0e-5                # linear decay over total_timesteps * updates_per_step optimizer
+                              #   steps (each optimizer counts its own: the actor's, delayed,
+                              #   decays 3x slower, as with optax.conditionally_mask); null: constant
+critic_hidden: [512, 512, 512, 512]
+actor_hidden: [256, 256, 256, 256]
+n_critics: 2
+critic_loss: categorical      # categorical | mse (the paper's ablation)
+num_atoms: 101
+v_min: -5.0
+v_max: 5.0
+weight_norm: true             # project weight rows to unit norm after every step
+normalize_last_layer: true    # the output layers too (without their biases)
+reward_normalization: true    # rewards / running std of the discounted return
+init_alpha: 0.01
+target_entropy_scale: 0.5     # target entropy = -scale * action_dim
+grad_clip: null               # null: no clipping (XQC); norms still logged
+log_frequency: 1000
+eval_frequency: 10_000
+n_episodes_test: 5

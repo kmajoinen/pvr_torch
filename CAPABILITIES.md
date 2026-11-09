@@ -234,7 +234,7 @@ run's `embedding.yaml` lists every field.)
 
 | | options |
 |---|---|
-| agents | SAC (`train_sac.py`), DrQ-v2 (`train_drqv2.py`), DQN and discrete SAC for discrete actions (`train_discrete.py`), behavioural cloning (`train_bc.py`) |
+| agents | SAC (`train_sac.py`), DrQ-v2 (`train_drqv2.py`), XQC (`train_xqc.py`; its pixel recipe: `train_drqv2.py algo=drqv2_xqc`), DQN and discrete SAC for discrete actions (`train_discrete.py`), behavioural cloning (`train_bc.py`) |
 | environments | DeepMind Control (any domain/task), Adroit (door, hammer, pen, relocate), FrankaKitchen, Pendulum, BipedalWalker (needs Box2D); pixels or state; CarRacing configured (needs Box2D too, not yet tested on the cluster); FourRooms (discrete actions: `train_discrete.py`) |
 | BC datasets | V-D4RL, Minari, pickled trajectories |
 | encoder use | frozen (features cached in the buffer), or fine-tuned from the critic, actor, both, or the BC loss -- the whole encoder, its head, or chosen modules only (`encoder.trainable=[layer3]`); BatchNorm adaptation; frame stacking. How it connects and which gradients reach it: `GUIDE.md`, section 3 |

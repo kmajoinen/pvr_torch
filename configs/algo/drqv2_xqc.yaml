@@ -1,0 +1,22 @@
+# DrQ-v2 with XQC's critic and actor MLPs (train_drqv2.py algo=drqv2_xqc): the
+# paper's pixel recipe (Table 2). DrQ-v2's trunk, exploration schedule,
+# n-step returns and optimizer settings stay; after the trunk each network
+# is XQC's BatchNorm MLP (weight-normalised), and the critic is categorical.
+# Reward normalisation isn't listed in Table 2, but the [-5, 5] support
+# needs it at gamma 0.99 (DMC returns run into the hundreds).
+defaults:
+  - drqv2
+  - _self_
+
+name: drqv2_xqc
+arch: xqc
+hidden_dim: 1024
+num_blocks: 4                 # XQC blocks per network (actor and each critic)
+n_critics: 2
+critic_loss: categorical      # categorical | mse
+num_atoms: 101
+v_min: -5.0
+v_max: 5.0
+weight_norm: true
+normalize_last_layer: true
+reward_normalization: true

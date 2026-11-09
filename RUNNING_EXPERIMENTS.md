@@ -20,6 +20,11 @@ how to extend the repo is in `GUIDE.md`.
   frames: MAE as in MVP), producing a checkpoint the scripts above load as
   an embedding. Config: `configs/config_pretrain.yaml`. See
   [Pretraining](#pretraining-pretrainpy).
+- **`train_xqc.py`** — XQC (Palenicek et al., ICLR 2026): SAC with
+  BatchNorm + weight-normalised MLPs and a categorical critic, with the same
+  encoder, augmentation, buffer and wandb setup as `train_sac.py`. Config:
+  `configs/config_xqc.yaml`. Its pixel recipe (DrQ-v2 with XQC's networks)
+  is `train_drqv2.py algo=drqv2_xqc`. See [XQC](#xqc-train_xqcpy-algodrqv2_xqc).
 - **`train_discrete.py`** — discrete actions (FourRooms): DQN (`algo=dqn`,
   default) or discrete SAC (`algo=sac_discrete`), with the same encoder,
   augmentation, buffer and wandb setup as `train_sac.py`. Config:
@@ -626,6 +631,90 @@ each episode's real final observation, so a truncated episode (time limit)
 bootstraps from its own last state; before, its last transition's next_obs
 was the next episode's first frame. n-step returns never cross an episode
 end, and a terminated step gets discount 0.
+
+## XQC (`train_xqc.py`, `algo=drqv2_xqc`)
+
+XQC (Palenicek et al., "XQC: Well-conditioned Optimization Accelerates
+Deep Reinforcement Learning", ICLR 2026, arXiv:2509.25174), ported to
+PyTorch from the authors' JAX code (`danielpalenicek/xqc`, MIT) in
+`src/rl/xqc.py`. It changes only the actor's and critic's MLPs and the
+critic loss, in three parts the paper's ablations find each matter (BN
+most, then CE, then WN):
+
+- **BatchNorm** on the input and after every hidden Linear (Linear without
+  bias → BN → ReLU). The critic sees (s, a) and (s', a') as one batch, so
+  its statistics cover both; the target critic normalises with batch
+  statistics, the actor loss evaluates the critic with running ones.
+- **Weight normalisation**: after every optimizer step, each Linear's
+  weight rows are projected to unit norm (the BN after it makes that
+  harmless), which keeps the effective learning rate constant.
+- **Categorical critic**: 101 atoms on [-5, 5], cross-entropy against the
+  C51-projected target of the target critic with the smaller expected
+  value. Rewards are divided by the running std of the discounted return
+  (`algo.reward_normalization`), so values fit the support.
+
+The paper has two recipes, and the repo has both:
+
+| | `train_xqc.py` (state recipe, Table 1) | `train_drqv2.py algo=drqv2_xqc` (pixel recipe, Table 2) |
+|---|---|---|
+| agent | SAC: tanh-Gaussian policy, temperature from 0.01, target entropy −A/2 | DrQ-v2: deterministic actor, scheduled noise, no entropy term |
+| networks | input BN, critic 4 × 512 (×2), actor 4 × 256 | DrQ-v2's trunk (Linear + LayerNorm + Tanh, 50-d), then 4 × 1024 |
+| updates | 2 per agent step, actor every 3rd | 1 per 2 agent steps |
+| lr | 3e-4 → 3e-5 linear decay, Adam | 1e-4 constant, Adam |
+| targets | 1-step, γ from episode length (`gamma: auto`), τ 0.005 | 3-step, γ 0.99, τ 0.01 |
+
+```bash
+# State
+python train_xqc.py env=pendulum embedding=none
+# Frozen PVR features (the state recipe on encoder features)
+python train_xqc.py env=pendulum_pixels embedding=resnet50 +embedding.frame_stack=3
+# The paper's pixel recipe: encoder trained from the critic, random shift
+python train_drqv2.py algo=drqv2_xqc embedding=random env.image_size=84 \
+    embedding.frame_stack=3 encoder.grads=critic augmentation=random_shift
+```
+
+- **`gamma: auto`** is the authors' heuristic, `1 − 5/T` clipped to
+  [0.95, 0.995], with T the episode length in agent steps (Pendulum 0.975,
+  BipedalWalker 0.995, DMC at action repeat 2: 0.99). The startup log
+  prints it. A number overrides it.
+- **Learning-rate decay** copies the authors' code (optax's
+  `linear_schedule` inside `conditionally_mask`, checked against optax
+  0.2.3): each optimizer counts its own steps over
+  `total_timesteps × updates_per_step`, which includes the warm-up. So the
+  critic ends ~1% short of `lr_end` (500k steps, 5k warm-up), and the actor
+  and temperature, which step on every 3rd update, only get a third of the
+  way (3e-4 → ~2.1e-4). Probably an accident on their side, kept to match
+  their curves; `lr_end: null` keeps all three constant.
+- **Paper vs repo**: the paper's pixel experiments trained DrQ-v2's conv
+  encoder from scratch, and its state recipe used raw state. Using either
+  recipe on frozen pretrained features is untested in the paper. Table 2
+  doesn't list reward normalisation; it's on here, since DMC returns at γ
+  0.99 don't fit [-5, 5] without it.
+- **Ablations** (the paper's Fig. 10): `algo.critic_loss=mse`,
+  `algo.weight_norm=false`. Both scripts support every `encoder.*` option;
+  `augmentation.strong` isn't supported. `obs_norm` doesn't apply to
+  `train_xqc.py` (the networks start with their own BatchNorm).
+- **α is in normalised-reward units**: the entropy bonus is added inside
+  the normalised target, so `train/alpha` drifts with the reward scale.
+  Compare `train/alpha_reward_units` (α × reward scale) across tasks or
+  with SAC's `train/alpha`.
+- **Support saturation**: the normaliser divides by the return's std
+  without subtracting its mean, so on dense, same-sign rewards normalised
+  values can reach the [-5, 5] edges, where the critic can't tell actions
+  apart. `train/target_mass_vmin`/`vmax` log the target's probability on
+  the two edge atoms (`edge_mass=` in the console); values well above 0
+  mean the support is too narrow.
+- **Metrics** reuse `train_sac.py`'s keys, plus `train/critic_lr`,
+  `train/actor_lr`, `train/reward_scale` (the std rewards are divided by),
+  `train/alpha_reward_units`, `train/target_mass_vmin`/`vmax` and
+  `charts/updates` (gradient steps: XQC makes 2 per agent step, SAC 1,
+  DrQ-v2 ½, so compare against both). Runs are named `xqc_...`.
+- **Comparing with SAC**: besides the method, γ (0.975/0.99 vs 0.99), UTD
+  (2 vs 1), network size and input normalisation differ. SAC's networks
+  already LayerNorm encoder features (`obs_norm` auto), but per sample,
+  where XQC's input BatchNorm standardises each feature over the batch.
+  Set `algo.gamma` to the same number for both unless you want XQC as
+  published.
 
 ## Discrete actions (`train_discrete.py`)
 
