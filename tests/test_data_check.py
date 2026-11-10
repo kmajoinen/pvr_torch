@@ -252,6 +252,20 @@ def test_known_raw_sources_name_their_converter(tmp_path, files, expect):
     assert not rep.ok and any(expect in n for n in rep.notes), rep.notes
 
 
+def test_a_known_archive_names_its_converter(tmp_path):
+    (tmp_path / "something-something-v2.tar").write_bytes(b"")
+    rep = _check(tmp_path / "something-something-v2.tar")
+    assert any("not a folder" in e for e in rep.errors) and any("prepare_ssv2" in n for n in rep.notes)
+    assert any("doesn't exist" in e for e in _check(tmp_path / "nope").errors)
+
+
+def test_an_unrecognised_folder_is_described(tmp_path):
+    for f in ("apple_000.zip", "apple_001.zip", "ball_000.zip", "category_list.json"):
+        (tmp_path / f).write_bytes(b"")
+    note = " ".join(_check(tmp_path).notes)
+    assert "Top level (4)" in note and "3 .zip" in note and "1 .json" in note and "unpack" in note
+
+
 def test_a_prepared_dataset_one_level_down_is_pointed_out(tmp_path):
     _clip_shards(tmp_path / "ssv2")
     rep = _check(tmp_path)

@@ -414,6 +414,22 @@ def _guess_unknown(root: str, rep: Report):
     if ext(".tar"):
         rep.notes.append(f"found tar files (e.g. {ext('.tar')[0]!r}): WebDataset/other tars aren't read "
                          "directly; convert them (DATASETS.md)")
+    if files and not (ext(_VIDEO_EXT) or ext(_IMAGE_EXT) or ext(".tar")):
+        rep.notes.append(_contents(root, files))
+
+
+def _contents(root: str, files: List[str]) -> str:
+    """What an unrecognised folder holds: its top-level entries and the most
+    common file types (of the files scanned), so a converter can be planned."""
+    import collections
+    top = sorted(os.listdir(root))
+    paths = [f for f in files if os.path.isfile(os.path.join(root, f))]
+    kinds = collections.Counter(os.path.splitext(f)[1].lower() or "(no extension)" for f in paths)
+    archives = [k for k in kinds if k in (".zip", ".tgz", ".gz", ".7z", ".rar", ".bz2", ".xz")]
+    capped = " (first 20,000 entries)" if len(files) >= 20000 else ""
+    return (f"nothing recognised. Top level ({len(top)}): {', '.join(top[:12])}{', ...' if len(top) > 12 else ''}; "
+            f"files by type{capped}: {', '.join(f'{n:,} {k}' for k, n in kinds.most_common(8)) or 'none'}"
+            + (f". Archives ({', '.join(archives)}) aren't read: unpack and convert them" if archives else ""))
 
 
 def check_dataset(root: str, image_size: int = 224, sample: int = 200, full: bool = False,
@@ -423,7 +439,10 @@ def check_dataset(root: str, image_size: int = 224, sample: int = 200, full: boo
     rep = Report()
     root = os.path.abspath(root)
     if not os.path.isdir(root):
-        rep.errors.append(f"{root!r} is not a folder")
+        rep.errors.append(f"{root!r} is not a folder" if os.path.exists(root) else f"{root!r} doesn't exist")
+        known = os.path.isfile(root) and _known_source(root, [os.path.basename(root)])
+        if known:
+            rep.notes.append(f"looks like {known}")
         return rep
     rng = np.random.default_rng(seed)
     name = os.path.basename(root.rstrip(os.sep)) or "data"
