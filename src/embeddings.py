@@ -1,5 +1,6 @@
 import glob
 import os
+import pickle
 import numpy as np
 
 import torch
@@ -44,25 +45,46 @@ def _resolve_model_dir_override(embedding_name, model_dir):
 
 
 def _read_state_dict(path):
-    return _read_checkpoint(path)[0]
+    # model_dir lookups: known official files in a folder the user set up
+    # (MoCo, torchvision, ...), loaded as before -- some pickle more than tensors.
+    return _read_checkpoint(path, trust=True)[0]
 
 
-def _read_checkpoint(path):
+def _read_checkpoint(path, trust=False):
     """torch.load a checkpoint and unwrap the usual wrapper dicts: 'encoder'
-    (this repo's saved encoders), 'state_dict', 'model', and the official R3M
-    code's 'r3m' snapshots (image encoder only). Returns
+    (this repo's saved encoders), 'state_dict', 'model', the official R3M
+    code's 'r3m' snapshots (image encoder only), and Voltron's released
+    (state_dict, optimizer) files (src/vision_models/voltron.py).
+
+    trust=False (embedding.checkpoint, by default): only PyTorch's restricted
+    unpickler, which loads tensors and plain containers and runs no code. A
+    file that needs more (custom classes, argparse.Namespace, or a planted
+    payload) is refused unless the caller trusts its source
+    (embedding.trust_checkpoint=true). Returns
     (state_dict, build record): the record holds the embedding config the
     encoder was built with ('embedding' entry, or 'config'.embedding in a
     final_checkpoint.pt) and the frame size it encoded ('input_size'); both
     None for files that don't record them."""
-    # weights_only=False: PyTorch 2.6+ defaults torch.load to a restricted
-    # unpickler that rejects anything beyond plain tensors -- research
-    # checkpoints routinely bundle non-tensor metadata (training args,
-    # optimizer state) and fail to load at all otherwise. Fine here: paths
-    # are either this repo's own MODELS_DIR or a user-provided file, not
-    # arbitrary untrusted input.
-    raw = torch.load(path, map_location='cpu', weights_only=False)
+    # The full unpickler can run arbitrary code from the file, so it's never
+    # a silent fallback: everything this repo saves, torchvision weights and
+    # Voltron's files load restricted.
+    try:
+        raw = torch.load(path, map_location='cpu', weights_only=True)
+    except pickle.UnpicklingError as e:
+        if not trust:
+            raise ValueError(
+                f"{path!r} holds more than tensors (custom classes, an argparse "
+                "Namespace, ...), which only the full unpickler loads -- and that can run "
+                "arbitrary code from the file. If you trust its source, set "
+                "embedding.trust_checkpoint=true (+embedding.trust_checkpoint=true if "
+                "the embedding config doesn't list it)."
+            ) from e
+        raw = torch.load(path, map_location='cpu', weights_only=False)
     record = {'embedding': None, 'input_size': None}
+    from src.vision_models.voltron import convert_voltron, is_voltron_checkpoint
+    if is_voltron_checkpoint(raw):
+        # Voltron's released models: (state_dict, optimizer), its own names.
+        return convert_voltron(raw[0]), record
     if isinstance(raw, dict):
         # 'actor' marks train_sac.py's final_checkpoint.pt. A bare 'config'
         # entry doesn't: {"model": weights, "config": ...} is a common layout
@@ -193,6 +215,8 @@ from src.vision_models.mae import (
         mae_vit_large_patch16,
         mae_vit_huge_patch14,
         vit_s16,
+        vit_s16_h6,
+        vit_s16_h6_gap,
         vit_b16,
         vit_l16,
 )
@@ -279,7 +303,8 @@ DINOV2_ARCHS = ('dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg1
 # with 16px patches as MVP defines them), random-init only: weights come from
 # embedding.checkpoint -- a pretrain.py run (objective `mae`), or a released
 # MAE-format file (MAE, MVP, VC-1 encoders).
-VIT_ARCHS = {'vit_s16': vit_s16, 'vit_b16': vit_b16, 'vit_l16': vit_l16}
+VIT_ARCHS = {'vit_s16': vit_s16, 'vit_s16_h6': vit_s16_h6, 'vit_s16_h6_gap': vit_s16_h6_gap,
+             'vit_b16': vit_b16, 'vit_l16': vit_l16}
 
 # Architectures cfg.embedding.checkpoint can load into: their branches build
 # the model without touching any default weights when pretrained=False. The
@@ -1108,8 +1133,9 @@ class EmbeddingNet(nn.Module):
     def __init__(self, embedding_name, in_channels=3, pretrained=True, train=False,
                  disable_cuda=False, model_dir=None, arch=None, checkpoint=None,
                  preprocess=None, input_size=None, layer=None, head=None, head_dim=None,
-                 frame_stack=1, frame_fusion=None):
+                 frame_stack=1, frame_fusion=None, trust_checkpoint=False):
         super(EmbeddingNet, self).__init__()
+        self.trust_checkpoint = bool(trust_checkpoint)
 
         self.embedding_name = embedding_name
 
@@ -1195,7 +1221,8 @@ class EmbeddingNet(nn.Module):
             dummy_raw = self._raw_output(dummy_pre)
             # Fused per-frame outputs are already batch-first.
             self.head = make_head(head, dummy_raw, batch=2, head_dim=head_dim,
-                                  seq_first=False if self._per_frame else None)
+                                  seq_first=False if self._per_frame else None,
+                                  cls_token=getattr(self.embedding, "has_cls_token", True))
             self.out_size = int(np.prod(self._head_output(dummy_raw, batch=2).shape[1:]))
 
         # Whether the head's weights came from `checkpoint` (only a file saved
@@ -1345,7 +1372,7 @@ class EmbeddingNet(nn.Module):
         weights, without any key mismatch (an avgpool head has no weights; a
         preprocess change never touches them), so that's warned about.
         """
-        sd, record = _read_checkpoint(path)
+        sd, record = _read_checkpoint(path, trust=self.trust_checkpoint)
         if record['embedding'] is not None:
             self._warn_on_build_differences(path, record)
         if any(k.startswith('embedding.') for k in sd):

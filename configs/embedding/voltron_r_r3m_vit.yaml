@@ -1,0 +1,23 @@
+# Voltron's R-R3M ViT (Karamcheti et al. 2023; siddk/voltron-robotics): R3M's
+# objectives on a ViT-S/16 (6 heads, no CLS token), trained on
+# Something-Something v2. Released weights, converted on load
+# (src/vision_models/voltron.py): download r-r3m-vit.pt (Google Drive id
+# 1Yby5oB4oPc33IDQqYxwYjQV3-56hjCTW) into $WRKDIR/models. Feature: the mean of
+# the patch tokens after the final norm (Voltron's).
+# Input: raw [0, 255] pixels, no normalisation -- Voltron trained R-R3M that
+# way (official R3M normalises inside the model); std 1/255 multiplies the
+# [0, 1] frames by 255.
+name: voltron_r_r3m_vit
+arch: vit_s16_h6_gap
+checkpoint: ${oc.env:WRKDIR,.}/models/r-r3m-vit.pt
+pretrained: true
+train: false
+preprocess:
+  resize: 224
+  crop: 224
+  interpolation: bilinear
+  mean: [0.0, 0.0, 0.0]
+  std: [0.00392156862745098, 0.00392156862745098, 0.00392156862745098]
+layer: null
+head: null
+head_dim: null

@@ -9,6 +9,9 @@ name: custom            # label: run directories, wandb names
 arch: resnet18          # any embedding name with a random-init path
 checkpoint: ???
 pretrained: true
+trust_checkpoint: false # true: allow files that pickle more than tensors (e.g. MAE's
+                        # official checkpoints, with an argparse Namespace). Their
+                        # unpickling can run arbitrary code: only for trusted sources.
 train: false
 preprocess: null        # null = arch's built-in input pipeline; see
                         # preprocess_transforms() in src/embeddings.py

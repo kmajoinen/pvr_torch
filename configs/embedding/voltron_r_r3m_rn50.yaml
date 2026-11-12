@@ -1,0 +1,22 @@
+# Voltron's R-R3M ResNet-50 (Karamcheti et al. 2023; siddk/voltron-robotics):
+# R3M's objectives on a torchvision ResNet-50, trained on Something-Something
+# v2. Released weights, converted on load (src/vision_models/voltron.py):
+# download r-r3m-rn50.pt (Google Drive id 1t1gkQYr6JbRSkG3fGqy_9laFg_54IIJL)
+# into $WRKDIR/models. Feature: the 2048-d average-pooled output.
+# Input: raw [0, 255] pixels, no normalisation -- Voltron trained R-R3M that
+# way (official R3M normalises inside the model); std 1/255 multiplies the
+# [0, 1] frames by 255.
+name: voltron_r_r3m_rn50
+arch: resnet50
+checkpoint: ${oc.env:WRKDIR,.}/models/r-r3m-rn50.pt
+pretrained: true
+train: false
+preprocess:
+  resize: 224
+  crop: 224
+  interpolation: bilinear
+  mean: [0.0, 0.0, 0.0]
+  std: [0.00392156862745098, 0.00392156862745098, 0.00392156862745098]
+layer: null
+head: null
+head_dim: null

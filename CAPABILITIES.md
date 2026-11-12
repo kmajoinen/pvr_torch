@@ -94,9 +94,11 @@ there, on replay frames.
 | ResNet-18 / 34 / 50 | `resnet18`, `resnet34`, `resnet50` | 512 / 512 / 2048 (or `head=fc` to any width) | **done** (RN18 supervised, RN50 R3M) | yes | torchvision ImageNet; R3M (18/34/50); VIP, LIV (50); PVR's MoCo variants |
 | small 5-layer CNN | `random` | conv map | ready (untested in pretraining) | yes | — |
 | ViT-S/16, ViT-B/16, ViT-L/16 (MAE layout; ViT-S as in MVP, 12 heads) | `vit_s16`, `vit_b16`, `vit_l16` | CLS token, 384 / 768 / 1024 | ready (MAE / MVP) | yes, also from released 224px MAE-format files (MAE, MVP, VC-1) | — |
+| ViT-S/16 with 6 heads; without a CLS token (mean of the patch tokens) | `vit_s16_h6`, `vit_s16_h6_gap` | 384 | ready (`_gap` not for MAE, which needs a CLS token) | yes | Voltron's R-MVP (`h6`) and R-R3M ViT (`h6_gap`) |
 | DINOv2 ViT-S/B/L/g, 14px patches | `dinov2_vits14` ... | CLS token, 384 / 768 / 1024 / 1536 | **experimental**: one supervised and one MoCo step run on ViT-S; no recipe | yes | DINOv2 |
 | OpenCLIP ViT-B/32, ViT-L/14, RN50 | `openclip_*` | CLIP embedding | experimental (not tested) | yes | OpenCLIP (LAION), OpenAI |
-| released-only models | `r3m_*`, `vip_resnet50`, `liv_resnet50`, `mvp_*`, `vc1_*`, `mae_base`, `clip_vit`, `rl3d_resnet18`, ... | various | no: these builders always load their own weights | — | yes (the baselines to compare against) |
+| released-only models | `r3m_*`, `vip_resnet50`, `liv_resnet50`, `mvp_*` (download links dead since 2026-11), `vc1_*`, `mae_base`, `clip_vit`, `rl3d_resnet18`, ... | various | no: these builders always load their own weights | — | yes (the baselines to compare against) |
+| Voltron's reproductions, trained on SSv2 (the data our R3M/MVP runs use) | `voltron_r_mvp`, `voltron_r_r3m_vit`, `voltron_r_r3m_rn50` | 384 / 384 / 2048 | — (configs over the architectures above) | — | yes: R-MVP, R-R3M ViT-S and RN50, converted from Voltron's files |
 
 On any architecture: `embedding.layer` stops the network early (e.g.
 `layer2`, or the first 6 ViT blocks), and `embedding.head` picks how the

@@ -1,0 +1,22 @@
+# Voltron's R-MVP (Karamcheti et al. 2023; siddk/voltron-robotics): MVP's
+# recipe -- MAE, ViT-S/16 with 6 heads -- trained on Something-Something v2.
+# Released weights, converted on load (src/vision_models/voltron.py): download
+# r-mvp.pt (Google Drive id 1-ExshZ6EC8guElOv_s-e8gOJ0R1QEAfj) into
+# $WRKDIR/models. Feature: the CLS token after the final norm (MVP's;
+# Voltron's paper prefers attention-pooling the patch tokens, a trained head
+# this repo doesn't have -- layer: 12 + head: avgpool gives their mean).
+# Input: Voltron's -- resize 224, center crop, ImageNet mean/std.
+name: voltron_r_mvp
+arch: vit_s16_h6
+checkpoint: ${oc.env:WRKDIR,.}/models/r-mvp.pt
+pretrained: true
+train: false
+preprocess:
+  resize: 224
+  crop: 224
+  interpolation: bilinear
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+layer: null
+head: null
+head_dim: null

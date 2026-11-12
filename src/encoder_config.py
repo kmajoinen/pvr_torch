@@ -312,6 +312,8 @@ def embedding_kwargs(cfg) -> dict:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"embedding.checkpoint={emb.checkpoint!r}: no file at {path}")
         kwargs["checkpoint"] = path
+        # Full unpickling (arbitrary code) only for files the user vouches for.
+        kwargs["trust_checkpoint"] = bool(emb.get("trust_checkpoint", False))
     if emb.get("preprocess") is not None:
         from src.embeddings import preprocess_transforms
         spec = _plain(emb.preprocess)

@@ -318,43 +318,62 @@ class MAEEncoder(nn.Module):
     """MaskedAutoencoderViT's encoder: patch embedding, fixed sin-cos
     positions, CLS token, blocks, final norm. forward() runs it unmasked, with
     the patches in order, and returns the CLS token after the final norm (the
-    feature MAE, MVP and VC-1 use); forward_encoder() is MAE's masked pass."""
+    feature MAE, MVP and VC-1 use); forward_encoder() is MAE's masked pass.
+
+    class_token=False: no CLS token (positions for the patches only), and
+    forward() returns the mean of the patch tokens after the final norm --
+    Voltron's R-R3M ViT. has_cls_token tells token pooling which layout it
+    gets."""
 
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=1024, depth=24,
-                 num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm):
+                 num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm, class_token=True):
         super().__init__()
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=False)
+        self.has_cls_token = bool(class_token)
+        n_extra = 1 if self.has_cls_token else 0
+        if self.has_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + n_extra, embed_dim), requires_grad=False)
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         self.embed_dim = embed_dim
 
-        pos_embed = get_2d_sincos_pos_embed(embed_dim, int(num_patches**.5), cls_token=True)
+        pos_embed = get_2d_sincos_pos_embed(embed_dim, int(num_patches**.5), cls_token=self.has_cls_token)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         w = self.patch_embed.proj.weight.data
         torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        torch.nn.init.normal_(self.cls_token, std=.02)
+        if self.has_cls_token:
+            torch.nn.init.normal_(self.cls_token, std=.02)
         self.apply(_init_linear_and_norm)
 
     random_masking = MaskedAutoencoderViT.random_masking
-    forward_encoder = MaskedAutoencoderViT.forward_encoder
+
+    def forward_encoder(self, x, mask_ratio):
+        if not self.has_cls_token:
+            raise ValueError("MAE's masked encoder pass needs a CLS token: this ViT has none "
+                             "(a *_gap arch); pretrain MAE with a vit_* arch that has one")
+        return MaskedAutoencoderViT.forward_encoder(self, x, mask_ratio)
 
     def forward_features(self, x):
         """All tokens after the final norm, unmasked and in order (MAE's
-        forward_encoder at mask_ratio=0 would still shuffle them)."""
-        x = self.patch_embed(x) + self.pos_embed[:, 1:, :]
-        cls = (self.cls_token + self.pos_embed[:, :1, :]).expand(x.shape[0], -1, -1)
-        x = torch.cat((cls, x), dim=1)
+        forward_encoder at mask_ratio=0 would still shuffle them); the CLS
+        token first, if there is one."""
+        if not self.has_cls_token:
+            x = self.patch_embed(x) + self.pos_embed
+        else:
+            x = self.patch_embed(x) + self.pos_embed[:, 1:, :]
+            cls = (self.cls_token + self.pos_embed[:, :1, :]).expand(x.shape[0], -1, -1)
+            x = torch.cat((cls, x), dim=1)
         for blk in self.blocks:
             x = blk(x)
         return self.norm(x)
 
     def forward(self, x):
-        return self.forward_features(x)[:, 0]
+        tokens = self.forward_features(x)
+        return tokens[:, 0] if self.has_cls_token else tokens.mean(dim=1)
 
 
 class MAEDecoder(nn.Module):
@@ -400,9 +419,22 @@ def _vit(patch_size, embed_dim, depth, num_heads, **kwargs):
 
 # ViT encoders in MAE's layout, as MVP defines them (ir413/mvp,
 # mvp/backbones/vit.py). MVP's ViT-S/16 has 12 heads of width 32, not
-# DeiT's 6 of width 64; the parameter shapes are the same either way.
+# DeiT's 6 of width 64; the parameter shapes are the same either way, so a
+# checkpoint loads into either -- but computes a different function in the
+# wrong one.
 def vit_s16(**kwargs):
     return _vit(16, 384, 12, 12, **kwargs)
+
+
+# ViT-S/16 with 6 heads (DeiT; the MVP paper's stated setting; Voltron's
+# R-MVP, siddk/voltron-robotics). _gap: no CLS token, the mean of the patch
+# tokens after the final norm (Voltron's R-R3M ViT).
+def vit_s16_h6(**kwargs):
+    return _vit(16, 384, 12, 6, **kwargs)
+
+
+def vit_s16_h6_gap(**kwargs):
+    return _vit(16, 384, 12, 6, class_token=False, **kwargs)
 
 
 def vit_b16(**kwargs):

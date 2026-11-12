@@ -131,6 +131,8 @@ mae_base
 moco_aug
 dinov2_vits14  dinov2_vitb14  dinov2_vitl14  dinov2_vitg14
 vit_s16  vit_b16  vit_l16      (random init; weights via `checkpoint`)
+vit_s16_h6  vit_s16_h6_gap     (ViT-S with 6 heads; _gap: no CLS token, mean-pooled)
+voltron_r_mvp  voltron_r_r3m_vit  voltron_r_r3m_rn50
 custom_checkpoint
 ```
 
@@ -154,8 +156,15 @@ Three optional fields on any embedding config (see `EmbeddingNet` in
   (which also take MAE-format files: MAE, MVP, VC-1 encoders); the other
   encoders always load their own default weights first, so they're rejected
   at startup. Relative paths resolve against the directory
-  you launch from. `embedding=custom_checkpoint` is a ready-made template
-  that requires `checkpoint`:
+  you launch from. Files are read with PyTorch's restricted unpickler
+  (tensors and plain containers; nothing in the file can run): everything
+  this repo saves, torchvision weights and Voltron's releases load that way.
+  A file that pickles more (custom classes, an `argparse.Namespace`, as in
+  MAE's official checkpoints) stops the run unless
+  **`trust_checkpoint=true`** (`+embedding.trust_checkpoint=true` where the
+  config doesn't list it): the full unpickler can run arbitrary code from
+  the file, so set it only for sources you trust. `embedding=custom_checkpoint`
+  is a ready-made template that requires `checkpoint`:
   ```bash
   python train_sac.py embedding=custom_checkpoint embedding.name=my_run \
       embedding.arch=resnet18 embedding.checkpoint=/path/to/weights.pt
@@ -282,7 +291,15 @@ python train_sac.py embedding=resnet50 embedding.name=resnet50_l3
 - `r3m_*` — via `load_r3m(...)`, downloads from Google Drive (`gdown`) to R3M's own cache dir on first use. On clusters whose compute nodes have no outbound internet (Triton's do have it), run once on the login node first to warm the cache, or the job will fail trying to download mid-run.
 - `vip_resnet50` — via `load_vip(...)`, same lab/codebase as R3M, same download-cache behavior and caveat. Install it without its dependencies (`pip install gdown && pip install --no-deps git+https://github.com/facebookresearch/vip.git`): its `setup.py` pins `hydra-core==1.1.1`, `omegaconf==2.1.1`, `pillow==9.0.1` and `gdown==4.4.0`, and Hydra 1.1 has no `version_base`, which every script here uses -- a plain install (or reinstall) stops them all from starting. R3M's `setup.py` only sets minimum versions, so a plain install is fine there.
 - `liv_resnet50` — via `load_liv(...)`, own cache dir/download on first use. Needs a two-step install (`pip install` the repo, then a nested `cd liv/models/clip && pip install -e .`) — not in `requirements.txt`, see the comment there.
-- `mvp_*` (5 variants) — via `mvp.load(...)`, own cache dir/download on first use (Berkeley Box-hosted). Genuinely pip-installable with no version conflicts, unlike VC-1.
+- `mvp_*` (5 variants) — via `mvp.load(...)`, which downloads to a hardcoded `/tmp/mvp-download-cache/` on first use. **Unavailable as of 2026-11-12:** all five Berkeley Box links return 404, and no mirror is known. Use `voltron_r_mvp` (below) as the MVP reference, or your own `+experiment=mvp` run.
+- `voltron_r_mvp`, `voltron_r_r3m_vit`, `voltron_r_r3m_rn50` — Voltron's released reproductions of MVP and R3M, trained on Something-Something v2 (Karamcheti et al. 2023): R-MVP is MAE on a ViT-S/16 with 6 heads (`vit_s16_h6`), R-R3M ViT is R3M on a ViT-S/16 with 6 heads and no CLS token (`vit_s16_h6_gap`, mean-pooled), R-R3M RN50 is R3M on a ResNet-50. No package needed: Voltron's `(state_dict, optimizer)` files are converted on load (`src/vision_models/voltron.py`; `tests/test_voltron.py` checks the features against a port of Voltron's forward pass). Download from Google Drive into `$WRKDIR/models` (the configs' default path; `${oc.env:WRKDIR,.}/models/...`, so `./models` without `WRKDIR`), keeping Voltron's file names:
+  ```bash
+  pip install gdown
+  gdown 1-ExshZ6EC8guElOv_s-e8gOJ0R1QEAfj -O $WRKDIR/models/r-mvp.pt        # 281 MB
+  gdown 1Yby5oB4oPc33IDQqYxwYjQV3-56hjCTW -O $WRKDIR/models/r-r3m-vit.pt    # 555 MB (incl. DistilBERT)
+  gdown 1t1gkQYr6JbRSkG3fGqy_9laFg_54IIJL -O $WRKDIR/models/r-r3m-rn50.pt   # 616 MB (incl. DistilBERT)
+  ```
+  Inputs differ: R-MVP takes ImageNet-normalised images; both R-R3M models take raw [0, 255] pixels (Voltron trained them that way, unlike official R3M), so R-R3M RN50's features are large (std in the thousands; the RL networks' input LayerNorm handles that). Each config sets its model's preprocessing. Voltron's own `VMVP.encode()` has a bug (the CLS token is concatenated without `dim=1`, so it fails as released); MVP's code, which it cites, and this repo use `dim=1`.
 - `random` — freshly initialized, no weights at all.
 - `none` — no embedding, raw state passed straight through.
 

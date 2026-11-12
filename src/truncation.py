@@ -156,14 +156,19 @@ class _SpatialAvgPool(nn.Module):
 
 
 class _TokenPool(nn.Module):
-    def __init__(self, mode: str, seq_first: bool):
+    """cls: token 0; mean: the patch tokens' mean (all tokens when the model
+    has no CLS token)."""
+
+    def __init__(self, mode: str, seq_first: bool, cls_token: bool = True):
         super().__init__()
-        self.mode, self.seq_first = mode, seq_first
+        self.mode, self.seq_first, self.cls_token = mode, seq_first, cls_token
 
     def forward(self, x):
         if self.seq_first:   # (T, N, D) -> (N, T, D), e.g. OpenAI CLIP
             x = x.transpose(0, 1)
-        return x[:, 0] if self.mode == "cls" else x[:, 1:].mean(dim=1)
+        if self.mode == "cls":
+            return x[:, 0]
+        return x[:, 1:].mean(dim=1) if self.cls_token else x.mean(dim=1)
 
 
 class _LinearHead(nn.Module):
@@ -229,10 +234,12 @@ def fuse_frames(raw: torch.Tensor, batch: int, frames: int, mode: str) -> torch.
 
 
 def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
-              head_dim: Optional[int] = None, seq_first: Optional[bool] = None) -> nn.Module:
+              head_dim: Optional[int] = None, seq_first: Optional[bool] = None,
+              cls_token: bool = True) -> nn.Module:
     """Head for an encoder whose raw output on a dummy batch of `batch`
     frames is `sample`. seq_first: token layout if already known (None:
-    detect it)."""
+    detect it). cls_token: whether token 0 is a CLS token (False: a ViT
+    without one, e.g. vit_s16_h6_gap)."""
     if head is not None and head not in HEADS:
         raise ValueError(f"embedding.head={head!r}; expected one of {HEADS}")
     if head_dim is not None and head not in TRAINABLE_HEADS:
@@ -260,11 +267,13 @@ def make_head(head: Optional[str], sample: torch.Tensor, batch: int,
     if head == "cls":
         if kind != "tokens":
             raise ValueError(f"embedding.head=cls needs transformer tokens; this layer outputs a {kind}")
+        if not cls_token:
+            raise ValueError("embedding.head=cls: this ViT has no CLS token; use avgpool (the patch tokens' mean)")
         return _TokenPool("cls", seq_first)
     if head == "avgpool":
         if kind == "vector":
             raise ValueError("embedding.head=avgpool: this output is already a vector (nothing to pool)")
-        return _SpatialAvgPool() if kind == "map" else _TokenPool("mean", seq_first)
+        return _SpatialAvgPool() if kind == "map" else _TokenPool("mean", seq_first, cls_token)
     # head=None
     if kind == "tokens":
         raise ValueError("a transformer layer's tokens need embedding.head (avgpool, cls, flatten, linear or fc)")
