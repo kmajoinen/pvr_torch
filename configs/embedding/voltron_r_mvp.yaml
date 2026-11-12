@@ -2,14 +2,17 @@
 # recipe -- MAE, ViT-S/16 with 6 heads -- trained on Something-Something v2.
 # Released weights, converted on load (src/vision_models/voltron.py): download
 # r-mvp.pt (Google Drive id 1-ExshZ6EC8guElOv_s-e8gOJ0R1QEAfj) into
-# $WRKDIR/models. Feature: the CLS token after the final norm (MVP's;
+# $WRKDIR/models. Feature: the CLS token after the final norm (MVP's).
 # Voltron's paper prefers attention-pooling the patch tokens, a trained head
-# this repo doesn't have -- layer: 12 + head: avgpool gives their mean).
+# this repo doesn't have; layer: 12 + head: avgpool gives the patch tokens'
+# mean before the final norm (truncated outputs skip it), which is neither.
 # Input: Voltron's -- resize 224, center crop, ImageNet mean/std.
 name: voltron_r_mvp
 arch: vit_s16_h6
 checkpoint: ${oc.env:WRKDIR,.}/models/r-mvp.pt
-pretrained: true
+pretrained: false       # the weights come from `checkpoint`; without one this is a
+                        # visibly random encoder (run tagged -scratch), never e.g.
+                        # torchvision's ImageNet weights under this name
 train: false
 preprocess:
   resize: 224

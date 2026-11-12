@@ -23,10 +23,12 @@ therefore differs from the model's normal output, which applies the final
 LayerNorm). The RL heads normalise their input anyway.
 
 `head` turns that output into a vector:
-  avgpool   ResNet maps: mean over H, W. Tokens: mean over patch tokens
-            (token 0, the CLS token, excluded). No parameters. Default when
-            `layer` is set.
-  cls       tokens only: token 0. No parameters.
+  avgpool   ResNet maps: mean over H, W. Tokens: mean over the patch tokens
+            (token 0, the CLS token, excluded; a ViT without a CLS token,
+            e.g. vit_s16_h6_gap, averages all of them). No parameters.
+            Default when `layer` is set.
+  cls       tokens only: token 0 (refused for a ViT without a CLS token).
+            No parameters.
   flatten   the whole map or token sequence as one vector. No parameters, so
             the RL heads' own first layers do the projecting. Very wide:
             ResNet18 layer2 is 128 x 11 x 11 = 15.5k at 84px, 100k at 224px.

@@ -25,9 +25,11 @@ trained them that way, unlike official R3M, which normalises internally).
 The embedding configs (configs/embedding/voltron_*.yaml) set this.
 """
 
+from functools import partial
 from typing import Dict
 
 import torch
+import torch.nn as nn
 
 # Voltron block -> MAE/timm block (src/vision_models/mae.py's Block).
 _BLOCK_RENAMES = (
@@ -39,6 +41,12 @@ _BLOCK_RENAMES = (
 # Parts that aren't the image encoder: MAE decoder (R-MVP), language model and
 # reward head (R-R3M).
 _DROPPED = ("decoder_", "encoder2decoder.", "mask_token", "lm.", "language_reward.")
+
+# R-MVP's MAE decoder (Voltron's conf/models.py, MVPSmallConfig). MAEDecoder's
+# own defaults (16 heads, LayerNorm eps 1e-5) take the same weight shapes at
+# width 192, so the wrong settings would load silently: build it with
+# rmvp_decoder().
+RMVP_DECODER = dict(decoder_embed_dim=192, decoder_depth=6, decoder_num_heads=6)
 
 
 def is_voltron_checkpoint(raw) -> bool:
@@ -54,6 +62,37 @@ def _rename_block(key: str) -> str:
     for old, new in _BLOCK_RENAMES:
         key = key.replace(old, new)
     return key
+
+
+def convert_voltron_decoder(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """R-MVP's state_dict -> its MAE decoder's, in MAEDecoder's names (for
+    checking a pretraining pipeline's reconstruction loss against the
+    released model)."""
+    out = {}
+    for k, v in state_dict.items():
+        if k.startswith("encoder2decoder."):
+            out["decoder_embed." + k.split(".", 1)[1]] = v
+        elif k == "mask_token":
+            out["mask_token"] = v
+        elif k == "decoder_pe":
+            out["decoder_pos_embed"] = v
+        elif k.startswith("decoder_blocks."):
+            out["decoder_blocks." + _rename_block(k.split(".", 1)[1])] = v
+        elif k.startswith("decoder_norm."):
+            out[k] = v
+        elif k.startswith("decoder_prediction."):
+            out["decoder_pred." + k.split(".", 1)[1]] = v
+    if not out:
+        raise KeyError("no MAE decoder in this Voltron checkpoint (only R-MVP has one)")
+    return out
+
+
+def rmvp_decoder(norm_pix_loss: bool = True):
+    """An MAEDecoder with R-MVP's settings: 6 blocks of width 192 with 6
+    heads, LayerNorm eps 1e-6, for a ViT-S/16 at 224px."""
+    from src.vision_models.mae import MAEDecoder
+    return MAEDecoder(num_patches=196, patch_size=16, embed_dim=384, **RMVP_DECODER,
+                      norm_layer=partial(nn.LayerNorm, eps=1e-6), norm_pix_loss=norm_pix_loss)
 
 
 def convert_voltron(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

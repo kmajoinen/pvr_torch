@@ -9,7 +9,9 @@
 name: voltron_r_r3m_rn50
 arch: resnet50
 checkpoint: ${oc.env:WRKDIR,.}/models/r-r3m-rn50.pt
-pretrained: true
+pretrained: false       # the weights come from `checkpoint`; without one this is a
+                        # visibly random encoder (run tagged -scratch), never e.g.
+                        # torchvision's ImageNet weights under this name
 train: false
 preprocess:
   resize: 224

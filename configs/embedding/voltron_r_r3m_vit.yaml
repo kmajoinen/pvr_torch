@@ -10,7 +10,9 @@
 name: voltron_r_r3m_vit
 arch: vit_s16_h6_gap
 checkpoint: ${oc.env:WRKDIR,.}/models/r-r3m-vit.pt
-pretrained: true
+pretrained: false       # the weights come from `checkpoint`; without one this is a
+                        # visibly random encoder (run tagged -scratch), never e.g.
+                        # torchvision's ImageNet weights under this name
 train: false
 preprocess:
   resize: 224
