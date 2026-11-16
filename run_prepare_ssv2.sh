@@ -20,7 +20,9 @@ module load mamba
 source activate pvr_env/
 
 ARCHIVE=/scratch/shareddata/dldata/something-something-v2.tar
+RESIZE="${RESIZE:-squash}"
 OUT="$WRKDIR/data/ssv2"
+[ "$RESIZE" = squash ] || OUT="${OUT}_$RESIZE"
 LOCAL="/tmp/ssv2-$SLURM_JOB_ID"       # /tmp is per user, not per job
 mkdir -p "$LOCAL"
 trap 'rm -rf "$LOCAL"' EXIT
@@ -37,5 +39,5 @@ LABELS="$LOCAL/something-something-v2-labels/labels"
 
 for split in train validation; do
     srun python -m src.data.prepare_ssv2 --videos "$VIDEOS" --labels "$LABELS/$split.json" \
-        --out "$OUT" --split $split --workers $SLURM_CPUS_PER_TASK
+        --out "$OUT" --split $split --resize "$RESIZE" --workers $SLURM_CPUS_PER_TASK
 done
