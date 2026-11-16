@@ -920,6 +920,33 @@ VIP comparable to the official setup (R3M's Ego4D clips, at most a few
 minutes long; VIP ignores the text). VIP draws its goal anywhere after the
 start frame, so whole videos (`pretrain_data.train_manifest=manifest_train_videos.csv`)
 put start and goal up to an hour apart: use them only for that on purpose.
+
+**Open X-Embodiment** (~55 robot datasets in TFDS/RLDS format, on Triton in
+`/scratch/shareddata/dldata/open_x_embodiment/tensorflow_datasets/<name>_<version>/`):
+`run_prepare_oxe.sh` converts one dataset per job (`DATASET`, default
+`bridge_0.1.0`) into `$WRKDIR/data/oxe/<name>`:
+```bash
+LIMIT=20 sbatch run_prepare_oxe.sh                          # timing run: 20 files per split
+sbatch run_prepare_oxe.sh                                   # Bridge
+DATASET=fractal20220817_data_0.1.0 sbatch run_prepare_oxe.sh
+DATASET=taco_play_0.1.0 CAMERA=all sbatch run_prepare_oxe.sh   # every camera, one clip each
+DATASET=droid EVERY=3 sbatch run_prepare_oxe.sh             # 15 Hz -> 5 Hz, Bridge's rate
+```
+Each episode becomes one clip of the main camera's frames, with its
+language instruction as `txt`; the log lists the dataset's cameras and text
+fields (`CAMERA=<name>` picks another). Datasets with only a train split
+(most of OXE) hold out 2% of its files as `validation`. The TFRecords are
+large and the output smaller: Bridge is 416 GB of 640×480 PNG frames (25k
+train and 3.5k test episodes) and about 30 GB as 224×224 JPEGs (~25 KB per
+frame); fractal is 119 GB, language_table 429 GB, kuka 835 GB, droid 1.8 TB.
+The output is what fills `$WRKDIR`: DROID's ~19M frames per camera at 15 Hz
+would be ~470 GB, so convert it with `EVERY=3` (every third step: 5 Hz, as
+Bridge, which also keeps R3M/VIP's frame spacing comparable across datasets).
+Time each dataset with `LIMIT=20` first: it prints minutes per GB read, and,
+scaled by GB read, the projected hours and output size. Run `quota` and
+compare before the full run (not resumable: a run that hits the time limit
+or the quota loses everything). Train with `DATA=$WRKDIR/data/oxe/bridge` in
+`run_pretrain_generic.sh` (auto config).
 In between, `--window 300` adds `manifest_<split>_win300s.csv` (videos cut
 into parts of at most 5 minutes; 1,172 for train). `frame_times_<split>.npz`
 records each stored frame's time, so `--manifests-only` adds or rebuilds
@@ -1322,8 +1349,9 @@ pretraining ones copy (or extract) their data to the node's local disk at
 job start and resume from `checkpoint.pt` when resubmitted with the same
 `RUN_DIR` (chain jobs with `sbatch --dependency=afterany:<jobid>`).
 
-- **Data:** `run_prepare_ssv2.sh` and `run_prepare_epic.sh`, the one-time
-  SSv2 and EPIC-KITCHENS-100 conversions to shards (CPU jobs).
+- **Data:** `run_prepare_ssv2.sh`, `run_prepare_epic.sh` and
+  `run_prepare_oxe.sh`, the one-time SSv2, EPIC-KITCHENS-100 and Open
+  X-Embodiment conversions to shards (CPU jobs).
 - **Pretraining:** `run_pretrain.sh` (R3M, ResNet-50 on SSv2),
   `run_vip.sh` (VIP), `run_r3m_vit.sh` (R3M on ViT-S/16),
   `run_mvp_epochs.sh` / `run_mvp_images.sh` (MVP, the two budgets),

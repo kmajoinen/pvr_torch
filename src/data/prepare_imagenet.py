@@ -307,5 +307,15 @@ def main(argv=None):
         print(f"  -> {out}: {w.num_shards} shards")
 
 
+
+def detect(root: str, files):
+    """check.py's hint for raw ImageNet (relative paths under root)."""
+    if any(re.search(r"(^|/)(ILSVRC|LOC_val_solution\.csv|n\d{8}/)", f) for f in files) or \
+            any(re.search(r"imagenet.*\.(zip|tar)$", f, re.I) for f in files):
+        return ("ImageNet (ILSVRC files or <wnid> folders): convert with python -m src.data.prepare_imagenet "
+                f"--source {root} --out <dataset folder> (it also reads Kaggle's zip and the imagefolder tar)")
+    return None
+
+
 if __name__ == "__main__":
     main()

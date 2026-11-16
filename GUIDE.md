@@ -81,8 +81,9 @@ epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
   `run_imagenet.sh` (supervised or MoCo v2 on ImageNet), and
   `run_pretrain_generic.sh` (any network x data x method x augmentation,
   checked before submitting); each copies its data to the node's local disk;
-- data: `run_prepare_ssv2.sh` and `run_prepare_epic.sh` (the one-time SSv2
-  and EPIC-KITCHENS-100 conversions);
+- data: `run_prepare_ssv2.sh`, `run_prepare_epic.sh` and
+  `run_prepare_oxe.sh` (the one-time SSv2, EPIC-KITCHENS-100 and Open
+  X-Embodiment conversions; OXE one dataset per job);
 - downstream: `run_sac.sh` / `run_ft_sac.sh` (SAC), `run_ft_r3m.sh` (SAC on
   your own R3M encoder), `run_ft_bc.sh` (BC);
 - `debug_*.sh`: short smoke tests (`debug_ddp.sh`: the same short run on 1

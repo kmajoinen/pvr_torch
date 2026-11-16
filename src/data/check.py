@@ -359,28 +359,27 @@ def _prepared_subfolders(root: str) -> List[str]:
     return out
 
 
-def _known_source(root: str, files: List[str]) -> Optional[str]:
-    """A raw dataset this repo has a converter (or a plan) for, recognised by its
-    file names: what it is and the command that prepares it."""
+def _webdataset(root: str, files: List[str]) -> Optional[str]:
     import re
-    norm = [f.replace(os.sep, "/") for f in files]
-    if any(re.search(r"(^|/)P\d\d/videos/P\d\d_\d+\.mp4$", f, re.I) for f in norm):
-        return ("EPIC-KITCHENS videos (<P##>/videos/<id>.MP4): convert with python -m src.data.prepare_epic "
-                f"--videos {root} --annotations <clone of github.com/epic-kitchens/epic-kitchens-100-annotations> "
-                "--out <dataset folder> --split train (then --split validation); run_prepare_epic.sh does both")
-    if any(re.search(r"(^|/)\d+\.webm$", f) for f in norm) or any("something-something" in f.lower() for f in norm):
-        return ("Something-Something v2 (numbered .webm videos / its labels): convert with python -m "
-                "src.data.prepare_ssv2 (run_prepare_ssv2.sh extracts Triton's archive and converts both splits)")
-    if any(re.search(r"\.tar$", f) for f in norm) and any(re.search(r"\d{4,}\.tar$", f) for f in norm):
+    if any(re.search(r"\d{4,}\.tar$", f) for f in files):
         return ("numbered .tar files, probably WebDataset shards (e.g. imagenet-1k-wds): not read directly; "
                 "no converter yet (DATASETS.md section 5)")
-    if any(re.search(r"(^|/)(ILSVRC|LOC_val_solution\.csv|n\d{8}/)", f) for f in norm) or \
-            any(re.search(r"imagenet.*\.(zip|tar)$", f, re.I) for f in norm):
-        return ("ImageNet (ILSVRC files or <wnid> folders): convert with python -m src.data.prepare_imagenet "
-                f"--source {root} --out <dataset folder> (it also reads Kaggle's zip and the imagefolder tar)")
-    if any("tfrecord" in f for f in norm) or any(f.endswith(("dataset_info.json", "features.json")) for f in norm):
-        return ("TFDS/RLDS TFRecords (e.g. Open X-Embodiment, BridgeData's RLDS release): no converter yet; "
-                "DATASETS.md section 5 shows how to write one")
+    return None
+
+
+def _known_source(root: str, files: List[str]) -> Optional[str]:
+    """A raw dataset this repo has a converter for, recognised by its file
+    names: what it is and the command that prepares it. Each converter
+    (src/data/prepare_*.py) recognises its own source with detect(root,
+    files); a new converter adds itself here. Order matters: WebDataset tars
+    named imagenet* before ImageNet."""
+    from src.data import prepare_epic, prepare_imagenet, prepare_rlds, prepare_ssv2
+    norm = [f.replace(os.sep, "/") for f in files]
+    for detect in (prepare_epic.detect, prepare_ssv2.detect, _webdataset, prepare_imagenet.detect,
+                   prepare_rlds.detect):
+        hint = detect(root, norm)
+        if hint:
+            return hint
     return None
 
 

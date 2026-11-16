@@ -299,5 +299,16 @@ def main(argv=None):
                 print(f"  {vid}: {err}")
 
 
+
+def detect(root: str, files):
+    """check.py's hint for raw EPIC-KITCHENS videos (relative paths under root)."""
+    import re
+    if any(re.search(r"(^|/)P\d\d/videos/P\d\d_\d+\.mp4$", f, re.I) for f in files):
+        return ("EPIC-KITCHENS videos (<P##>/videos/<id>.MP4): convert with python -m src.data.prepare_epic "
+                f"--videos {root} --annotations <clone of github.com/epic-kitchens/epic-kitchens-100-annotations> "
+                "--out <dataset folder> --split train (then --split validation); run_prepare_epic.sh does both")
+    return None
+
+
 if __name__ == "__main__":
     main()

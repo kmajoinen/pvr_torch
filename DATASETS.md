@@ -14,8 +14,8 @@ python pretrain.py +experiment=r3m pretrain_data=auto pretrain_data.root=/path/t
 ```
 A run checks its data folder at startup, before building the encoder: a
 folder that isn't what the config reads stops the run with what the folder
-holds instead (a raw EPIC, SSv2 or ImageNet download gets the command that
-converts it).
+holds instead (a raw EPIC, SSv2, ImageNet or RLDS/Open X-Embodiment
+download gets the command that converts it).
 
 ## 1. Which kind of data each method needs
 
@@ -170,6 +170,13 @@ A method preset may override some of these (e.g. `+experiment=mae` sets
   timestamped annotations.
 - `python -m src.data.prepare_imagenet`: class folders (as a folder, a tar
   or Kaggle's zip) -> image shards.
+- `python -m src.data.prepare_rlds`: any TFDS/RLDS robot dataset (Open
+  X-Embodiment's ~55, BridgeData's RLDS release) -> shards, one clip per
+  episode with its language instruction as text. Reads the TFRecords
+  without TensorFlow and finds the camera and instruction fields from the
+  dataset's `features.json` (`--camera <name>` or `all`, `--text <field>`
+  or `none`). Datasets with only a train split hold out 2% of its files as
+  validation.
 
 **Your own:** anything that writes the layouts above works. With shards,
 the conversion is short:
@@ -203,6 +210,11 @@ def write_clips(videos, out, split):
 ```
 For an image dataset, the same with `w.add(key, jpeg_bytes, label=class_index)`
 (-1 if unlabelled) and a `classes.txt` in the root.
+
+So the checker points raw downloads at your converter, give it a
+`detect(root, files)` that returns a one-line hint with the command (or
+None) from the relative paths it is shown, and add it to
+`_known_source` in `src/data/check.py` (see `prepare_rlds.detect`).
 
 **On a cluster:**
 - Keep datasets as shards: a few hundred files instead of millions, within
@@ -243,11 +255,10 @@ Candidates on Triton for pretraining, most relevant first:
 | dataset | kind | why |
 |---|---|---|
 | EPIC-Kitchens | egocentric video + narrations | part of MVP's training data; narrations work like Ego4D's for R3M. Converter: `prepare_epic.py` |
-| Open X-Embodiment, BridgeData | robot video + language instructions | in-domain data for R3M/VIP; frames for MAE |
+| Open X-Embodiment, BridgeData | robot video + language instructions | in-domain data for R3M/VIP; frames for MAE. Converter: `prepare_rlds.py` (Triton's `BridgeData` folder: layout not checked yet) |
 | CO3Dv2, MVImgNet, OmniObject3D | object-centric multi-view video | object views from many angles |
 | Open Images, LAION-400M (if stored as images), Hypersim | images | large image sets for MAE/MoCo |
 
-Planned: a `prepare_data.py` that converts common source layouts (video
-files, frame folders, image folders, WebDataset tars, RLDS) automatically,
-and a check when `pretrain.py` loads a dataset, with guidance for known
-datasets.
+Planned: converters for the other common source layouts (video files with
+a caption table, frame-sequence folders such as CO3Dv2, image collections,
+WebDataset tars), each recognising its source for the checker as above.
