@@ -74,22 +74,24 @@ per epoch) or `random` (uniform with replacement, an epoch being
 steps per batch. E.g. `schedule.sampling=random schedule.epoch_batches=1000
 epochs=100`. See `RUNNING_EXPERIMENTS.md`, "Schedules".
 
-**On the cluster.** Job scripts are templates to copy (all listed in
-`RUNNING_EXPERIMENTS.md`, "Cluster job scripts"):
-- pretraining: `run_pretrain.sh` (R3M), `run_vip.sh`, `run_r3m_vit.sh`,
-  `run_mvp_epochs.sh` / `run_mvp_images.sh` (the two MVP budgets),
-  `run_imagenet.sh` (supervised or MoCo v2 on ImageNet), and
-  `run_pretrain_generic.sh` (any network x data x method x augmentation,
+**On the cluster.** Job scripts live in `run/` (all listed in
+`RUNNING_EXPERIMENTS.md`, "Cluster job scripts"); submit them from the repo
+root, e.g. `sbatch run/pretrain/vip.sh`. Triton's are in `run/`,
+`run/pretrain/` and `run/data/`, CSC Roihu's in `run/roihu/`:
+- pretraining: `run/pretrain/r3m.sh` (R3M), `run/pretrain/vip.sh`, `run/pretrain/r3m_vit.sh`,
+  `run/pretrain/mvp_epochs.sh` / `run/pretrain/mvp_images.sh` (the two MVP budgets),
+  `run/pretrain/imagenet.sh` (supervised or MoCo v2 on ImageNet), and
+  `run/pretrain/generic.sh` (any network x data x method x augmentation,
   checked before submitting); each copies its data to the node's local disk;
-- data: `run_prepare_ssv2.sh`, `run_prepare_epic.sh` and
-  `run_prepare_oxe.sh` (the one-time SSv2, EPIC-KITCHENS-100 and Open
+- data: `run/data/prepare_ssv2.sh`, `run/data/prepare_epic.sh` and
+  `run/data/prepare_oxe.sh` (the one-time SSv2, EPIC-KITCHENS-100 and Open
   X-Embodiment conversions; OXE one dataset per job);
-- downstream: `run_sac.sh` / `run_ft_sac.sh` (SAC), `run_ft_r3m.sh` (SAC on
-  your own R3M encoder), `run_ft_bc.sh` (BC);
-- `debug_*.sh`: short smoke tests (`debug_ddp.sh`: the same short run on 1
-  and 2 GPUs, to compare).
+- downstream: `run/sac.sh` / `run/ft_sac.sh` (SAC), `run/ft_r3m.sh` (SAC on
+  your own R3M encoder), `run/ft_bc.sh` (BC);
+- smoke tests: `run/debug_sac.sh`, `run/debug_pieg.sh`, `run/pretrain/debug.sh`
+  (`run/pretrain/debug_ddp.sh`: the same short run on 1 and 2 GPUs, to compare).
 
-`*.sh` files are gitignored: `git add -f` a script to keep it in the repo.
+Every `.sh` under `run/` is tracked in git; `*.sh` elsewhere is ignored.
 
 **Locally, before a cluster run.**
 - Run the tests: `env/bin/python -m pytest tests -q`.

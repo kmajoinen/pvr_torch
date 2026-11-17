@@ -8,6 +8,8 @@
 #SBATCH --error=./outs/rn18_%A/e.err
 #SBATCH --output=./outs/rn18_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 
 # module --ignore-cache load mamba
 module load mamba

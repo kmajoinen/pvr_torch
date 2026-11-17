@@ -211,7 +211,7 @@ def detect(root: str, files):
     import re
     if any(re.search(r"(^|/)\d+\.webm$", f) for f in files) or any("something-something" in f.lower() for f in files):
         return ("Something-Something v2 (numbered .webm videos / its labels): convert with python -m "
-                "src.data.prepare_ssv2 (run_prepare_ssv2.sh extracts Triton's archive and converts both splits)")
+                "src.data.prepare_ssv2 (run/data/prepare_ssv2.sh extracts Triton's archive and converts both splits)")
     return None
 
 

@@ -8,7 +8,9 @@
 #SBATCH --error=./out_debug/profile_%A/e.err
 #SBATCH --output=./out_debug/profile_%A/o.out
 
-# Where an R3M step's time goes (profile_pretrain.py), for run_pretrain.sh's
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
+# Where an R3M step's time goes (profile_pretrain.py), for run/pretrain/r3m.sh's
 # setup: ResNet-50, batch 16, fp32. Run 1 reads the real shards (straight from
 # $WRKDIR: the loader isn't the bottleneck, data_wait ~0.1%); runs 2-5 use
 # synthetic frames, so they compare the GPU side alone. Each run prints

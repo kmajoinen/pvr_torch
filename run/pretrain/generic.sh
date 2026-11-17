@@ -11,6 +11,8 @@
 #SBATCH --error=./outs/pretrain_%A/e.err
 #SBATCH --output=./outs/pretrain_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # "Network X, trained on data Y, with method Z and augmentation K" -- any
 # combination pretrain.py supports, picked by the four variables below.
 #
@@ -18,9 +20,9 @@
 #           scratch -- vit_s16 | vit_b16 | vit_l16 (MAE/MVP-layout ViTs),
 #           resnet18 | resnet34 | resnet50, dinov2_vits14 ...
 #   DATA    imagenet     ImageNet, extracted from Triton's shared tar to /tmp
-#           ssv2         SSv2 as video clips (shards from run_prepare_ssv2.sh)
+#           ssv2         SSv2 as video clips (shards from run/data/prepare_ssv2.sh)
 #           ssv2_frames  SSv2's frames as unlabelled images (same shards)
-#           epic         EPIC-KITCHENS-100 narrated segments (run_prepare_epic.sh)
+#           epic         EPIC-KITCHENS-100 narrated segments (run/data/prepare_epic.sh)
 #           epic_frames  EPIC's frames as unlabelled images (same shards)
 #           /a/path      any prepared dataset folder (pretrain_data=auto: pretrain.py
 #                        picks clips or images to match METHOD); checked before the copy
@@ -41,9 +43,9 @@
 #   ARCH=vit_s16 DATA=ssv2_frames METHOD=mae                 AUG=""
 #   ARCH=vit_s16 DATA=ssv2        METHOD=r3m_vit             AUG=random_resized_crop
 #   ARCH=resnet18 DATA=imagenet   METHOD=moco_v2             AUG=""
-# DRY_RUN=1 bash run_pretrain_generic.sh prints the checks and the command only.
+# DRY_RUN=1 bash run/pretrain/generic.sh prints the checks and the command only.
 # Resubmitting with the same RUN_DIR resumes; chain long runs with
-#   jid=$(sbatch --parsable run_pretrain_generic.sh); sbatch --dependency=afterany:$jid run_pretrain_generic.sh
+#   jid=$(sbatch --parsable run/pretrain/generic.sh); sbatch --dependency=afterany:$jid run/pretrain/generic.sh
 
 set -euo pipefail
 

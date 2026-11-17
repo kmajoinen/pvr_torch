@@ -218,7 +218,7 @@ run's `embedding.yaml` lists every field.)
 
 **Compute and evaluation**
 - Several GPUs on one node (DDP) work for supervised and MAE/MVP only, and
-  only on CPU so far (`tests/test_distributed.py`; `debug_ddp.sh` is the GPU
+  only on CPU so far (`tests/test_distributed.py`; `run/pretrain/debug_ddp.sh` is the GPU
   check, not yet run). MoCo, R3M and VIP compare samples within a batch, so
   they still run on one GPU: long runs stay slow there (R3M ResNet-50: ~23 h
   for 1M steps; VIP's 2M steps at batch 32 longer), and MoCo's multi-GPU

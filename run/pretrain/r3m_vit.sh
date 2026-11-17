@@ -11,12 +11,14 @@
 #SBATCH --error=./outs/r3m_vit_%A/e.err
 #SBATCH --output=./outs/r3m_vit_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # R3M's objective on MVP's ViT-S/16, from scratch, on SSv2
-# (configs/experiment/r3m_vit.yaml). Needs the shards from run_prepare_ssv2.sh.
+# (configs/experiment/r3m_vit.yaml). Needs the shards from run/data/prepare_ssv2.sh.
 # Each job copies them to the node's /tmp/$SLURM_JOB_ID and trains from there;
 # the copy is removed at the end. 1M steps won't fit one job: resubmit with the
 # same RUN_DIR and it resumes from checkpoint.pt, or chain jobs:
-#   jid=$(sbatch --parsable run_r3m_vit.sh); sbatch --dependency=afterany:$jid run_r3m_vit.sh
+#   jid=$(sbatch --parsable run/pretrain/r3m_vit.sh); sbatch --dependency=afterany:$jid run/pretrain/r3m_vit.sh
 # Check steps/s and data_wait in the first log lines: hours for the full run
 # = 1,000,000 / steps/s / 3600. Override the tuning knobs on the srun line
 # (lr=..., weight_decay=..., objectives.0.l1_weight=..., lr_schedule.warmup=...).

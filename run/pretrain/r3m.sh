@@ -11,15 +11,17 @@
 #SBATCH --error=./outs/pretrain_%A/e.err
 #SBATCH --output=./outs/pretrain_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # R3M on Something-Something v2 (pretrain.py, configs/experiment/r3m.yaml).
 # Before the first run:
 #   - convert Triton's SSv2 archive once into frame shards (a few hundred files
-#     instead of millions, within the file quota): sbatch run_prepare_ssv2.sh
+#     instead of millions, within the file quota): sbatch run/data/prepare_ssv2.sh
 # Each job copies the shards to the node's /tmp/$SLURM_JOB_ID and trains from
 # there (scicomp.aalto.fi/triton/usage/localstorage); the copy is removed at
 # the end. A job that hits the time limit resumes from checkpoint.pt when
 # resubmitted with the same RUN_DIR:
-#   jid=$(sbatch --parsable run_pretrain.sh); sbatch --dependency=afterany:$jid run_pretrain.sh
+#   jid=$(sbatch --parsable run/pretrain/r3m.sh); sbatch --dependency=afterany:$jid run/pretrain/r3m.sh
 
 module load mamba
 source activate pvr_env/

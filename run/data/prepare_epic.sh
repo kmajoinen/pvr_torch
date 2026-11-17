@@ -6,6 +6,8 @@
 #SBATCH --error=./outs/prep_epic_%A/e.err
 #SBATCH --output=./outs/prep_epic_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 set -euo pipefail
 module load mamba
 source activate pvr_env/

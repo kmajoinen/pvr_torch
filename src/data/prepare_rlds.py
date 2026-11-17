@@ -456,8 +456,8 @@ def detect(root: str, files: List[str]) -> Optional[str]:
     cmd = "python -m src.data.prepare_rlds --source {} --out <dataset folder>"
     if len(tops) > 1:
         return (f"{len(tops)} TFDS/RLDS datasets (e.g. {', '.join(tops[:5])}): convert one at a time with "
-                + cmd.format(os.path.join(root, "<name>")) + " (run_prepare_oxe.sh)")
-    return "a TFDS/RLDS dataset (TFRecords): convert with " + cmd.format(root) + " (run_prepare_oxe.sh)"
+                + cmd.format(os.path.join(root, "<name>")) + " (run/data/prepare_oxe.sh)")
+    return "a TFDS/RLDS dataset (TFRecords): convert with " + cmd.format(root) + " (run/data/prepare_oxe.sh)"
 
 
 if __name__ == "__main__":

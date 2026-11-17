@@ -552,8 +552,8 @@ buffer_obs: auto     # SAC only: auto | features | pixels
   the prefetched reads, so a slow disk shows in `add_ms`: the buffer's cost
   per step is `sample_ms + add_ms`. sacct's MaxRSS includes a disk buffer's
   cached pages (reclaimable); `rss_anon_gb` and `cgroup_mem_gb` are the
-  honest numbers. `run_buffer_ram.sh` (array: none / zstd / lz4, 24G) and
-  `run_buffer_ssd.sh` (array: none / zstd on the local disk, 8G) compare the
+  honest numbers. `run/buffer_ram.sh` (array: none / zstd / lz4, 24G) and
+  `run/buffer_ssd.sh` (array: none / zstd on the local disk, 8G) compare the
   storage options on one SAC setup; compare `charts/steps_per_sec_recent`
   and `sample_ms + add_ms` once the buffer is full.
 - **BatchNorm**: the encoder stays in `eval()` even while it trains, so
@@ -864,7 +864,7 @@ layout; one file per frame, so millions for SSv2 -- more than a typical
 scratch file quota). `src/data/clips.py` reads either; the official R3M code
 would additionally need its own `manifest.csv` with absolute paths and its
 2-character text prefix. Something-Something v2 (about 169k training videos,
-~20 GB of webm; on Triton a shared archive, which `run_prepare_ssv2.sh`
+~20 GB of webm; on Triton a shared archive, which `run/data/prepare_ssv2.sh`
 extracts to a node's local disk and converts there) is converted once per
 split, in a CPU job:
 ```bash
@@ -878,7 +878,7 @@ labels ("putting a pen on a table"; `--text template` for the class
 template). Expect on the order of 100 GB for the training split.
 `--limit N` converts a subset. Shards aren't resumable (an interrupted split
 is converted again); `--format folders` is, skipping videos finished with
-the same settings. `run_pretrain.sh` copies the shards to the node's local
+the same settings. `run/pretrain/r3m.sh` copies the shards to the node's local
 disk at job start. Other datasets need only a script that writes the same
 layout (`DATASETS.md` has the formats and an example; `python -m
 src.data.check <root>` checks the result and prints a config); then
@@ -893,7 +893,7 @@ node:
 ```bash
 git clone https://github.com/epic-kitchens/epic-kitchens-100-annotations $WRKDIR/data/epic-kitchens-100-annotations
 ```
-Then `run_prepare_epic.sh` converts both splits (train: 495 videos, 67k
+Then `run/data/prepare_epic.sh` converts both splits (train: 495 videos, 67k
 narrated segments; validation: 138 videos, 9.7k). Each video's frames are
 resampled to `--fps` (default 10) and stored once, as 224×224 JPEG shards
 (~55 GB for train and ~10 GB for validation at 10 fps). Run `quota` on a
@@ -906,7 +906,7 @@ a conversion that hits the quota fails partway and can't resume.
 
 *Timing.* Every frame is decoded whatever `--fps` is, so decoding sets the
 run time, and a split isn't resumable: a job that hits its time limit loses
-everything. `LIMIT=20 sbatch run_prepare_epic.sh` converts 20 videos per
+everything. `LIMIT=20 sbatch run/data/prepare_epic.sh` converts 20 videos per
 split (into `epic_limit20`) and ends with its rate in minutes per GB of video
 and the whole split's projected time. Scale by GB, not by video count: EPIC
 videos run from a minute to an hour, and the first 20 in annotation order
@@ -923,14 +923,14 @@ put start and goal up to an hour apart: use them only for that on purpose.
 
 **Open X-Embodiment** (~55 robot datasets in TFDS/RLDS format, on Triton in
 `/scratch/shareddata/dldata/open_x_embodiment/tensorflow_datasets/<name>_<version>/`):
-`run_prepare_oxe.sh` converts one dataset per job (`DATASET`, default
+`run/data/prepare_oxe.sh` converts one dataset per job (`DATASET`, default
 `bridge_0.1.0`) into `$WRKDIR/data/oxe/<name>`:
 ```bash
-LIMIT=20 sbatch run_prepare_oxe.sh                          # timing run: 20 files per split
-sbatch run_prepare_oxe.sh                                   # Bridge
-DATASET=fractal20220817_data_0.1.0 sbatch run_prepare_oxe.sh
-DATASET=taco_play_0.1.0 CAMERA=all sbatch run_prepare_oxe.sh   # every camera, one clip each
-DATASET=droid EVERY=3 sbatch run_prepare_oxe.sh             # 15 Hz -> 5 Hz, Bridge's rate
+LIMIT=20 sbatch run/data/prepare_oxe.sh                          # timing run: 20 files per split
+sbatch run/data/prepare_oxe.sh                                   # Bridge
+DATASET=fractal20220817_data_0.1.0 sbatch run/data/prepare_oxe.sh
+DATASET=taco_play_0.1.0 CAMERA=all sbatch run/data/prepare_oxe.sh   # every camera, one clip each
+DATASET=droid EVERY=3 sbatch run/data/prepare_oxe.sh             # 15 Hz -> 5 Hz, Bridge's rate
 ```
 Each episode becomes one clip of the main camera's frames, with its
 language instruction as `txt`; the log lists the dataset's cameras and text
@@ -946,7 +946,7 @@ Time each dataset with `LIMIT=20` first: it prints minutes per GB read, and,
 scaled by GB read, the projected hours and output size. Run `quota` and
 compare before the full run (not resumable: a run that hits the time limit
 or the quota loses everything). Train with `DATA=$WRKDIR/data/oxe/bridge` in
-`run_pretrain_generic.sh` (auto config).
+`run/pretrain/generic.sh` (auto config).
 In between, `--window 300` adds `manifest_<split>_win300s.csv` (videos cut
 into parts of at most 5 minutes; 1,172 for train). `frame_times_<split>.npz`
 records each stored frame's time, so `--manifests-only` adds or rebuilds
@@ -989,7 +989,7 @@ norms, `warmup_cosine` with 10k warmup steps over `train_steps`,
 `grad_clip: 1.0`, bf16. Starting values to tune (lr, weight decay, the
 L1/L2 weights for a 384-dim output, the warmup), not a published recipe:
 R3M released no ViT. With `+experiment=mvp` on the same `vit_s16`, R3M and
-MAE differ only in the objective. `run_r3m_vit.sh` is its job script.
+MAE differ only in the objective. `run/pretrain/r3m_vit.sh` is its job script.
 ```bash
 python pretrain.py +experiment=r3m_vit pretrain_data.root=/path/to/ssv2
 ```
@@ -1044,7 +1044,7 @@ per architecture and read both; a high `data_wait` means more
 `num_workers`/CPUs, not a bigger GPU. `profile_pretrain.py` (same config as
 `pretrain.py`, clip objectives) breaks a step down: steps/s, ms per phase
 (data, encoder, text encoder, reward head, backward, optimizer), GPU busy
-fraction, host-device syncs, and a Chrome trace; `run_profile_pretrain.sh`
+fraction, host-device syncs, and a Chrome trace; `run/pretrain/profile.sh`
 runs it for R3M and a few variants (`profile.synthetic=true` needs no data).
 
 ### Schedules: how batches are drawn and used
@@ -1137,7 +1137,7 @@ line.
 - **Status:** tested on CPU (several processes with gloo): the gradient
   equals the single-process one on the full batch, data split and resume
   are exact (`tests/test_distributed.py`). Not yet run on GPUs:
-  `debug_ddp.sh` runs the same 1000 steps on 1 and 2 GPUs to compare loss and
+  `run/pretrain/debug_ddp.sh` runs the same 1000 steps on 1 and 2 GPUs to compare loss and
   `steps/s`. Both runs train on the whole total batch per step, so `steps/s`
   (per log interval) compares directly. Losses should be close, not equal:
   BatchNorm sees half the batch per GPU and rank 1 draws other crops. If the
@@ -1179,7 +1179,7 @@ request ~32 GB for 16 workers.
 
 **Without converting:** `pretrain_data.root` can also point at an extracted
 ImageFolder tree (`<root>/train/<wnid>/`, `<root>/val/<wnid>/`; labels in the
-same sorted-wnid order). On Triton, `run_imagenet.sh` does this by default:
+same sorted-wnid order). On Triton, `run/pretrain/imagenet.sh` does this by default:
 it extracts the shared `ILSVRC2012_imagefolder.tar` to the node's local
 `/tmp/$SLURM_JOB_ID` at job start (scicomp's local-storage pattern), trains
 from there, and removes it at the end. Don't point it at millions of files
@@ -1214,7 +1214,7 @@ Implemented from the papers, not the official code (its license is
 non-commercial).
 
 **Compute.** One GPU, or several (see "Multi-GPU pretraining"). The
-supervised ResNet-18 run (90 epochs, 450k steps, bf16, `run_imagenet.sh`)
+supervised ResNet-18 run (90 epochs, 450k steps, bf16, `run/pretrain/imagenet.sh`)
 took 10 h 20 min; ResNet-50 is several times that -- watch `data_wait`; `perf.amp_bf16=true` and
 `--short-side 256` help. ImageNet-100 or fewer epochs make quick runs
 practical. The supervised classifier and MoCo's heads belong to the
@@ -1344,39 +1344,56 @@ environment, GPU -- so a measurement only carries over to runs that match.
 
 ## Cluster job scripts
 
-Templates to copy and adjust (Triton partitions, `$WRKDIR` paths). The
-pretraining ones copy (or extract) their data to the node's local disk at
-job start and resume from `checkpoint.pt` when resubmitted with the same
-`RUN_DIR` (chain jobs with `sbatch --dependency=afterany:<jobid>`).
+In `run/`: Triton's scripts (partitions, `$WRKDIR` paths), with
+`run/pretrain/` and `run/data/` for pretraining and data preparation and
+everything else directly in `run/`; `run/roihu/` holds CSC Roihu versions
+(below). Submit from the repo root (`sbatch run/pretrain/vip.sh`): jobs run
+in the directory they're submitted from, so the scripts' relative paths
+(`./outs/...`, `pvr_env/`, `python3 pretrain.py`) resolve there, and each
+script stops at once if that isn't the repo root. The pretraining ones copy
+(or extract) their data to the node's local disk at job start and resume
+from `checkpoint.pt` when resubmitted with the same `RUN_DIR` (chain jobs
+with `sbatch --dependency=afterany:<jobid>`).
 
-- **Data:** `run_prepare_ssv2.sh`, `run_prepare_epic.sh` and
-  `run_prepare_oxe.sh`, the one-time SSv2, EPIC-KITCHENS-100 and Open
+- **Data:** `run/data/prepare_ssv2.sh`, `run/data/prepare_epic.sh` and
+  `run/data/prepare_oxe.sh`, the one-time SSv2, EPIC-KITCHENS-100 and Open
   X-Embodiment conversions to shards (CPU jobs).
-- **Pretraining:** `run_pretrain.sh` (R3M, ResNet-50 on SSv2),
-  `run_vip.sh` (VIP), `run_r3m_vit.sh` (R3M on ViT-S/16),
-  `run_mvp_epochs.sh` / `run_mvp_images.sh` (MVP, the two budgets),
-  `run_imagenet.sh` (ImageNet: supervised or MoCo v2, set `METHOD`/`ARCH`),
-  and `run_pretrain_generic.sh`, any network x data x method x augmentation
+- **Pretraining:** `run/pretrain/r3m.sh` (R3M, ResNet-50 on SSv2),
+  `run/pretrain/vip.sh` (VIP), `run/pretrain/r3m_vit.sh` (R3M on ViT-S/16),
+  `run/pretrain/mvp_epochs.sh` / `run/pretrain/mvp_images.sh` (MVP, the two budgets),
+  `run/pretrain/imagenet.sh` (ImageNet: supervised or MoCo v2, set `METHOD`/`ARCH`),
+  and `run/pretrain/generic.sh`, any network x data x method x augmentation
   from four variables (`ARCH`, `DATA`, `METHOD`, `AUG`; the combination is
   checked before anything runs, `DRY_RUN=1` prints the command). `DATA` is
   a dataset name (`imagenet`, `ssv2`, `ssv2_frames`, `epic`, `epic_frames`)
   or any prepared dataset folder's path, read with `pretrain_data=auto`
   after a check of the folder, before it's copied.
-  `debug_pretrain.sh` is a smoke test (including a resume), `debug_ddp.sh`
+  `run/pretrain/debug.sh` is a smoke test (including a resume), `run/pretrain/debug_ddp.sh`
   the same short run on 1 and 2 GPUs (`METHOD`, `ARCH`) to compare loss and
   steps/s,
-  `run_profile_pretrain.sh` runs `profile_pretrain.py` on R3M variants.
-- **Downstream:** `run_sac.sh` (full run), `run_ft_sac.sh` (fine-tuning)
-  and `debug_sac.sh` (quick smoke test) for `train_sac.py` -- adjust
-  `embedding=`/`env=`/`encoder.*`/`augmentation=`; `run_ft_r3m.sh` is SAC on
-  your own R3M encoder (`embedding=custom_checkpoint`). `debug_pieg.sh` /
-  `arrayrun_pieg.sh` run the PIE-G preset on `train_drqv2.py`.
-  `run_buffer_ram.sh` / `run_buffer_ssd.sh` (job arrays) compare
+  `run/pretrain/profile.sh` runs `profile_pretrain.py` on R3M variants.
+- **Downstream:** `run/sac.sh` (full run), `run/ft_sac.sh` (fine-tuning)
+  and `run/debug_sac.sh` (quick smoke test) for `train_sac.py` -- adjust
+  `embedding=`/`env=`/`encoder.*`/`augmentation=`; `run/ft_r3m.sh` is SAC on
+  your own R3M encoder (`embedding=custom_checkpoint`). `run/debug_pieg.sh` /
+  `run/pieg_array.sh` run the PIE-G preset on `train_drqv2.py`.
+  `run/buffer_ram.sh` / `run/buffer_ssd.sh` (job arrays) compare
   replay-buffer storage options on one SAC setup (see "Buffer metrics"
-  above), and `run_buffer_stress_1m.sh` runs `src.rl.buffer_stress` on a
-  1M-frame compressed disk buffer, without training. `run_ft_bc.sh` is the template for `train_bc.py`
-  (ResNet-18 finetuning on cheetah_run; `run_bc.sh` is a legacy script for
-  a different cluster).
+  above), and `run/buffer_stress_1m.sh` runs `src.rl.buffer_stress` on a
+  1M-frame compressed disk buffer, without training. `run/ft_bc.sh` is the template for `train_bc.py`
+  (ResNet-18 finetuning on cheetah_run).
+- **Simple benchmark** (3 encoders x Pendulum/BipedalWalker/FourRooms):
+  `run/simple_bench.sh` (SAC, and DQN on FourRooms), `run/simple_bench_xqc.sh`
+  (XQC), and `run/simple_bench_state.sh` / `run/simple_bench_xqc_state.sh`
+  (the same from state). `run/bench_fourrooms.sh` times the FourRooms runs,
+  `run/probe_fourrooms.sh` runs `probe_encoder.py` on them;
+  `run/xqc_repro.sh` / `run/xqc_repro_state.sh` reproduce XQC paper curves.
+- **CSC Roihu** (`run/roihu/`): the same runs with Roihu's header (account,
+  `gpumedium`, `gpu:gh200`) and environment (`module load python-pytorch`,
+  the venv `$PROJAPPL_DIR/pvr_env`), and `WRKDIR` set to `$SCRATCH_DIR`
+  (`/scratch/project_2019621/pvr`), so `$WRKDIR/models` and
+  `$WRKDIR/pretrain_runs` work as on Triton. Pretraining stays on Triton,
+  where the data is.
 
-`*.sh` files are gitignored, so scripts not yet tracked (e.g.
-`run_ft_bc.sh`) need `git add -f`.
+Every `.sh` under `run/` is tracked in git (`!run/**/*.sh` in `.gitignore`);
+`*.sh` elsewhere stays ignored.

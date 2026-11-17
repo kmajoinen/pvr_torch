@@ -220,9 +220,9 @@ None) from the relative paths it is shown, and add it to
 - Keep datasets as shards: a few hundred files instead of millions, within
   file quotas.
 - Convert once, on a CPU node, with the source extracted to the node's
-  local disk (`run_prepare_ssv2.sh` does this).
+  local disk (`run/data/prepare_ssv2.sh` does this).
 - For training, copy the shards to the GPU node's local disk at job start
-  (`run_pretrain.sh`): random reads from a shared filesystem are slow.
+  (`run/pretrain/r3m.sh`): random reads from a shared filesystem are slow.
 
 ## 6. Checking a dataset
 
@@ -245,7 +245,7 @@ X-Embodiment, WebDataset tars) with the command that converts it, prepared
 datasets one folder down, or else video files, loose images, tar files.
 
 `--quick` checks what `pretrain.py` checks at startup: a few samples, no
-scans over a whole index (`run_pretrain_generic.sh` runs it before copying
+scans over a whole index (`run/pretrain/generic.sh` runs it before copying
 a folder to the node).
 
 ## 7. Datasets worth converting next

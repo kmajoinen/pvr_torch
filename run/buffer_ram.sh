@@ -9,6 +9,8 @@
 #SBATCH --error=./outs/buf_ram_%A_%a/e.err
 #SBATCH --output=./outs/buf_ram_%A_%a/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 module load mamba
 source activate pvr_env/
 

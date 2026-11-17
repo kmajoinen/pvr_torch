@@ -9,11 +9,13 @@
 #SBATCH --error=./outs/prep_ssv2_%A/e.err
 #SBATCH --output=./outs/prep_ssv2_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # One-time conversion of Triton's Something-Something v2 archive into frame
 # shards for pretrain.py (R3M). The archive (videos + labels) is extracted on
 # the node's local disk -- its 220k small files never touch the shared
 # filesystem -- and the shards (a few hundred ~1 GB files) are written to
-# $OUT. Training jobs (run_pretrain.sh) then copy only the shards.
+# $OUT. Training jobs (run/pretrain/r3m.sh) then copy only the shards.
 
 set -euo pipefail
 module load mamba

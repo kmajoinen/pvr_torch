@@ -9,6 +9,8 @@
 #SBATCH --output=./outs/simple_bench_state_%A/%a/o.out
 #SBATCH --array=0-2
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 module load mamba
 source activate pvr_env/
 

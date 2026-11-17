@@ -11,6 +11,8 @@
 #SBATCH --error=./outs/imagenet_%A/e.err
 #SBATCH --output=./outs/imagenet_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # ImageNet pretraining (pretrain.py): supervised (torchvision recipe) or MoCo v2,
 # from the node's local disk, as in scicomp.aalto.fi/triton/usage/localstorage:
 # the data goes to /tmp/$SLURM_JOB_ID at job start, training reads only that,
@@ -32,7 +34,7 @@
 #       --out /tmp/$SLURM_JOB_ID/check --workers 16; rm -rf /tmp/$SLURM_JOB_ID
 # Resubmitting with the same RUN_DIR resumes where the job stopped. MoCo v2 (200
 # epochs, two encoder passes per image) runs several days on one GPU: chain jobs,
-#   jid=$(sbatch --parsable run_imagenet.sh); sbatch --dependency=afterany:$jid run_imagenet.sh
+#   jid=$(sbatch --parsable run/pretrain/imagenet.sh); sbatch --dependency=afterany:$jid run/pretrain/imagenet.sh
 
 module load mamba
 source activate pvr_env/

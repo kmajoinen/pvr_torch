@@ -1,7 +1,7 @@
 """Multi-GPU pretraining (src/distributed.py, pretrain.py), on CPU: DDP runs the
 same way over processes with the gloo backend. Checks the data split across
 processes, that DDP's gradient equals the single-process one, and real runs
-through the launcher. What only GPUs show (nccl, speed) needs debug_ddp.sh."""
+through the launcher. What only GPUs show (nccl, speed) needs run/pretrain/debug_ddp.sh."""
 
 import json
 import os

@@ -10,6 +10,8 @@
 #SBATCH --error=./out_debug/ddp_%A/e.err
 #SBATCH --output=./out_debug/ddp_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 module load mamba
 source activate pvr_env/
 

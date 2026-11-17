@@ -10,13 +10,15 @@
 #SBATCH --error=./out_debug/r3m_%A/e.err
 #SBATCH --output=./out_debug/r3m_%A/o.out
 
-# Smoke test of run_pretrain.sh: the same steps, a few hundred training steps.
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
+# Smoke test of run/pretrain/r3m.sh: the same steps, a few hundred training steps.
 # Checks the shard copy to /tmp, R3M with ResNet-50 and the language loss
 # (DistilBERT downloads on first use), validation, checkpointing, and resume
-# (a second run continues the first). Needs the shards from run_prepare_ssv2.sh.
+# (a second run continues the first). Needs the shards from run/data/prepare_ssv2.sh.
 # In o.out look for: the copy time, "Encoder: resnet50", the steps/s and
 # data_wait of the log lines, EVAL lines, "Resumed from ... at step 100".
-# COPY_TO_LOCAL=0 sbatch debug_pretrain.sh reads the shards from $WRKDIR instead.
+# COPY_TO_LOCAL=0 sbatch run/pretrain/debug.sh reads the shards from $WRKDIR instead.
 
 set -euo pipefail
 module load mamba
@@ -25,7 +27,7 @@ source activate pvr_env/
 export HF_HOME="$WRKDIR/hf"
 DATA="$WRKDIR/data/ssv2"
 RUN_DIR="$WRKDIR/pretrain_runs/debug_r3m_$SLURM_JOB_ID"     # delete afterwards
-[ -f "$DATA/manifest_train.csv" ] || { echo "no shards at $DATA (run run_prepare_ssv2.sh first)"; exit 1; }
+[ -f "$DATA/manifest_train.csv" ] || { echo "no shards at $DATA (run run/data/prepare_ssv2.sh first)"; exit 1; }
 
 LOCAL="/tmp/$SLURM_JOB_ID"
 mkdir -p "$LOCAL"

@@ -10,18 +10,20 @@
 #SBATCH --error=./outs/vip_%A/e.err
 #SBATCH --output=./outs/vip_%A/o.out
 
+[ -f pretrain.py ] || { echo "submit from the repo root"; exit 1; }
+
 # VIP on Something-Something v2 (pretrain.py +experiment=vip,
 # configs/experiment/vip.yaml): a ResNet-50 from scratch with the released
 # VIP model's settings -- batch 32 videos x 4 frames, Adam 1e-4, 2M steps,
 # gamma 0.98, L1/L2 weights 1e-3, 3 negatives, a 1024-wide fc head
 # (embedding.head=fc). No text needed. Reads the same SSv2 shards as R3M
-# (run_prepare_ssv2.sh).
+# (run/data/prepare_ssv2.sh).
 #
 # 2M steps may not fit in one job: chain jobs, each resuming from
 # checkpoint.pt in RUN_DIR (saved at every validation, every 20k steps):
-#   jid=$(sbatch --parsable run_vip.sh); sbatch --dependency=afterany:$jid run_vip.sh
+#   jid=$(sbatch --parsable run/pretrain/vip.sh); sbatch --dependency=afterany:$jid run/pretrain/vip.sh
 # Read steps/s in the first log lines: 2M / steps/s / 3600 = hours.
-# Smaller encoder: ARCH=resnet18 sbatch run_vip.sh (its own run directory).
+# Smaller encoder: ARCH=resnet18 sbatch run/pretrain/vip.sh (its own run directory).
 
 module load mamba
 source activate pvr_env/
@@ -29,7 +31,7 @@ source activate pvr_env/
 ARCH="${ARCH:-resnet50}"
 RUN_DIR="$WRKDIR/pretrain_runs/vip_ssv2_${ARCH}_s1"
 DATA="$WRKDIR/data/ssv2"              # the converted shards and manifests
-[ -f "$DATA/manifest_train.csv" ] || { echo "no SSv2 shards at $DATA (run run_prepare_ssv2.sh first)"; exit 1; }
+[ -f "$DATA/manifest_train.csv" ] || { echo "no SSv2 shards at $DATA (run run/data/prepare_ssv2.sh first)"; exit 1; }
 
 LOCAL="/tmp/$SLURM_JOB_ID"            # /tmp is per user, not per job
 mkdir -p "$LOCAL"

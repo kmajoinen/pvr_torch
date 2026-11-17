@@ -24,6 +24,7 @@ Replica-Dataset
 TODO.md
 /out_debug/
 *.sh
+!run/**/*.sh
 replay/
 
 # papers
