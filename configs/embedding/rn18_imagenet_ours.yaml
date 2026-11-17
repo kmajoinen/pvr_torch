@@ -1,0 +1,5 @@
+# Encoder from pretrain.py (/scratch/work/majoink1/pretrain_runs/imagenet_supervised_resnet18_s1). Copy to configs/embedding/supervised_imagenet_resnet18.yaml,
+# then: python train_sac.py embedding=supervised_imagenet_resnet18
+name: supervised_imagenet_resnet18
+arch: resnet18
+checkpoint: /scratch/work/majoink1/pretrain_runs/imagenet_supervised_resnet18_s1/encoder_step0450360.pt
