@@ -22,6 +22,8 @@ srun python3 train_xqc.py \
         env.image_size=84 \
         embedding=resnet18 \
         encoder.grads=critic \
+        algo.action_repeat=4 \
+        algo.gamma=0.99 \
         algo.total_timesteps=200000 \
         algo.buffer_size=200000 \
         save.enabled=false \

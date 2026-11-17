@@ -23,6 +23,7 @@ echo "checkpoints: VIP=$VIP R3M=$R3M MVP=$MVP"
 
 ENVS=(dm_control_pixels dmc_walker)
 ENV_NAMES=(cheetah_run walker_walk)
+ACTION_REPEATS=(4 2)
 
 MODELS=(
   "embedding=custom_checkpoint embedding.arch=resnet50 embedding.checkpoint=$VIP embedding.head=fc embedding.head_dim=1024 embedding.name=vip50_ours"
@@ -44,7 +45,7 @@ srun python3 train_xqc.py \
         env=${ENVS[$E]} \
         ${MODELS[$M]} \
         ++embedding.frame_stack=3 \
-        algo.action_repeat=2 \
+        algo.action_repeat=${ACTION_REPEATS[$E]} \
         algo.total_timesteps=500000 \
         algo.buffer_size=500000 \
         save.enabled=false \
