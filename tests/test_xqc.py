@@ -2,6 +2,7 @@
 normalization, BatchNorm placement and modes, the policy, reward
 normalization, the discount heuristic, configs, and both scripts end to end."""
 
+import importlib.util
 import math
 import os
 import subprocess
@@ -279,7 +280,8 @@ def test_configs_compose():
 
 @pytest.mark.parametrize("env_name, repeat, gamma", [
     ("pendulum", 1, 0.975),
-    ("bipedal_walker_state", 1, 0.995),
+    pytest.param("bipedal_walker_state", 1, 0.995, marks=pytest.mark.skipif(
+        importlib.util.find_spec("Box2D") is None, reason="BipedalWalker needs Box2D")),
     ("dm_control_state", 2, 0.99),        # dm_control's own 1000-step limit, in env steps
     ("dm_control_pixels", 2, 0.99),
 ])
