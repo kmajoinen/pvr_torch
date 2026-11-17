@@ -32,6 +32,7 @@ dependencies:
     - --only-binary=Box2D           # a prebuilt wheel: box2d-py's source build fails
     - Box2D                         # BipedalWalker, CarRacing
     - git+https://github.com/sparisi/gym_gridworlds   # FourRooms
+    - metaworld==3.0.0                # Meta-World; 3.1.x pins mujoco==3.3.0; needs MuJoCo 3 (pinned above)
     - pygame>=2.6                  # box2d/classic-control rendering
 
     # ── Vision models ──────────────────────────────────────────────────────────

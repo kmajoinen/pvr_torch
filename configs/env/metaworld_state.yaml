@@ -1,0 +1,8 @@
+# Meta-World (see metaworld_pixels.yaml) from its 39-dimensional state:
+# end-effector, gripper, object and goal positions.
+name: mw_drawer_open_state
+builder: state
+id: Meta-World/MT1
+kwargs:
+  env_name: drawer-open-v3
+  seed: ${seed}               # fixes the task's 50 layouts: the training and evaluation envs share them

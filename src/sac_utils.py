@@ -57,8 +57,64 @@ def _register_env_ids(env_id: str) -> None:
         import shimmy  # noqa: F401  (registers "dm_control/*-v0" ids)
     elif "Gym-Gridworlds" in env_id:
         import gym_gridworlds  # noqa: F401
+    elif "Meta-World" in env_id:
+        import mujoco
+        if int(mujoco.__version__.split(".")[0]) >= 4:
+            raise ImportError(
+                f"Meta-World 3.0.0 needs MuJoCo 3 (found {mujoco.__version__}): under MuJoCo 4 "
+                "building its envs fails in reset_mocap_welds. Install the pinned version: "
+                "pip install mujoco==3.8.1 (requirements.txt)")
+        import metaworld  # noqa: F401  (registers "Meta-World/MT1" etc.)
     elif env_id not in gym.registry:
         import gymnasium_robotics  # noqa: F401  (registers AdroitHand*/FrankaKitchen ids)
+
+
+class _MetaWorldAdapter(gym.Wrapper):
+    """Two fixes for Meta-World (3.0.0):
+      - it ignores reset's seed (its envs are seeded with an old-style seed()
+        method), and its RandomTaskSelectWrapper draws the next task -- the
+        object/goal layout -- from that unseeded generator, so reset(seed=s)
+        doesn't determine the layout. A seeded reset here calls seed(s) first:
+        the same seed gives the same layout, as fixed evaluation seeds need.
+        Unseeded resets (training) are unchanged.
+      - MT1 records episode statistics itself (info["episode"]), which collides
+        with make_env's RecordEpisodeStatistics; its entry is dropped, so
+        episodes are recorded once, like every other env's (after action
+        repeat)."""
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.env.unwrapped.seed(int(seed))
+        return self.env.reset(options=options)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if "episode" in info:
+            info = {k: v for k, v in info.items() if k != "episode"}
+        return obs, reward, terminated, truncated, info
+
+
+class _OwnGLContext(gym.Wrapper):
+    """Gymnasium's MujocoRenderer (Adroit, Meta-World, FrankaKitchen) makes its
+    GL context current only when one env holds several viewers, and its
+    OffScreenViewer.render never does. With a training and an evaluation env
+    in one process, the context created last stays current and the other env
+    renders through it -- wrong frames, without any error. Make this env's own
+    context current before every render. Does nothing for envs without that
+    renderer (dm_control makes its context current itself; Pendulum,
+    BipedalWalker render without MuJoCo)."""
+
+    def render(self):
+        renderer = getattr(self.env.unwrapped, "mujoco_renderer", None)
+        viewer = renderer._viewers.get("rgb_array") if renderer is not None else None
+        if viewer is not None:
+            viewer.make_context_current()
+        return self.env.render()
+
+
+def _make(env_id: str, **kwargs):
+    env = gym.make(env_id, **kwargs)
+    return _MetaWorldAdapter(env) if "Meta-World" in env_id else env
 
 
 def _wrap(env, wrappers):
@@ -86,7 +142,7 @@ def _make_dmc(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(),
 
 
 def _make_carracing(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
-    return _repeat(_wrap(gym.make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
+    return _repeat(_wrap(_make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
 
 
 def _make_gym(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(), **env_kwargs):
@@ -109,8 +165,8 @@ def _make_gym(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(),
     from gymnasium.wrappers import AddRenderObservation, ResizeObservation
 
     _register_env_ids(env_id)
-    env = _repeat(_wrap(gym.make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
-    env = AddRenderObservation(env, render_only=True)
+    env = _repeat(_wrap(_make(env_id, render_mode="rgb_array", **env_kwargs), wrappers), action_repeat)
+    env = AddRenderObservation(_OwnGLContext(env), render_only=True)
     return ResizeObservation(env, (image_size, image_size))
 
 
@@ -120,7 +176,7 @@ def _make_state(env_id: str, image_size: int, action_repeat: int = 1, wrappers=(
     # (separate proprioceptive components) natively -- ReplayBuffer needs a
     # flat obs_shape, and a Dict space has no .shape at all. Box-observation
     # envs (e.g. Pendulum-v1) pass through this wrapper as a no-op.
-    return gym.wrappers.FlattenObservation(_repeat(_wrap(gym.make(env_id, **env_kwargs), wrappers), action_repeat))
+    return gym.wrappers.FlattenObservation(_repeat(_wrap(_make(env_id, **env_kwargs), wrappers), action_repeat))
 
 
 ENV_BUILDERS = {
@@ -179,6 +235,12 @@ def make_env(cfg: DictConfig, embedding_net=None, wrap_encoder: bool = True):
         wrappers=list(cfg.env.get("wrappers") or ()),
         **env_kwargs(cfg),
     )
+    if cfg.env.get("rotate_180", False):
+        # Cameras mounted upside down (Meta-World's corner cameras: their up
+        # axis points down) render frames rotated 180 degrees. Undoing that
+        # takes a rotation: a vertical flip alone leaves them mirrored.
+        env = gym.wrappers.TransformObservation(
+            env, lambda o: np.ascontiguousarray(o[::-1, ::-1]), env.observation_space)
     frame_stack = cfg.embedding.get("frame_stack", 1) if cfg.env.builder != "state" else 1
     if frame_stack > 1 and cfg.embedding.get("name") is not None:
         env = gym.wrappers.FrameStackObservation(env, frame_stack)
@@ -278,6 +340,10 @@ def _success_fn_for(env_id: str):
         # just at the final step (matches train_bc.py::evaluate()'s
         # max(ep_success, ...) convention for the same envs).
         return lambda infos: float(any(i.get("success", False) for i in infos))
+    if "Meta-World" in env_id:
+        # info["success"] is per step (float 0/1); an episode succeeds if the
+        # task was ever completed, Meta-World's own evaluation convention.
+        return lambda infos: float(any(i.get("success", 0.0) > 0 for i in infos))
     if "FrankaKitchen" in env_id:
         # No boolean success field at all -- FrankaKitchen is a composite
         # multi-subtask env. info carries tasks_to_complete (remaining) and

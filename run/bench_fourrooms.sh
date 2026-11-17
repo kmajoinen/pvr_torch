@@ -16,7 +16,8 @@ source activate pvr_env/
 
 R3M="$WRKDIR/pretrain_runs/r3m_ssv2_resnet50_s1/encoder_step1000000.pt"
 IMAGENET="$WRKDIR/pretrain_runs/imagenet_supervised_resnet18_s1/encoder_step0450360.pt"
-MVP=$(ls "$WRKDIR"/pretrain_runs/mvp_ssv2_vits16_epochs_s1/encoder_step*.pt | tail -1)
+MVP=$(ls -v "$WRKDIR"/pretrain_runs/mvp_ssv2_vits16_epochs_s1/encoder_step*.pt | tail -1)
+echo "checkpoints: R3M=$R3M IMAGENET=$IMAGENET MVP=$MVP"
 
 MODELS=(
   "embedding=custom_checkpoint embedding.arch=resnet50 embedding.checkpoint=$R3M embedding.name=r3m50_ours"

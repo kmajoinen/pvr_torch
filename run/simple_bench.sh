@@ -14,9 +14,10 @@
 module load mamba
 source activate pvr_env/
 
-VIP=$(ls "$WRKDIR"/pretrain_runs/vip_ssv2_resnet50_s1/encoder_step*.pt | tail -1)
+VIP=$(ls -v "$WRKDIR"/pretrain_runs/vip_ssv2_resnet50_s1/encoder_step*.pt | tail -1)
 R3M="$WRKDIR/pretrain_runs/r3m_ssv2_resnet50_s1/encoder_step1000000.pt"
-MVP=$(ls "$WRKDIR"/pretrain_runs/mvp_ssv2_vits16_epochs_s1/encoder_step*.pt | tail -1)
+MVP=$(ls -v "$WRKDIR"/pretrain_runs/mvp_ssv2_vits16_epochs_s1/encoder_step*.pt | tail -1)
+echo "checkpoints: VIP=$VIP R3M=$R3M MVP=$MVP"
 
 ENVS=(pendulum_pixels bipedal_walker_pixels fourrooms_pixels)
 SCRIPTS=(train_sac.py train_sac.py train_discrete.py)

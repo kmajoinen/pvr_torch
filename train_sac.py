@@ -286,6 +286,11 @@ def main(cfg: DictConfig) -> None:
             ckpt.update(encoder_record(cfg, embedding_net))
         return ckpt
 
+    # The same evaluation episodes (reset seeds) at every evaluation, and for
+    # every run with this seed: encoders compare on the same start states, and
+    # each training seed gets its own set (as in train_discrete.py).
+    eval_seeds = [int(s) for s in np.random.default_rng([cfg.seed, 1]).integers(2**31, size=cfg.algo.n_episodes_test)]
+
     def run_eval(global_step, timing_only=False):
         nonlocal best_eval_return
         with timer.exclude("eval", timing_only=timing_only):
@@ -296,6 +301,7 @@ def main(cfg: DictConfig) -> None:
                 device,
                 encode_fn=E.encode_single if pixels_in_buffer else None,
                 success_fn=_success_fn_for(cfg.env.id),
+                seeds=eval_seeds,
             )
             log_eval(stats, global_step, wandb)
             if stats["return_mean"] > best_eval_return and not bench_steps:

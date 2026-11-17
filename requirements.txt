@@ -18,6 +18,8 @@ shimmy[dm-control]==2.0.1
 mujoco==3.8.1
 opencv-python-headless==5.0.0.93
 git+https://github.com/sparisi/gym_gridworlds   # FourRooms (configs/env/fourrooms_pixels.yaml)
+metaworld==3.0.0               # Meta-World (configs/env/metaworld_*.yaml); 3.1.x pins mujoco==3.3.0, and
+                               #   MuJoCo 4 breaks it (reset_mocap_welds): keep the mujoco pin above
 # BipedalWalker and CarRacing need Box2D: install the prebuilt wheel, which
 # needs no swig or compiler (box2d-py's source build fails on Python 3.11):
 #   pip install --only-binary :all: Box2D

@@ -1,0 +1,22 @@
+# Meta-World (Farama, metaworld==3.0.0) from rendered frames: one task (MT1),
+# its object and goal positions drawn from the task's 50 variations at every
+# reset; 500-step episodes, success tracked from info["success"] (an episode
+# succeeds if the task was ever completed). Other tasks: override the name,
+# as with dm_control:
+#   python train_xqc.py env=metaworld_pixels env.kwargs.env_name=button-press-topdown-v3 env.name=mw_button_press_topdown
+# Camera: "corner" (as in the R3M/VIP/VC-1 evaluations); others: corner2,
+# corner3, topview, behindGripper, gripperPOV. corner, corner2 and corner3 are
+# mounted upside down (their up axis points down), so their frames arrive
+# rotated 180 degrees: rotate_180 turns them back. behindGripper is upright:
+# set rotate_180=false for it.
+name: mw_drawer_open
+builder: gym
+id: Meta-World/MT1
+image_size: 224
+rotate_180: true
+kwargs:
+  env_name: drawer-open-v3
+  seed: ${seed}               # fixes the task's 50 layouts: the training and evaluation envs share them
+  camera_name: corner
+  width: ${..image_size}      # render directly at the frame size
+  height: ${..image_size}
