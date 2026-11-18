@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=roihu_debug
 #SBATCH --account=project_2019621
-#SBATCH --partition=gpumedium
+#SBATCH --partition=gputest
 #SBATCH --gres=gpu:gh200:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=00:45:00
+#SBATCH --time=00:15:00
 #SBATCH --error=./outs/roihu_debug_%j/e.err
 #SBATCH --output=./outs/roihu_debug_%j/o.out
 
@@ -25,10 +25,10 @@ for ENV in dm_control_pixels adroit_door_pixels metaworld_pixels; do
             embedding=resnet18 \
             embedding.pretrained=false \
             ++embedding.frame_stack=3 \
-            algo.total_timesteps=3000 \
+            algo.total_timesteps=1500 \
             algo.learning_starts=1000 \
-            algo.log_frequency=500 \
-            algo.eval_frequency=3000 \
+            algo.log_frequency=250 \
+            algo.eval_frequency=1500 \
             algo.n_episodes_test=1 \
             algo.buffer_size=10000 \
             save.enabled=false \

@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:gh200:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=36:00:00  # TODO: set from pack_scaling.sh; gpumedium's maximum
 #SBATCH --cpus-per-task=72
 #SBATCH --error=./outs/xqc_ft_cheetah_%j/e.err
 #SBATCH --output=./outs/xqc_ft_cheetah_%j/o.out
@@ -18,9 +18,17 @@ export WRKDIR="${SCRATCH_DIR:-/scratch/project_2019621/pvr}"
 
 export MUJOCO_GL=egl
 
-SEED=${SEED:-1}
+SEEDS=(${SEEDS:-${SEED:-1 2 3}})
+CPUS=($(python3 -c 'import os; print(*sorted(os.sched_getaffinity(0)))'))
+C=$(( ${#CPUS[@]} / ${#SEEDS[@]} ))
+LOGS=outs/xqc_ft_cheetah_${SLURM_JOB_ID}
+mkdir -p "$LOGS"
 
-srun python3 train_xqc.py \
+PIDS=()
+for i in "${!SEEDS[@]}"; do
+    SEED=${SEEDS[$i]}
+    OMP_NUM_THREADS=$C taskset -c "$(IFS=,; echo "${CPUS[*]:i*C:C}")" \
+    python3 train_xqc.py \
         env=dm_control_pixels \
         env.image_size=84 \
         embedding=resnet18 \
@@ -33,4 +41,11 @@ srun python3 train_xqc.py \
         seed=$SEED \
         wandb.enabled=true \
         wandb.project=pvr-sac \
-        "$@"
+        hydra.run.dir="outputs/xqc_ft_cheetah/s${SEED}_${SLURM_JOB_ID}" \
+        "$@" > "$LOGS/s$SEED.out" 2> "$LOGS/s$SEED.err" &
+    PIDS+=($!)
+done
+
+RC=0
+for i in "${!PIDS[@]}"; do wait ${PIDS[$i]} || { echo "seed ${SEEDS[$i]} failed"; RC=1; }; done
+exit $RC
