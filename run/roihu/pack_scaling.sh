@@ -17,12 +17,11 @@ export WRKDIR="${SCRATCH_DIR:-/scratch/project_2019621/pvr}"
 
 export MUJOCO_GL=egl
 
-R3M="$WRKDIR/pretrain_runs/r3m_ssv2_resnet50_s1/encoder_step1000000.pt"
 RUN=("$@")
 [ ${#RUN[@]} -gt 0 ] || RUN=(
     train_xqc.py
     env=dm_control_pixels
-    embedding=custom_checkpoint embedding.arch=resnet50 embedding.checkpoint=$R3M embedding.name=r3m50_ours
+    embedding=resnet50 embedding.pretrained=false
     ++embedding.frame_stack=3
     algo.action_repeat=4
     algo.total_timesteps=500000
@@ -57,7 +56,8 @@ for i in $(seq 0 $((PACK - 1))); do
         > "$LOGS/run$i.out" 2> "$LOGS/run$i.err" &
     PIDS+=($!)
 done
-for p in "${PIDS[@]}"; do wait $p; done
+RC=0
+for i in "${!PIDS[@]}"; do wait ${PIDS[$i]} || { echo "run$i failed: see $LOGS/run$i.err"; RC=1; }; done
 kill $SMI
 [ "${MPS:-0}" = 1 ] && echo quit | nvidia-cuda-mps-control
 
@@ -65,3 +65,4 @@ echo "PACK=$PACK MPS=${MPS:-0} ${RUN[*]:0:2}"
 grep -h "^  training " "$LOGS"/run*.out | awk '{s += $2; n++} END {printf "aggregate %.2f steps/s over %d runs\n", s, n}'
 grep -h "^Predicted time" "$LOGS"/run*.out
 awk -F', ' '{u += $1; if ($2 > m) m = $2; n++} END {if (n) printf "GPU load %.0f%% mean, %.1f GiB peak\n", u / n, m / 1024}' "$LOGS/gpu.csv"
+exit $RC
