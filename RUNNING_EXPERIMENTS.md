@@ -74,7 +74,37 @@ Only `configs/env/*.yaml` files that have a `builder:` field work with
   fixed goal (bottom-right corner); `env.kwargs.random_goals=true` moves the goal at every
   reset, which from state took DQN past 200k steps (still ~35% greedy success there)
 
+- `metaworld_pixels.yaml` / `metaworld_state.yaml` (`Meta-World/MT1`, needs
+  `pip install metaworld==3.0.0`: 3.1.x pins `mujoco==3.3.0`). One task
+  (default `drawer-open-v3`; another: `env.kwargs.env_name=button-press-topdown-v3
+  env.name=mw_button_press_topdown`), its object and goal layout drawn from the
+  task's 50 variations at every reset, 500-step episodes, success from
+  `info["success"]` (`eval/success_rate`: the task completed at any step).
+  Frames from the `corner` camera (`env.kwargs.camera_name`), rendered at
+  `env.image_size` and rotated back upright (`env.rotate_180`: the corner
+  cameras are mounted upside down, so their frames arrive rotated 180 degrees;
+  a vertical flip would leave them mirrored. `behindGripper` is upright: set
+  `env.rotate_180=false` for it). `env.kwargs.seed: ${seed}` fixes the 50
+  layouts per run, so the training and evaluation envs share them. Meta-World
+  ignores reset's seed and records episode statistics itself; a small adapter
+  (`src/sac_utils.py`) fixes both, so fixed evaluation seeds give fixed layouts.
+
 `env.kwargs` passes extra arguments to `gym.make`, e.g. `env.kwargs.random_goals=true` for FourRooms.
+
+**Two envs in one process.** Every run keeps a training and an evaluation
+env alive. Gymnasium's MuJoCo renderer (Adroit, Meta-World, FrankaKitchen)
+makes its GL context current only when one env holds several viewers, so
+without a fix one env would render through the other's context: wrong
+frames, no error. The `gym` builder makes each env's own context current
+before every render (`_OwnGLContext`, `src/sac_utils.py`;
+`tests/test_env_seeding.py` checks it). dm_control does this itself.
+
+**Evaluation** (`train_sac.py`, `train_drqv2.py`, `train_xqc.py`, `train_discrete.py`)
+runs `algo.n_episodes_test` episodes from fixed reset seeds, drawn from the run's
+`seed`: every evaluation of a run, and every run with the same seed (e.g. each
+encoder of a comparison), uses the same start states, so curves differ by the
+policy, not by which starts were drawn. Different training seeds get different
+sets.
 
 The old `adroit_*.yaml`/`franka_kitchen.yaml`/`dmc_cheetah.yaml` files (only `id:`, no
 `builder:`) are still there, untouched, for `train_sac_sb3.py`'s universal
@@ -1382,6 +1412,17 @@ with `sbatch --dependency=afterany:<jobid>`).
   above), and `run/buffer_stress_1m.sh` runs `src.rl.buffer_stress` on a
   1M-frame compressed disk buffer, without training. `run/ft_bc.sh` is the template for `train_bc.py`
   (ResNet-18 finetuning on cheetah_run).
+- **Benchmark** (XQC on frozen encoders: our VIP, R3M and MVP, the released
+  VIP and R3M, Voltron's R-MVP and R-R3M RN50): `run/bench_dmc.sh`
+  (cheetah-run at action repeat 4 and walker-walk at 2, 500k agent steps),
+  `run/bench_adroit_door.sh` (Adroit door, 5M steps) and
+  `run/bench_metaworld.sh` (Meta-World drawer-open, 1M steps).
+  `run/xqc_ft_cheetah.sh` fine-tunes a torchvision ResNet-18 from the critic
+  with XQC on cheetah-run (200k steps), to compare with the SAC runs. Each
+  takes `SEED` (default 1): submit an array once per seed
+  (`SEED=2 sbatch run/bench_dmc.sh`); runs are named `..._s<seed>`, and the
+  evaluation episodes stay paired across encoders within a seed. Every
+  script prints the encoder checkpoints it picked.
 - **Simple benchmark** (3 encoders x Pendulum/BipedalWalker/FourRooms):
   `run/simple_bench.sh` (SAC, and DQN on FourRooms), `run/simple_bench_xqc.sh`
   (XQC), and `run/simple_bench_state.sh` / `run/simple_bench_xqc_state.sh`
@@ -1393,7 +1434,18 @@ with `sbatch --dependency=afterany:<jobid>`).
   the venv `$PROJAPPL_DIR/pvr_env`), and `WRKDIR` set to `$SCRATCH_DIR`
   (`/scratch/project_2019621/pvr`), so `$WRKDIR/models` and
   `$WRKDIR/pretrain_runs` work as on Triton. Pretraining stays on Triton,
-  where the data is.
+  where the data is. Each GH200 comes with a fixed 72 cores and 212 GiB
+  (`--mem` is ignored) and the job is billed on the GPU, while one run uses
+  about one core, so each Roihu array task runs its config's `SEEDS` (default
+  `1 2 3`; `SEEDS=1` or `SEED=n` for one run) side by side on its GPU, each on
+  its own block of cores, with logs in `outs/<job>/<task>/s<seed>.out`.
+  Without MPS the runs take turns on the GPU, so N packed runs take at least
+  N x (solo GPU load) x (solo time); with `save.enabled=false` a timeout loses
+  all of them. `run/roihu/pack_scaling.sh` measures it on `gputest` in
+  benchmark mode: `for k in 1 2 3 4; do PACK=$k sbatch run/roihu/pack_scaling.sh; done`
+  (and `PACK=3 MPS=1`), then compare the `aggregate` lines; arguments replace
+  its default run (bench_dmc's cheetah_run with a randomly initialised
+  ResNet-50: same compute as the R3M/VIP runs, no checkpoint needed).
 
 Every `.sh` under `run/` is tracked in git (`!run/**/*.sh` in `.gitignore`);
 `*.sh` elsewhere stays ignored.
