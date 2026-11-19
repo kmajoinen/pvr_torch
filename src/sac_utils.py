@@ -112,9 +112,51 @@ class _OwnGLContext(gym.Wrapper):
         return self.env.render()
 
 
+# Adroit door/hammer/relocate, dense reward: gymnasium-robotics 1.2.1 flipped
+# the sign of the "take the hand to the object" term, +0.1 * |palm - target|
+# instead of DAPG's -0.1 (a refactor bug: it rewards moving the hand away;
+# Gymnasium-Robotics PR #220, fixed on main in May 2026, in no release up to
+# 1.4.2). Positions as the env's own step() reads them.
+_ADROIT_REACH_TERM = {
+    "AdroitHandDoor": ("site", "handle_site_id", "grasp_site_id"),
+    "AdroitHandHammer": ("body", "obj_body_id", "S_grasp_site_id"),
+    "AdroitHandRelocate": ("body", "obj_body_id", "S_grasp_site_id"),
+}
+
+
+def _adroit_reward_is_buggy() -> bool:
+    from packaging.version import Version
+    import gymnasium_robotics
+    return Version("1.2.1") <= Version(gymnasium_robotics.__version__) <= Version("1.4.2")
+
+
+class _AdroitRewardFix(gym.Wrapper):
+    """Restores DAPG's sign on the reach term of Adroit's dense reward:
+    reward - 0.2 * |palm - target| turns +0.1 * d into -0.1 * d. Applied per
+    simulator step (before action repeat)."""
+
+    def __init__(self, env, target_kind, target_attr, palm_attr):
+        super().__init__(env)
+        self._kind, self._target_attr, self._palm_attr = target_kind, target_attr, palm_attr
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        u = self.env.unwrapped
+        target_id = getattr(u, self._target_attr)
+        target = u.data.site_xpos[target_id] if self._kind == "site" else u.data.xpos[target_id]
+        palm = u.data.site_xpos[getattr(u, self._palm_attr)]
+        return obs, reward - 0.2 * float(np.linalg.norm(palm - target)), terminated, truncated, info
+
+
 def _make(env_id: str, **kwargs):
     env = gym.make(env_id, **kwargs)
-    return _MetaWorldAdapter(env) if "Meta-World" in env_id else env
+    if "Meta-World" in env_id:
+        return _MetaWorldAdapter(env)
+    task = env_id.split("-")[0].replace("Dense", "")
+    if task in _ADROIT_REACH_TERM and not getattr(env.unwrapped, "sparse_reward", False) \
+            and _adroit_reward_is_buggy():
+        env = _AdroitRewardFix(env, *_ADROIT_REACH_TERM[task])
+    return env
 
 
 def _wrap(env, wrappers):
