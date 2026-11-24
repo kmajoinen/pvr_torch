@@ -91,6 +91,16 @@ Only `configs/env/*.yaml` files that have a `builder:` field work with
 
 `env.kwargs` passes extra arguments to `gym.make`, e.g. `env.kwargs.random_goals=true` for FourRooms.
 
+**Adroit's dense reward is corrected.** gymnasium-robotics 1.2.1 to 1.4.2
+(including the pinned 1.4.2, the latest release) flipped the sign of the
+"take the hand to the object" term in door, hammer and relocate: +0.1 x the
+palm-to-target distance instead of the original DAPG reward's -0.1, which
+rewards moving the hand away (a refactor bug, Gymnasium-Robotics PR #220,
+fixed on GitHub in May 2026 but not released). The env builders restore
+DAPG's sign on those versions (`_AdroitRewardFix`, `src/sac_utils.py`;
+`tests/test_adroit_reward.py`). Pen and the sparse rewards are unaffected.
+Runs before 2026-11-19 used the flipped term.
+
 **Two envs in one process.** Every run keeps a training and an evaluation
 env alive. Gymnasium's MuJoCo renderer (Adroit, Meta-World, FrankaKitchen)
 makes its GL context current only when one env holds several viewers, so
